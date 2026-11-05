@@ -13,7 +13,9 @@
 #   若构建机内存紧张，优先改用 PREBUILD_FRONTEND=1 在宿主机完成前端构建。
 ARG PREBUILD_FRONTEND=0
 ARG APP_VERSION=dev
-FROM node:20-slim AS frontend-builder
+# 基础镜像锁定 manifest digest（index），保证不同机器/不同日期构建解析到完全相同的基础镜像；
+# 升级方式：docker pull node:20-slim 后用 docker images --digests 取新 digest 替换
+FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS frontend-builder
 ARG PREBUILD_FRONTEND
 ARG APP_VERSION
 WORKDIR /app/frontend
@@ -30,7 +32,8 @@ RUN if [ "$PREBUILD_FRONTEND" = "1" ]; then \
     fi
 
 # --- 阶段 2: Python 环境构建 ---
-FROM python:3.11-slim
+# 基础镜像锁定 manifest digest（index），与 node 阶段同理；升级方式：docker pull 后替换 digest
+FROM python:3.11-slim@sha256:673719e071ecf27434fd2635bbd8d00f49f4fdd81f243143438a42ced8bedf60
 
 WORKDIR /app
 
@@ -79,13 +82,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         msodbcsql18 \
     && rm -rf /var/lib/apt/lists/*
 
-# 复制依赖文件
-COPY requirements.txt .
+# 复制依赖文件：requirements.txt 为开发宽松清单（>= 下限），requirements.lock.txt 为构建锁清单（全量 ==）
+COPY requirements.txt requirements.lock.txt ./
 
 # 安装 Python 依赖（使用 BuildKit 缓存挂载以加速重新构建时的依赖下载）
+# 使用锁定清单保证任意时间/任意机器构建产出一致的依赖版本；
+# 更新依赖时：改 requirements.txt 后重新构建一次（不锁版），再从新镜像导出 pip freeze 刷新 lock
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && \
-    pip install -r requirements.txt
+    pip install -r requirements.lock.txt
 
 # 安装 Playwright 浏览器内核及系统依赖（Chromium headless，约 260 MiB）
 # 使用 --with-deps 选项，Playwright 会自动补全当前版本 Chromium 运行所需的全部底层 Linux 系统库，确保绝对完整
