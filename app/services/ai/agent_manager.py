@@ -329,6 +329,12 @@ class AgentManagerService:
             is_system=False,
             sort_order=data.sort_order or 0,
             is_enabled=data.is_enabled if data.is_enabled is not None else True,
+            # 主助手是系统兜底入口，不允许被设成专家团主专家（前端也不提供该开关）
+            is_expert_team_lead=(
+                bool(data.is_expert_team_lead)
+                and str(data.name or "").strip().lower() not in MAIN_GENERAL_AGENT_NAMES
+            ),
+            team_profile=data.team_profile,
             created_by=created_by,
             engine_type=data.engine_type,
             engine_config=data.engine_config,
@@ -429,6 +435,32 @@ class AgentManagerService:
 
         ids = normalize_dataset_ids((engine_config or {}).get("dataset_ids"))
         return len(ids) if ids else None
+
+    @staticmethod
+    def _resolve_team_members(published_version: Any) -> Optional[List[str]]:
+        """专家团成员 = 已发布版本调度范围里的智能体标识。
+
+        返回 None 表示**未配置**调度范围：那意味着全部有权限的系统级智能体都能被调，
+        不是「0 个成员」。两者前端必须分开显示，否则会把「没设范围」说成「团是空的」。
+
+        名单只有一份（``sub_agent_call`` 为准，batch 上的历史字段兜底），与运行时
+        ``sub_agent_call`` / ``sub_agent_batch_call`` 的校验口径完全同源——这里若
+        再单独回落一次 batch，就会出现「卡片显示有成员、委派时却读不到」的分叉。
+        """
+        if published_version is None:
+            return None
+        from app.services.ai.tools.agent_delegate_tool import resolve_delegation_allowlist
+
+        tools = getattr(published_version, "tools", None) or []
+        configured, ids = resolve_delegation_allowlist(tools)
+        if not configured:
+            return None
+        return [str(item) for item in (ids or []) if str(item or "").strip()]
+
+    @staticmethod
+    def _count_team_members(published_version: Any) -> Optional[int]:
+        members = AgentManagerService._resolve_team_members(published_version)
+        return None if members is None else len(members)
 
     @classmethod
     def summarize_version_capabilities(
@@ -568,7 +600,9 @@ class AgentManagerService:
                     tools=[],
                     capabilities=agent.capabilities or [],
                     engine_type=agent.engine_type,
-                    engine_config=agent.engine_config
+                    engine_config=agent.engine_config,
+                    is_expert_team_lead=bool(getattr(agent, "is_expert_team_lead", False)),
+                    team_profile=getattr(agent, "team_profile", None),
                 )
 
             # 3. Handle LOCAL Engine (Require PUBLISHED version)
@@ -612,7 +646,9 @@ class AgentManagerService:
                 welcome_config=safe_welcome_config(getattr(version, "welcome_config", None)),
                 capabilities=agent.capabilities or [],
                 engine_type=agent.engine_type,
-                engine_config=agent.engine_config
+                engine_config=agent.engine_config,
+                is_expert_team_lead=bool(getattr(agent, "is_expert_team_lead", False)),
+                team_profile=getattr(agent, "team_profile", None),
             )
             
         except OperationalError as e:
@@ -703,7 +739,9 @@ class AgentManagerService:
                     welcome_config=safe_welcome_config(getattr(version, "welcome_config", None)),
                     capabilities=version.agent.capabilities or [],
                     engine_type=version.agent.engine_type,
-                    engine_config=version.agent.engine_config
+                    engine_config=version.agent.engine_config,
+                    is_expert_team_lead=bool(getattr(version.agent, "is_expert_team_lead", False)),
+                    team_profile=getattr(version.agent, "team_profile", None),
                 )
             
             # 2. Fallback: Check if version_id is actually an Agent ID (for RAGFlow shortcut)
@@ -875,6 +913,20 @@ class AgentManagerService:
             )
             agent.readiness_ready = readiness.ready
             agent.readiness_missing = list(readiness.missing)
+
+            # 专家团展示：团名未配置时回落展示名；成员数取已发布版本的调度范围。
+            # 未配置白名单（configured=False）时保持 None —— 它表示「调度范围未限定，
+            # 全部有权限的系统级都能调」，不等于 0 个成员，前端要分开显示。
+            if getattr(agent, "is_expert_team_lead", False):
+                profile = agent.team_profile if isinstance(agent.team_profile, dict) else {}
+                agent.team_name = (str(profile.get("name") or "").strip() or agent.display_name)
+                team_members = AgentManagerService._resolve_team_members(published_version)
+                agent.team_member_count = None if team_members is None else len(team_members)
+                agent.team_member_ids = team_members
+            else:
+                agent.team_name = None
+                agent.team_member_count = None
+                agent.team_member_ids = None
 
         # 模型健康：只校验 LOCAL 引擎的已启用智能体。OPENCLAW 的 model 是机器人 ID，
         # RAGFLOW 不走平台 LLM，拿模型表去比对只会误报。
@@ -1068,6 +1120,45 @@ class AgentManagerService:
         stmt = stmt.order_by(main_first, AIAgent.sort_order.desc(), AIAgent.is_system.desc(), AIAgent.display_name)
 
         return list((await session.execute(stmt)).scalars().all())
+
+    @classmethod
+    async def attach_team_metadata(
+        cls,
+        session: AsyncSession,
+        agents: List[Any],
+    ) -> List[Any]:
+        """给团主专家补「团名 + 子专家数」，供聊天页「专家中心」抽屉展示。
+
+        抽屉要在行里显示「xl 测试专家团 · 2 位子专家」，只给一个 👥 TEAM 徽标
+        用户还是不知道是哪个团、能不能用。团名读 ``ai_agents.team_profile`` 零查询；
+        成员数取已发布版本的调度范围，只对团主专家查一次版本，其余智能体不查。
+        """
+        agent_list = [agent for agent in (agents or []) if getattr(agent, "id", None)]
+        if not agent_list:
+            return list(agents or [])
+
+        # 主助手即使历史数据里 is_expert_team_lead=true 也不算团主：它不该被当成
+        # 可分派的专才，前端专家团视图也按同一口径过滤。
+        leads = [
+            agent
+            for agent in agent_list
+            if getattr(agent, "is_expert_team_lead", False)
+            and not _is_main_general_agent_record(agent)
+        ]
+        if not leads:
+            return list(agents)
+
+        for agent in leads:
+            profile = agent.team_profile if isinstance(agent.team_profile, dict) else {}
+            agent.team_name = str(profile.get("name") or "").strip() or agent.display_name
+
+        versions = await cls._latest_published_versions_by_agent(
+            session, [str(agent.id) for agent in leads]
+        )
+        for agent in leads:
+            members = cls._resolve_team_members(versions.get(agent.id))
+            agent.team_member_count = None if members is None else len(members)
+        return list(agents)
 
     @classmethod
     async def attach_bound_metadata_dataset_counts(
@@ -1304,6 +1395,10 @@ class AgentManagerService:
             agent_type=source.agent_type,
             onboarding_step="COMPLETE",
             is_system=False,  # 复制品永远不是系统智能体
+            # 复制品不是团主专家：否则「复制一份」会让平台上冒出多个同名团。
+            # 团名/介绍仍沿用，用户决定开团时不用重填。
+            is_expert_team_lead=False,
+            team_profile=getattr(source, "team_profile", None),
             sort_order=(source.sort_order or 0) + 1,  # 紧邻源智能体而非沉到末尾
             is_enabled=True,
             created_by=username or None,
@@ -1551,6 +1646,16 @@ class AgentManagerService:
         agent.name = data.name
         agent.display_name = data.display_name
         agent.description = data.description
+        # 专家团字段是局部更新：编辑页的其他表单不会带这两项，无条件赋值会把开关和
+        # 团名悄悄清空，所以只在 model_fields_set 里出现时才落库。
+        if "is_expert_team_lead" in data.model_fields_set:
+            # 主助手是系统兜底对话入口，不允许当团主：前端已隐藏「专家团」页，
+            # 这里兜住 API 直调，也顺手清理历史数据里被置过 true 的记录。
+            agent.is_expert_team_lead = (
+                bool(data.is_expert_team_lead) and not _is_main_general_agent_record(agent)
+            )
+        if "team_profile" in data.model_fields_set:
+            agent.team_profile = data.team_profile
         agent.avatar_url = adopt_pending_avatar(data.avatar_url, agent.id)
         from app.services.ai.agent_types import (
             normalize_agent_capabilities_for_agent,
@@ -1681,10 +1786,14 @@ class AgentManagerService:
     def _normalize_tools_for_db(tools: List[Any]) -> List[Any]:
         """
         Converts ToolConfigItem objects to plain dictionaries for JSON serialization.
+
+        顺带把两个委派工具补成对：页面只让用户勾 ``sub_agent_call``，落库时若缺
+        ``sub_agent_batch_call``，模型就拿不到并行委派入口；batch 上遗留的名单
+        字段也在这里丢弃（名单只有一份）。
         """
         if not tools:
             return []
-        
+
         normalized = []
         for item in tools:
             if hasattr(item, "model_dump"): # Pydantic v2
@@ -1693,7 +1802,10 @@ class AgentManagerService:
                 normalized.append(item.dict(exclude_none=True))
             else:
                 normalized.append(item)
-        return normalized
+
+        from app.services.ai.tools.agent_delegate_tool import ensure_delegation_tool_pair
+
+        return ensure_delegation_tool_pair(normalized, as_dict=True)
 
     @staticmethod
     def _normalize_skills_list(skills: Any) -> List[str]:

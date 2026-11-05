@@ -48,8 +48,10 @@ def test_management_checks_unsaved_versions_through_stateless_endpoint():
 
 
 def test_removing_stale_refs_only_mutates_local_form():
+    # 取到下一个顶层 const 为止即可：原来拿 "watch(versionConfigStep" 当分界，那个
+    # watch 后来被删了（工具分组改为默认折叠），split 找不到锚点会把整份文件当成函数体
     remove_body = MANAGEMENT.split("const removeStaleToolRefs", 1)[1].split(
-        "watch(versionConfigStep", 1
+        "const fetchTools", 1
     )[0]
     assert "versionForm.value.tools" in remove_body
     # 只做本地过滤：任何直接写库/删工具的动作都会绕过「保存版本」这一确认步骤
@@ -98,3 +100,26 @@ def test_delete_toast_reports_auto_pruned_agent_versions():
     assert "个智能体版本中移除失效引用" in REGISTRY
     # 删除前就告诉用户会自动清理，避免他再去智能体里找那个已经消失的 MCP
     assert "无需再去智能体里手动解绑" in REGISTRY
+
+
+def test_stale_refs_card_sits_at_top_of_tools_step():
+    """失效引用卡片要放在「工具能力」步骤的最上方。
+
+    这些引用跨系统工具 / MCP / Skills 三类，跟当前停在哪个页签无关。卡片最初挂在
+    `toolTab === 'mcp'` 分支内部，站在「系统工具」或 Skills 页签时完全看不到；只挪到
+    页签栏下方仍然像个「页签区的东西」。放在超时卡片之前，才明确它是本步骤的全局提示
+    ——看不到就等于「无解」，因为它是用户唯一的解绑入口。
+    """
+    card_at = DRAWER.index("项已失效的工具引用")
+    timeout_card_at = DRAWER.index(
+        '<div class="text-sm font-bold text-gray-800">智能体版本工具调用超时时间</div>'
+    )
+    static_tab_at = DRAWER.index('v-if="toolTab === \'static\'"')
+    mcp_tab_at = DRAWER.index('v-else-if="toolTab === \'mcp\'"')
+    skills_tab_at = DRAWER.index('v-else class="flex-1 overflow-y-auto space-y-3 pr-1 version-editor-scroll"')
+
+    # 步骤内最靠前的元素：先于知识库引导与超时卡片，更早于页签与工具列表
+    assert card_at < timeout_card_at, "失效引用卡片应位于本步骤最上方"
+    assert card_at < static_tab_at, "失效引用卡片不应出现在系统工具页签之后"
+    assert card_at < mcp_tab_at, "失效引用卡片不应挂在 MCP 页签内部"
+    assert static_tab_at < mcp_tab_at < skills_tab_at

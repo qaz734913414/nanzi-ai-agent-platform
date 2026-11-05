@@ -58,6 +58,10 @@ const props = withDefaults(defineProps<{
   isSkillSelected: (skillId: string) => boolean;
   getToolCustomConfig: (name: string) => any;
   hasToolMetadataDatasetBinding: (name: string) => boolean;
+  /** 该工具是否已配置调度白名单；两个委派工具共用 sub_agent_call 那一份。 */
+  hasDelegationAllowlist: (name: string) => boolean;
+  /** 当前生效的白名单数量；名单只有一份，传哪个委派工具都返回同一个数。 */
+  delegationScopeCount: (name: string) => number;
   isAllMcpSelected: (serverName: string, tools: any[]) => boolean;
   isAllStaticGroupSelected: (label: string) => boolean;
   isMcpGroupCollapsed: (serverName: string) => boolean;
@@ -105,6 +109,7 @@ const emit = defineEmits<{
   setSynthesisTemperature: [value: number];
   openToolRuntimeConfig: [name: string];
   openMetadataDatasetBinding: [name: string];
+  openDelegationScope: [name: string];
   openDingTalkConfig: [name: string];
   openEmailConfig: [name: string];
   openWeChatWorkConfig: [name: string];
@@ -917,6 +922,74 @@ const externalCreationMissingFields = computed(() => {
 
           <!-- Step 2: Tools -->
           <div v-else-if="versionConfigStep === 'tools'" class="flex flex-col min-h-[calc(100vh-280px)]">
+            <!--
+              失效引用放在本步骤最上方、页签与具体卡片之外：它跨系统工具 / MCP /
+              Skills 三类，跟当前停在哪个页签无关。挂在某个页签里时用户换个页签就
+              看不到了，而它是唯一的解绑入口。选择器只渲染「当前可见且已发布」的
+              工具，服务删除/禁用后旧引用既不会显示也不会自动消失。
+            -->
+            <div
+              v-if="staleToolRefs.length"
+              class="mb-3 rounded-lg border border-amber-200 bg-amber-50/70 p-3 dark:border-amber-900/50 dark:bg-amber-950/30"
+            >
+              <div class="flex items-start justify-between gap-2">
+                <div class="min-w-0">
+                  <p class="flex items-center gap-1.5 text-xs font-bold text-amber-800 dark:text-amber-300">
+                    <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M10.29 3.86a2 2 0 0 1 3.42 0l8.6 14.86A2 2 0 0 1 20.6 21H3.4a2 2 0 0 1-1.71-2.28z" />
+                      <path d="M12 9v4" />
+                      <path d="M12 17h.01" />
+                    </svg>
+                    {{ staleToolRefs.length }} 项已失效的工具引用
+                  </p>
+                  <p class="mt-1 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300/80">
+                    这些工具已不可用（MCP 服务被删除、禁用，或工具已下线），运行时拿不到，勾选列表里也不会再显示。移除后请保存版本。
+                  </p>
+                  <p v-if="!canEditVersion" class="mt-1 text-[10px] font-medium text-amber-700 dark:text-amber-300">
+                    当前版本不可编辑（已发布或只读）。请编辑草稿版本、移除后重新发布，改动才会生效。
+                  </p>
+                </div>
+                <div class="flex shrink-0 items-center gap-1">
+                  <button
+                    v-if="canEditVersion"
+                    type="button"
+                    class="rounded-md bg-amber-600 px-2 py-1 text-[11px] font-semibold text-white transition-colors hover:bg-amber-700"
+                    @click="emit('removeStaleToolRefs', staleToolRefs.map((item) => item.name))"
+                  >全部移除</button>
+                  <button
+                    type="button"
+                    class="rounded-md border border-amber-300 px-2 py-1 text-[11px] font-medium text-amber-700 transition-colors hover:bg-amber-100 dark:border-amber-800 dark:text-amber-300 dark:hover:bg-amber-900/40"
+                    @click="emit('refreshStaleToolRefs')"
+                  >重新检测</button>
+                </div>
+              </div>
+              <ul class="mt-2 max-h-40 space-y-1 overflow-y-auto">
+                <li
+                  v-for="item in staleToolRefs"
+                  :key="item.name"
+                  class="flex items-center gap-2 rounded-md bg-white/80 px-2 py-1.5 dark:bg-gray-800/80"
+                >
+                  <span class="min-w-0 flex-1">
+                    <span class="block truncate font-mono text-[11px] text-gray-700 dark:text-gray-200" :title="item.name">{{ item.name }}</span>
+                    <span class="block text-[10px] text-amber-700 dark:text-amber-300/80">{{ item.reason_label }}<template v-if="item.server_name"> · {{ item.server_name }}</template></span>
+                  </span>
+                  <button
+                    v-if="canEditVersion"
+                    type="button"
+                    class="shrink-0 rounded-md px-2 py-1 text-[11px] font-semibold text-amber-700 transition-colors hover:bg-amber-100 dark:text-amber-300 dark:hover:bg-amber-900/40"
+                    @click="emit('removeStaleToolRefs', [item.name])"
+                  >移除</button>
+                </li>
+              </ul>
+            </div>
+            <p
+              v-else-if="staleToolRefsError"
+              class="mb-3 flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-[11px] text-gray-500 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-400"
+            >
+              <span class="min-w-0 truncate">{{ staleToolRefsError }}</span>
+              <button type="button" class="shrink-0 font-semibold text-primary hover:underline" @click="emit('refreshStaleToolRefs')">重试</button>
+            </p>
+
             <div
               v-if="showKnowledgeBaseToolsGuidance"
               class="mb-4 flex-shrink-0 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-amber-950"
@@ -1164,6 +1237,14 @@ const externalCreationMissingFields = computed(() => {
                         <span v-if="tool.isSystem" class="text-[9px] bg-gray-100 text-gray-500 px-1 rounded font-sans font-normal">系统</span>
                       </div>
                       <div class="text-[10px] text-gray-400 mt-0.5 line-clamp-2">{{ tool.description }}</div>
+                      <!-- 调度范围只有一份，入口只挂在 sub_agent_call；
+                           sub_agent_batch_call 由它自动带上，不单独出卡片。 -->
+                      <div
+                        v-if="tool.name === 'sub_agent_call' && hasDelegationAllowlist(tool.name)"
+                        class="text-[10px] text-primary mt-0.5"
+                      >
+                        调度范围：{{ delegationScopeCount(tool.name) }} 个智能体
+                      </div>
                       <div v-if="isToolSelected(tool.name)" class="flex gap-1 mt-1.5" @click.stop>
                         <button type="button" @click="emit('openToolRuntimeConfig', tool.name)" class="tool-action-btn" title="配置">
                           <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
@@ -1177,6 +1258,21 @@ const externalCreationMissingFields = computed(() => {
                           title="绑定数据集"
                         >
                           <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7c0 1.657 3.582 3 8 3s8-1.343 8-3-3.582-3-8-3-8 1.343-8 3zm0 0v5c0 1.657 3.582 3 8 3s8-1.343 8-3V7M4 12v5c0 1.657 3.582 3 8 3s8-1.343 8-3v-5" /></svg>
+                        </button>
+                        <!-- 调度范围只有一份，入口只挂在 sub_agent_call；批量委派跟随它。 -->
+                        <button
+                          v-if="tool.name === 'sub_agent_call'"
+                          type="button"
+                          @click="emit('openDelegationScope', tool.name)"
+                          class="tool-action-btn"
+                          :class="hasDelegationAllowlist(tool.name) ? 'tool-action-btn--active' : ''"
+                          :title="`调度范围（${delegationScopeCount(tool.name)} 个智能体）`"
+                        >
+                          <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <circle cx="12" cy="12" r="3" stroke-width="2" />
+                            <circle cx="12" cy="12" r="8" stroke-width="2" stroke-dasharray="3 2.4" />
+                            <path stroke-linecap="round" stroke-width="2" d="M12 2v2.4M12 19.6V22M2 12h2.4M19.6 12H22" />
+                          </svg>
                         </button>
                         <button v-if="tool.name === 'send_dingtalk_message'" type="button" @click="emit('openDingTalkConfig', tool.name)" class="tool-action-btn" title="钉钉">
                           <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5.882V19.24a1.76 1.72 0 01-3.417.592l-2.147-6.15M18 13a3 3 0 100-6M5.436 13.683A4.001 4.001 0 017 6h1.832c4.1 0 7.625-1.234 9.168-3v14c-1.543-1.766-5.067-3-9.168-3H7a3.988 3.988 0 01-1.564-.317z" /></svg>
@@ -1211,72 +1307,6 @@ const externalCreationMissingFields = computed(() => {
 
             <!-- MCP Tools -->
             <div v-else-if="toolTab === 'mcp'" class="flex-1 overflow-y-auto space-y-3 pr-1 version-editor-scroll">
-              <!--
-                失效引用：工具选择器只渲染「当前可见且已发布」的工具，服务删除/禁用后
-                旧引用既不会显示也不会自动消失，这里是用户唯一的解绑入口。
-              -->
-              <div
-                v-if="staleToolRefs.length"
-                class="rounded-lg border border-amber-200 bg-amber-50/70 p-3 dark:border-amber-900/50 dark:bg-amber-950/30"
-              >
-                <div class="flex items-start justify-between gap-2">
-                  <div class="min-w-0">
-                    <p class="flex items-center gap-1.5 text-xs font-bold text-amber-800 dark:text-amber-300">
-                      <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <path d="M10.29 3.86a2 2 0 0 1 3.42 0l8.6 14.86A2 2 0 0 1 20.6 21H3.4a2 2 0 0 1-1.71-2.28z" />
-                        <path d="M12 9v4" />
-                        <path d="M12 17h.01" />
-                      </svg>
-                      {{ staleToolRefs.length }} 项已失效的工具引用
-                    </p>
-                    <p class="mt-1 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300/80">
-                      这些工具已不可用（MCP 服务被删除、禁用，或工具已下线），运行时拿不到，勾选列表里也不会再显示。移除后请保存版本。
-                    </p>
-                    <p v-if="!canEditVersion" class="mt-1 text-[10px] font-medium text-amber-700 dark:text-amber-300">
-                      当前版本不可编辑（已发布或只读）。请编辑草稿版本、移除后重新发布，改动才会生效。
-                    </p>
-                  </div>
-                  <div class="flex shrink-0 items-center gap-1">
-                    <button
-                      v-if="canEditVersion"
-                      type="button"
-                      class="rounded-md bg-amber-600 px-2 py-1 text-[11px] font-semibold text-white transition-colors hover:bg-amber-700"
-                      @click="emit('removeStaleToolRefs', staleToolRefs.map((item) => item.name))"
-                    >全部移除</button>
-                    <button
-                      type="button"
-                      class="rounded-md border border-amber-300 px-2 py-1 text-[11px] font-medium text-amber-700 transition-colors hover:bg-amber-100 dark:border-amber-800 dark:text-amber-300 dark:hover:bg-amber-900/40"
-                      @click="emit('refreshStaleToolRefs')"
-                    >重新检测</button>
-                  </div>
-                </div>
-                <ul class="mt-2 max-h-40 space-y-1 overflow-y-auto">
-                  <li
-                    v-for="item in staleToolRefs"
-                    :key="item.name"
-                    class="flex items-center gap-2 rounded-md bg-white/80 px-2 py-1.5 dark:bg-gray-800/80"
-                  >
-                    <span class="min-w-0 flex-1">
-                      <span class="block truncate font-mono text-[11px] text-gray-700 dark:text-gray-200" :title="item.name">{{ item.name }}</span>
-                      <span class="block text-[10px] text-amber-700 dark:text-amber-300/80">{{ item.reason_label }}<template v-if="item.server_name"> · {{ item.server_name }}</template></span>
-                    </span>
-                    <button
-                      v-if="canEditVersion"
-                      type="button"
-                      class="shrink-0 rounded-md px-2 py-1 text-[11px] font-semibold text-amber-700 transition-colors hover:bg-amber-100 dark:text-amber-300 dark:hover:bg-amber-900/40"
-                      @click="emit('removeStaleToolRefs', [item.name])"
-                    >移除</button>
-                  </li>
-                </ul>
-              </div>
-              <p
-                v-else-if="staleToolRefsError"
-                class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-[11px] text-gray-500 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-400"
-              >
-                <span class="min-w-0 truncate">{{ staleToolRefsError }}</span>
-                <button type="button" class="shrink-0 font-semibold text-primary hover:underline" @click="emit('refreshStaleToolRefs')">重试</button>
-              </p>
-
               <!-- MCP Scope Tab 选项卡：平台 MCP / 我的 MCP -->
               <div class="flex items-center justify-between border-b border-indigo-100 dark:border-gray-800 pb-2 mb-1 sticky top-0 bg-white dark:bg-gray-900 z-10">
                 <div class="flex items-center gap-1.5 bg-gray-100 dark:bg-gray-800 p-0.5 rounded-lg text-xs">
