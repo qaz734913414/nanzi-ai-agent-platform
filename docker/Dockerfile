@@ -90,7 +90,7 @@ COPY requirements.txt requirements.lock.txt ./
 # 更新依赖时：改 requirements.txt 后重新构建一次（不锁版），再从新镜像导出 pip freeze 刷新 lock
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && \
-    pip install -r requirements.lock.txt
+    pip install -r requirements.txt
 
 # 安装 Playwright 浏览器内核及系统依赖（Chromium headless，约 260 MiB）
 # 使用 --with-deps 选项，Playwright 会自动补全当前版本 Chromium 运行所需的全部底层 Linux 系统库，确保绝对完整
