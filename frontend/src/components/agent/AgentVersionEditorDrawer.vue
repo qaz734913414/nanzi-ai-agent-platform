@@ -30,6 +30,11 @@ const props = withDefaults(defineProps<{
   agentForm: Partial<AIAgentBase>;
   versionForm: Partial<AIAgentVersion>;
   globalAgentToolcallTimeout: number;
+  /**
+   * 整轮看门狗时长（秒）。版本级超时是「所有工具的默认值」，配得比它大整轮会先被取消，
+   * 预算根本用不满，所以这一层也必须提示。0 = 看门狗已关闭，此时不存在该天花板。
+   */
+  producerHardTimeoutSeconds?: number | null;
   selectedAgent: AIAgent | null;
   models: AIModel[];
   globalModelTemperature: number;
@@ -56,7 +61,8 @@ const props = withDefaults(defineProps<{
   mcpToolsCount: number;
   isToolSelected: (name: string) => boolean;
   isSkillSelected: (skillId: string) => boolean;
-  getToolCustomConfig: (name: string) => any;
+  /** 工具级高级配置摘要：count=已配置项数，parts=文案片段，用于齿轮点亮与摘要行 */
+  getToolAdvancedConfigSummary: (name: string) => { count: number; parts: string[] };
   hasToolMetadataDatasetBinding: (name: string) => boolean;
   /** 该工具是否已配置调度白名单；两个委派工具共用 sub_agent_call 那一份。 */
   hasDelegationAllowlist: (name: string) => boolean;
@@ -186,6 +192,8 @@ const formatTemperature = (value: unknown) => {
 const stepIndex = () => props.versionConfigSteps.findIndex((s) => s.id === props.versionConfigStep);
 const isFirstStep = () => stepIndex() <= 0;
 const isLastStep = () => stepIndex() >= props.versionConfigSteps.length - 1;
+/** 移动端紧凑条：只显示当前步骤名 + 第几步/共几步，整条压到一行 */
+const currentStepLabel = () => props.versionConfigSteps[stepIndex()]?.label ?? '';
 const canReachStep = (step: VersionConfigStep) =>
   props.canReachVersionConfigStep ? props.canReachVersionConfigStep(step) : true;
 const isCurrentStepComplete = () =>
@@ -227,6 +235,29 @@ const getAgentVersionToolcallTimeoutValue = () => {
     ? value
     : AGENT_VERSION_TOOLCALL_TIMEOUT_DEFAULT;
 };
+/** 整轮看门狗（真正天花板）；0/null/非法值视为关闭。 */
+const producerHardTimeout = computed<number | null>(() => {
+  const value = Number(props.producerHardTimeoutSeconds);
+  return Number.isFinite(value) && value > 0 ? Math.round(value) : null;
+});
+
+/** 版本级超时超过了整轮预算：整轮会先被强制终止，预算用不满。 */
+const isVersionTimeoutAboveProducer = computed(() => {
+  if (producerHardTimeout.value === null) return false;
+  if (!isAgentVersionToolcallTimeoutEnabled.value) return false;
+  const value = Number(props.versionForm.toolcall_timeout_seconds);
+  if (!Number.isFinite(value) || value <= 0) return false;
+  return value > producerHardTimeout.value;
+});
+
+/** 输入超过表单硬上限 86400：失焦才截断，这里先提示，避免「填了 9999999 看着像能存」。 */
+const isVersionTimeoutOverMax = computed(() => {
+  if (!isAgentVersionToolcallTimeoutEnabled.value) return false;
+  const value = Number(props.versionForm.toolcall_timeout_seconds);
+  if (!Number.isFinite(value) || value <= 0) return false;
+  return value > AGENT_VERSION_TOOLCALL_TIMEOUT_MAX;
+});
+
 const setAgentVersionToolcallTimeoutEnabled = (enabled: boolean) => {
   if (!props.canEditVersion) return;
   props.versionForm.toolcall_timeout_seconds = enabled
@@ -467,6 +498,8 @@ const removeCapability = (value: string) => {
   props.agentForm.capabilities = (props.agentForm.capabilities || []).filter((item) => item !== value);
 };
 const selectEngine = (value: 'LOCAL' | 'RAGFLOW' | 'OPENCLAW') => {
+  // 执行引擎仅在首次创建时可选；继续向导面对的是已落库副本，后端 update_agent 禁止修改引擎
+  if (!props.isCreatingAgent) return;
   props.agentForm.engine_type = value;
   if (value !== 'LOCAL') {
     props.agentForm.agent_type = 'GENERAL';
@@ -539,13 +572,57 @@ const externalCreationMissingFields = computed(() => {
 
         <!-- Stepper -->
         <div class="px-6 py-3 border-b border-gray-100 bg-white flex-shrink-0">
-          <div class="flex items-center gap-1">
+          <!-- 移动端：整条步骤条换成「当前步骤 + 进度点」。
+               原来那一排按钮在 375px 下每个只剩十几个像素宽，标题被压成
+               一个字一行（智能体信息竖着排下来），比没有还难读。 -->
+          <div class="flex items-center gap-2 sm:hidden">
+            <span
+              class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary text-[11px] font-bold text-white"
+            >{{ stepIndex() + 1 }}</span>
+            <div class="min-w-0 flex-1">
+              <div class="truncate text-sm font-semibold text-gray-900">{{ currentStepLabel() }}</div>
+              <!-- 外部引擎只有一步，「第 1 步 / 共 1 步」+ 一个点是噪音 -->
+              <div v-if="versionConfigSteps.length > 1" class="text-[10px] leading-tight text-gray-400">
+                第 {{ stepIndex() + 1 }} 步 / 共 {{ versionConfigSteps.length }} 步
+              </div>
+            </div>
+            <div v-if="versionConfigSteps.length > 1" class="flex shrink-0 items-center gap-1">
+              <button
+                v-for="(step, idx) in versionConfigSteps"
+                :key="`dot-${step.id}`"
+                type="button"
+                class="rounded-full transition-all"
+                :class="[
+                  idx === stepIndex()
+                    ? 'h-1.5 w-4 bg-primary'
+                    : idx < stepIndex()
+                      ? 'h-1.5 w-1.5 bg-primary/40'
+                      : 'h-1.5 w-1.5 bg-gray-200',
+                  canReachStep(step.id) ? 'cursor-pointer' : 'cursor-not-allowed',
+                ]"
+                :disabled="!canReachStep(step.id)"
+                :aria-label="`第 ${idx + 1} 步：${step.label}`"
+                :aria-current="idx === stepIndex() ? 'step' : undefined"
+                :title="step.label"
+                @click="goStep(step.id)"
+              />
+            </div>
+          </div>
+
+          <!-- 断点只管「要不要换成紧凑条」；能不能不竖排，取决于按钮自己
+               有没有 shrink-0。抽屉宽度是 max-w-4xl（约 896px，窄屏时更小），
+               而视口可能远大于它——只看 sm 断点会让 900px 视口里的 660px 抽屉
+               继续走完整步骤条，5 个按钮被压成「模/型/策/略」竖排。
+               所以这里既禁止收缩，也在放不下时允许横滑。 -->
+          <div
+            class="hidden items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden sm:flex"
+          >
             <template v-for="(step, idx) in versionConfigSteps" :key="step.id">
               <button
                 type="button"
                 @click="goStep(step.id)"
                 :disabled="!canReachStep(step.id) && versionConfigStep !== step.id"
-                class="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
+                class="flex shrink-0 items-center gap-2 whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-medium transition-all"
                 :class="versionConfigStep === step.id
                   ? 'bg-primary text-white shadow-sm'
                   : canReachStep(step.id)
@@ -554,7 +631,7 @@ const externalCreationMissingFields = computed(() => {
                 :title="!canReachStep(step.id) && versionConfigStep !== step.id ? '请先完成前面的配置步骤' : undefined"
               >
                 <span
-                  class="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold border"
+                  class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-[10px] font-bold"
                   :class="versionConfigStep === step.id
                     ? 'bg-white/20 border-white/30 text-white'
                     : canReachStep(step.id)
@@ -576,7 +653,7 @@ const externalCreationMissingFields = computed(() => {
             外部引擎不创建本地版本，完成当前页面即可创建智能体。
           </div>
           <div v-else class="mt-2 text-[10px] text-gray-400">
-            配置完成度 {{ versionConfigProgress }} / {{ versionConfigProgressTotal }}（{{ versionConfigProgressLabels }}）
+            配置完成度 {{ versionConfigProgress }} / {{ versionConfigProgressTotal }}<span class="hidden sm:inline">（{{ versionConfigProgressLabels }}）</span>
           </div>
         </div>
 
@@ -600,7 +677,11 @@ const externalCreationMissingFields = computed(() => {
                   系统级
                 </span>
               </div>
-              <p class="mt-1 text-sm text-gray-500">先选择执行引擎并配置智能体属性，页面会自动调整所需配置和后续流程。</p>
+              <p class="mt-1 text-sm text-gray-500">
+                {{ isCreatingAgent
+                  ? '先选择执行引擎并配置智能体属性，页面会自动调整所需配置和后续流程。'
+                  : '执行引擎在创建后不可修改；可继续配置智能体属性与后续流程。' }}
+              </p>
             </div>
 
             <div class="rounded-xl border border-blue-100 bg-blue-50/40 p-4">
@@ -615,7 +696,7 @@ const externalCreationMissingFields = computed(() => {
                 >?</button>
               </div>
               <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
-                <button v-for="engine in [{ value: 'LOCAL', label: 'NanZi Engine', icon: '🧠', note: '平台原生编排' }, { value: 'RAGFLOW', label: 'RAGFlow', icon: '🌊', note: '外部智能体' }, { value: 'OPENCLAW', label: 'OpenClaw', icon: '🦞', note: '外部任务机器人' }]" :key="engine.value" type="button" @click="selectEngine(engine.value as any)" class="rounded-xl border-2 bg-white p-4 text-left transition-all" :class="agentForm.engine_type === engine.value ? 'border-primary shadow-sm ring-1 ring-primary/10' : 'border-white hover:border-blue-200'">
+                <button v-for="engine in [{ value: 'LOCAL', label: 'NanZi Engine', icon: '🧠', note: '平台原生编排' }, { value: 'RAGFLOW', label: 'RAGFlow', icon: '🌊', note: '外部智能体' }, { value: 'OPENCLAW', label: 'OpenClaw', icon: '🦞', note: '外部任务机器人' }]" :key="engine.value" type="button" :disabled="!isCreatingAgent" :title="!isCreatingAgent ? '执行引擎创建后不可修改' : undefined" @click="selectEngine(engine.value as any)" class="rounded-xl border-2 bg-white p-4 text-left transition-all" :class="[agentForm.engine_type === engine.value ? 'border-primary shadow-sm ring-1 ring-primary/10' : 'border-white hover:border-blue-200', !isCreatingAgent ? 'cursor-not-allowed' : '', !isCreatingAgent && agentForm.engine_type !== engine.value ? 'opacity-50' : '']">
                   <div class="flex items-center gap-2"><span class="text-xl">{{ engine.icon }}</span><span class="text-sm font-bold text-gray-800">{{ engine.label }}</span></div><div class="mt-2 text-[11px] text-gray-500">{{ engine.note }}</div>
                 </button>
               </div>
@@ -1039,6 +1120,10 @@ const externalCreationMissingFields = computed(() => {
                     默认使用全局配置；启用后，以当前智能体版本配置为准，不再与全局或工具配置取最大值。
                   </p>
                   <p class="mt-1 text-[11px] text-gray-400">当前全局配置：{{ globalAgentToolcallTimeout }} 秒（范围 1–3600）</p>
+                  <p v-if="producerHardTimeout !== null" class="mt-1 text-[11px] text-gray-400">
+                    整轮看门狗 {{ producerHardTimeout }} 秒：从发消息到收尾的总时长上限（含所有工具与模型调用），
+                    版本级配置超过它时本轮会先被强制终止。
+                  </p>
                 </div>
                 <div class="flex items-center gap-2">
                   <span class="text-xs font-medium text-gray-600">
@@ -1063,7 +1148,8 @@ const externalCreationMissingFields = computed(() => {
                   </button>
                 </div>
               </div>
-              <div v-if="isAgentVersionToolcallTimeoutEnabled" class="mt-3 flex items-center gap-2">
+              <div v-if="isAgentVersionToolcallTimeoutEnabled" class="mt-3">
+                <div class="flex items-center gap-2">
                 <button
                   type="button"
                   aria-label="减少智能体工具调用超时时间"
@@ -1093,6 +1179,17 @@ const externalCreationMissingFields = computed(() => {
                   class="flex h-8 w-8 items-center justify-center rounded-lg border border-gray-200 bg-white text-lg leading-none text-gray-600 hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
                 >+</button>
                 <span class="text-xs text-gray-500">秒（范围 1–86400）</span>
+                </div>
+                <!-- 超过整轮看门狗：整轮会先被取消，这一层的预算用不满 -->
+                <p v-if="isVersionTimeoutAboveProducer" class="mt-2 rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-[11px] leading-relaxed text-amber-800">
+                  已超出整轮看门狗 {{ producerHardTimeout }} 秒：本轮会先被强制终止并释放会话，
+                  这个预算用不满（该版本下所有工具都会受影响）。需要更久请先调大系统配置的看门狗时长。
+                </p>
+                <!-- 超过表单硬上限：目前只在失焦时截断，先提示，避免误以为填多少都能存 -->
+                <p v-else-if="isVersionTimeoutOverMax" class="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-[11px] leading-relaxed text-amber-700">
+                  单个版本最多 {{ AGENT_VERSION_TOOLCALL_TIMEOUT_MAX }} 秒，离开输入框后会被截断为
+                  {{ AGENT_VERSION_TOOLCALL_TIMEOUT_MAX }} 秒。
+                </p>
               </div>
               <p v-else class="mt-2 text-[11px] text-gray-400">当前跟随全局配置（当前全局值 {{ globalAgentToolcallTimeout }} 秒）</p>
             </div>
@@ -1237,6 +1334,13 @@ const externalCreationMissingFields = computed(() => {
                         <span v-if="tool.isSystem" class="text-[9px] bg-gray-100 text-gray-500 px-1 rounded font-sans font-normal">系统</span>
                       </div>
                       <div class="text-[10px] text-gray-400 mt-0.5 line-clamp-2">{{ tool.description }}</div>
+                      <!-- 已自定义的高级项：一眼看出这个工具被单独调过什么 -->
+                      <div
+                        v-if="isToolSelected(tool.name) && getToolAdvancedConfigSummary(tool.name).count > 0"
+                        class="tool-advanced-line"
+                      >
+                        {{ getToolAdvancedConfigSummary(tool.name).parts.join(' · ') }}
+                      </div>
                       <!-- 调度范围只有一份，入口只挂在 sub_agent_call；
                            sub_agent_batch_call 由它自动带上，不单独出卡片。 -->
                       <div
@@ -1246,8 +1350,20 @@ const externalCreationMissingFields = computed(() => {
                         调度范围：{{ delegationScopeCount(tool.name) }} 个智能体
                       </div>
                       <div v-if="isToolSelected(tool.name)" class="flex gap-1 mt-1.5" @click.stop>
-                        <button type="button" @click="emit('openToolRuntimeConfig', tool.name)" class="tool-action-btn" title="配置">
+                        <button
+                          type="button"
+                          @click="emit('openToolRuntimeConfig', tool.name)"
+                          class="tool-action-btn"
+                          :class="getToolAdvancedConfigSummary(tool.name).count > 0 ? 'tool-action-btn--active' : ''"
+                          :title="getToolAdvancedConfigSummary(tool.name).count > 0
+                            ? `已配置 ${getToolAdvancedConfigSummary(tool.name).count} 项：${getToolAdvancedConfigSummary(tool.name).parts.join('、')}`
+                            : '高级配置：暂未自定义'"
+                        >
                           <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                          <span
+                            v-if="getToolAdvancedConfigSummary(tool.name).count > 0"
+                            class="tool-action-count"
+                          >{{ getToolAdvancedConfigSummary(tool.name).count }}</span>
                         </button>
                         <button
                           v-if="tool.name === 'get_dataset_schema'"
@@ -2038,6 +2154,8 @@ const externalCreationMissingFields = computed(() => {
 }
 
 .tool-action-btn {
+  /* relative 给右上角的已配置角标做定位锚点 */
+  position: relative;
   padding: 4px;
   border-radius: 4px;
   color: #9ca3af;
@@ -2051,6 +2169,32 @@ const externalCreationMissingFields = computed(() => {
 .tool-action-btn--active {
   color: var(--color-primary, #2563eb);
   background: white;
+}
+/* 已配置项数角标：齿轮右上角，避免「亮了但不知道亮什么」 */
+.tool-action-count {
+  position: absolute;
+  top: -2px;
+  right: -3px;
+  min-width: 12px;
+  height: 12px;
+  padding: 0 2px;
+  border-radius: 999px;
+  border: 1.5px solid white;
+  background: var(--color-primary, #2563eb);
+  color: white;
+  font-size: 8px;
+  font-weight: 900;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+}
+/* 工具卡片内的已配置摘要行：与卡片内「调度范围」同层级 */
+.tool-advanced-line {
+  margin-top: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.5;
+  color: var(--color-primary-dark, #1d4ed8);
 }
 
 .tool-action-btn--attention {

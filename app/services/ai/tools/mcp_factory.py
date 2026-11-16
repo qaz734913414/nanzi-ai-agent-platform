@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
+import contextvars
 import json
+import keyword
 import logging
 import re
 import time
@@ -11,10 +13,14 @@ from app.services.ai.tools.tool_compat import StructuredTool
 from app.models.mcp import McpToolCache
 from app.services.ai.tools.mcp_client import McpClientService
 from app.services.ai.runtime.agentscope.tool_timeout import (
+    get_active_tool_timeout_seconds,
     load_agent_max_toolcall_timeout,
+    parse_agent_version_toolcall_timeout,
 )
 from app.services.ai.grounding.models import EvidenceType
 from app.core.context import get_current_agent_context
+from app.services.secrets.injection import apply_mcp_arg_bindings, denial_hint, denial_text
+from app.services.secrets.redact import collect_injected_from_context
 
 logger = logging.getLogger(__name__)
 
@@ -46,15 +52,21 @@ MCP_PROGRESS_MIN_INTERVAL_SECONDS = 0.25
 
 
 async def resolve_mcp_tool_timeout() -> Optional[float]:
-    """单次 MCP 工具调用的超时：优先请求期快照，其次系统配置。
+    """单次 MCP 工具调用的超时：优先外层工具三级解析结果，其次请求期版本快照，再回退系统全局配置。
 
-    平台已有 ``agent_max_toolcall_timeout``（全局默认 180s，支持版本级覆盖），
-    并把它快照进 ``AgentContext``。MCP 输出链路曾经写死 120s，长工具会在进度
-    走到一半时被静默掐断——这里统一回同一个旋钮。
+    平台已有 ``agent_max_toolcall_timeout``（全局默认 180s，支持版本级 1–86400s
+    与工具级覆盖），此前 MCP 只读版本级快照而忽略外层工具级配置，导致慢工具
+    即使单独调大了工具超时仍会在底层被提前掐断。
     """
+    active_timeout = get_active_tool_timeout_seconds()
+    if active_timeout is not None and active_timeout > 0:
+        return float(active_timeout)
     context = get_current_agent_context()
     snapshot = getattr(context, "agent_max_toolcall_timeout_seconds", None) if context else None
-    if snapshot:
+    if snapshot is not None:
+        parsed_version_timeout = parse_agent_version_toolcall_timeout(snapshot)
+        if parsed_version_timeout is not None:
+            return float(parsed_version_timeout)
         try:
             value = float(snapshot)
         except (TypeError, ValueError):
@@ -133,6 +145,9 @@ async def stream_remote_tool_with_progress(
             )
         )
 
+    # create_task 默认复制 ContextVar，子协程内部新注册的 header/token 不会自动
+    # 回流到父协程；显式传入 child_ctx 并在 finally 回收，避免父层异常脱敏漏掉明文。
+    child_ctx = contextvars.copy_context()
     call_task = asyncio.create_task(
         McpClientService.call_remote_tool(
             server_id=server_id,
@@ -141,7 +156,8 @@ async def stream_remote_tool_with_progress(
             progress_callback=_on_progress,
             timeout_seconds=timeout_seconds,
             **identity_kwargs,
-        )
+        ),
+        context=child_ctx,
     )
     getter: Optional[asyncio.Future] = None
     try:
@@ -180,6 +196,7 @@ async def stream_remote_tool_with_progress(
         elif not call_task.cancelled():
             # 取走异常，避免 "Task exception was never retrieved" 噪声日志。
             call_task.exception()
+        collect_injected_from_context(child_ctx)
 
 
 def _map_schema_type(param_def: dict[str, Any]) -> Any:
@@ -222,6 +239,48 @@ def _schema_allows_null(param_def: dict[str, Any]) -> bool:
     return isinstance(raw_type, list) and "null" in raw_type
 
 
+def _safe_field_name(param_name: str) -> str:
+    """把远端参数名映射成 Pydantic 能接受的字段名。
+
+    ``create_model`` 对字段名有硬约束：不能以下划线开头（``_id`` 会直接抛
+    ``NameError: Fields must not use names with leading underscores``）、必须是
+    合法标识符、不能是 Python 关键字。远端 schema 里 ``_id`` / ``$ref`` / ``2fa``
+    这类名字并不罕见，一个参数名就足以让整条工具创建失败。
+    """
+    candidate = re.sub(r"[^0-9a-zA-Z_]+", "_", str(param_name or "")).strip("_")
+    if not candidate:
+        candidate = "value"
+    if candidate[0].isdigit():
+        candidate = f"field_{candidate}"
+    if keyword.iskeyword(candidate):
+        candidate = f"{candidate}_"
+    if candidate.startswith("model_"):
+        candidate = f"field_{candidate}"
+    return candidate
+
+
+def credential_param_names(tool_record: Any) -> list[str]:
+    """工具上声明「值由凭据中心提供」的参数名。
+
+    解析失败按「没声明」处理：宁可让模型看到一个多余的参数，也不能因为存储里
+    半截 JSON 就把工具定义整个搞坏——那会让这个工具彻底不可用。
+    """
+    raw = getattr(tool_record, "credential_params", None)
+    if not raw:
+        return []
+    try:
+        names = json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError):
+        logger.warning(
+            "[McpFactory] 工具 %s 的 credential_params 不是合法 JSON，忽略",
+            getattr(tool_record, "tool_name", "?"),
+        )
+        return []
+    if not isinstance(names, list):
+        return []
+    return [n for n in names if isinstance(n, str) and n.strip()]
+
+
 class McpToolFactory:
     @staticmethod
     def create_tool(tool_record: McpToolCache) -> StructuredTool:
@@ -234,7 +293,34 @@ class McpToolFactory:
         properties = schema_def.get("properties", {})
         required_fields = set(schema_def.get("required", []))
 
+        # 声明过「值由凭据提供」的参数从模型可见的参数里剔除：留着的话模型会
+        # 自己编一个值填进去，而平台随后又要用凭据覆盖它，等于骗了模型一次，
+        # 日志里也看不出这个值到底是谁给的。
+        #
+        # 要改的是**两份** schema：
+        #   - ``args_schema``：本地调用校验用；
+        #   - ``schema_def``（→ ``tool.mcp_input_schema``）：这才是真正送给模型的
+        #     参数表——``_schema_from_legacy_tool`` 与 ``legacy_tools_to_openai_schemas``
+        #     两处都优先读它，只在 args_schema 上做改动，模型什么也看不到。
+        _credential_args = credential_param_names(tool_record)
+        for _name in _credential_args:
+            properties.pop(_name, None)
+            if not isinstance(schema_def.get("properties"), dict):
+                # 扁平形态：顶层就是参数表，上面的 pop 改的是新 dict，没回写
+                schema_def.pop(_name, None)
+            required_fields.discard(_name)
+        if _credential_args and isinstance(schema_def.get("required"), list):
+            remaining = [n for n in schema_def["required"] if n not in _credential_args]
+            if remaining:
+                schema_def["required"] = remaining
+            else:
+                # 空 required 留着只会让模型以为「必填但没定义」
+                schema_def.pop("required", None)
+
         fields = {}
+        # 远端参数名 → 本地字段别名（执行时再映射回去）。只在不合法时才换名，
+        # 合法的参数名保持逐字节一致，历史行为不变。
+        alias_to_param: Dict[str, str] = {}
         for param_name, param_def in properties.items():
             if not isinstance(param_def, dict):
                 param_def = {}
@@ -249,14 +335,63 @@ class McpToolFactory:
                 p_default = param_def.get("default", None)
                 field_type = Optional[mapped_type]
 
-            fields[param_name] = (field_type, Field(default=p_default, description=p_desc))
+            alias = _safe_field_name(param_name)
+            base_alias = alias
+            suffix = 2
+            while alias in fields:
+                alias = f"{base_alias}_{suffix}"
+                suffix += 1
+            if alias != param_name:
+                alias_to_param[alias] = param_name
+
+            fields[alias] = (field_type, Field(default=p_default, description=p_desc))
         
+        # 凭据参数被剔除了，但「规则没匹配上时让模型挑一条」需要一条回传通道：
+        # 给每个凭据参数配一个可选的编号字段。**不在这里注入候选清单**——工具定义
+        # 是跨用户缓存的，候选却按用户可见范围算，写死就会串号。
+        # 候选从 ``list_my_credentials`` 拿，两边用同一套编号（排序后的序号）。
+        from app.services.secrets.locator import choice_field
+
+        for _name in _credential_args:
+            _alias = choice_field(_name)
+            if _alias in fields:
+                continue
+            _choice_desc = (
+                f"可选。{_name} 用哪条凭据的编号（例如 c3），编号来自 "
+                "list_my_credentials 工具的返回。只在平台规则没能自动匹配到"
+                "凭据时才生效；拿不准就留空，平台会按规则自己去匹配。"
+            )
+            fields[_alias] = (
+                Optional[str],
+                Field(default=None, description=_choice_desc),
+            )
+            # 同一个字段必须也写进 ``mcp_input_schema``。这是模型唯一能看到的
+            # 参数表：只加进 args_schema 的话，``on_miss=model`` 里那句
+            # 「让模型挑一条」永远等不到编号——模型不知道有这个口子，
+            # 只会回一句「凭据参数我看不到、也不能猜」。
+            _schema_props = schema_def.get("properties")
+            if isinstance(_schema_props, dict):
+                _schema_props.setdefault(
+                    _alias, {"type": "string", "description": _choice_desc}
+                )
+            else:
+                schema_def.setdefault(
+                    _alias, {"type": "string", "description": _choice_desc}
+                )
+
         # Create dynamic Pydantic model for args
         clean_name = re.sub(r"[^a-zA-Z0-9_]+", "_", str(tool_record.tool_name)).strip("_") or "Tool"
         args_schema = create_model(f"Mcp_{clean_name}Args", **fields)
         
         # 2. Define execution logic
         async def _execute(**kwargs) -> Any:
+            # 字段别名 → 远端原始参数名（只有不合法名字才会出现在映射里）
+            if alias_to_param:
+                kwargs = {
+                    alias_to_param.get(key, key): value
+                    for key, value in kwargs.items()
+                }
+
             # Extract raw tool name (remove our prefix)
             # Full name: "server_name:raw_tool_name"
             if ":" in tool_record.tool_name:
@@ -266,6 +401,41 @@ class McpToolFactory:
 
             user_info, agent_info = current_mcp_agent_identity()
             context = get_current_agent_context()
+
+            # 凭据参数在模型侧没有值，这里补上。注入点在别名映射之后——槽位存的
+            # 是远端原始参数名，不是本地安全别名。
+            if _credential_args:
+                arg_denials: Dict[str, str] = {}
+                kwargs = await apply_mcp_arg_bindings(
+                    tool_record, kwargs, user_info=user_info, denials=arg_denials
+                )
+                # 编号字段是给平台看的，绝不能发给远端：远端收到未知参数会报错。
+                # 必须在上面的注入之后剥——注入层要从这里读模型的选择。
+                if _credential_args:
+                    from app.services.secrets.locator import choice_field
+
+                    for _name in _credential_args:
+                        kwargs.pop(choice_field(_name), None)
+                if arg_denials:
+                    # 声明了却取不到，就是缺必需参数。必须报错，不能带着空值发出去：
+                    # 远端只会回一个 401，用户看不懂缺的是哪个绑定。
+                    detail = "；".join(
+                        f"{slot}（{denial_text(why)}）" for slot, why in arg_denials.items()
+                    )
+                    hints: list[str] = []
+                    for reason in arg_denials.values():
+                        hint = denial_hint(reason)
+                        if hint and hint not in hints:
+                            hints.append(hint)
+                    message = (
+                        f"MCP 工具 {tool_record.tool_name} 的凭据参数缺失：{detail}"
+                    )
+                    message += ("。" + "；".join(hints)) if hints else ""
+                    # 只有「压根没绑」才该去绑；域名/场景不对时去绑一条也解决不了
+                    if not hints:
+                        message += "。请到「我的 MCP → 平台服务」绑定对应凭据"
+                    raise ValueError(message + "。")
+
             identity_kwargs: Dict[str, Any] = {}
             if user_info:
                 identity_kwargs["user_info"] = user_info

@@ -196,21 +196,24 @@ async def resolve_effective_prompt_tool_names_for_turn(
     却被裁掉」的假拦截 —— 模型照着清单调用，白名单判定为未注册。
     """
     names = resolve_effective_prompt_tool_names(agent_config)
-    from app.services.ai.session_tool_artifact import (
-        REUSABLE_RESULT_ACQUISITION_TOOLS,
-        should_inject_session_artifact,
-    )
+    from app.services.ai.session_tool_artifact import reusable_result_removal_names
 
     force_reuse = (
         str(getattr(turn_decision, "reusable_result_mode", "none") or "none").strip().lower()
         == "reuse"
     )
-    if force_reuse or should_inject_session_artifact(
-        str(current_user_query or ""),
-        session_artifact,
-        force_reuse=force_reuse,
-    ):
-        names.difference_update(REUSABLE_RESULT_ACQUISITION_TOOLS)
+    # 裁掉哪些工具必须与运行时 filter_tools_for_reusable_result 走**同一个函数**。
+    # 过去这里对系统回执无条件豁免（一个都不裁），运行时却按 should_inject 把
+    # sub_agent_call 一起拔掉——提示词列着、运行时没有，续聊必然失败。
+    # 现在两边都由 reusable_result_removal_names 决定：回执裁事实获取工具、
+    # 保留 sub_agent_call。
+    names.difference_update(
+        reusable_result_removal_names(
+            str(current_user_query or ""),
+            session_artifact,
+            force_reuse=force_reuse,
+        )
+    )
     return names
 
 

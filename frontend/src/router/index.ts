@@ -1,6 +1,8 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { getSnapshotLandingPath } from '../composables/useNavigation'
-import { getCachedUiMode, resolveInitialUiMode } from '../composables/useUiMode'
+import { getCachedUiMode, getCachedUiModeBlocked, resolveInitialUiMode } from '../composables/useUiMode'
+import { isUserModeReachable } from '../constants/userModeMenu'
+import { clearUserSession } from '../utils/userSession'
 
 // 这四个页面此前是**静态** import，等于把整套管理后台（Dashboard 及其依赖）打进
 // 首屏主包——第三方站点嵌入的 `/embed/*` 挂件也得先下载它。改成路由级懒加载后，
@@ -99,6 +101,12 @@ const router = createRouter({
           meta: { perm: 'menu:system:config', title: '系统配置' }
         },
         {
+          path: 'secrets',
+          name: 'AdminSecretCenter',
+          component: () => import('../views/AdminSecretCenter.vue'),
+          meta: { perm: 'menu:system:credentials', title: '凭据中心' }
+        },
+        {
           path: 'menus',
           name: 'MenuManagement',
           component: () => import('../views/MenuManagement.vue'),
@@ -185,6 +193,12 @@ const router = createRouter({
           name: 'MetadataTables',
           component: () => import('../views/MetadataTables.vue'),
           meta: { perm: 'menu:metadata', title: '表详情' }
+        },
+        {
+          path: 'metadata-permissions',
+          name: 'MetadataPermissionOverview',
+          component: () => import('../views/MetadataPermissionOverview.vue'),
+          meta: { perm: 'menu:metadata', title: '权限总览' }
         },
         {
           path: 'data-sources',
@@ -338,6 +352,22 @@ router.beforeEach((to: any, _from: any, next: any) => {
         return
       }
 
+      // 界面模式黑名单：被角色禁用「专业模式」的账号，只能走用户模式能到的页面。
+      // 放在权限判断之前——否则手敲地址栏会先按 menu:* 放行、渲染出页面，
+      // 再被下面的模式判断踢走，看起来像「页面坏了又好了」。
+      //
+      // 只拦「禁用专业模式」：禁用用户模式不改变可达页面集合（两种模式复用同一批
+      // 页面，用户模式只是简化排布），只需要换侧栏。
+      if (
+        getCachedUiModeBlocked().includes('pro') &&
+        !isUserModeReachable(to.path)
+      ) {
+        // 这里是强制换到用户模式的落地页，同样不能写死 /dashboard/chat：
+        // 缺 menu:ai_chat 的账号会被兜到无权限页（原因见 resolveUserModeHomePath）。
+        next(resolveUserModeHomePath(userInfo.permissions?.menus || []))
+        return
+      }
+
       const userMenus = userInfo.permissions?.menus || []
       const isPublicWorkbench = to.name === 'PersonalWorkbench'
       // 只读概览是给「被授权但没有对应管理菜单」的账号用的：
@@ -346,7 +376,9 @@ router.beforeEach((to: any, _from: any, next: any) => {
         to.name === 'ResourceSquareDataset' || to.name === 'ResourceSquareKnowledge'
       
       // 1. 本地会话没有任何菜单权限 → 无权限页（「尝试刷新」会重新拉取 /me）
-      if (userMenus.length === 0 && !isPublicWorkbench && !isReadonlySquarePage) {
+      // 只拦「需要权限码」的页面：个人中心 / 工作空间 / 我的任务等路由没有 meta.perm，
+      // 本来就不该用菜单权限把关，否则无菜单账号连改密码的入口都进不去。
+      if (userMenus.length === 0 && Boolean(to.meta.perm) && !isPublicWorkbench && !isReadonlySquarePage) {
         next({ name: 'NoPermission' })
         return
       }
@@ -359,7 +391,7 @@ router.beforeEach((to: any, _from: any, next: any) => {
       const userModePass = Boolean(to.meta.userModeAllowed) && resolveInitialUiMode() === 'user'
       if (requiredPerm && !userMenus.includes(requiredPerm) && !userModePass) {
         console.warn(`[Guard] Access denied to ${to.path}. Missing ${requiredPerm}`)
-        const fallbackPath = resolveFallbackPath()
+        const fallbackPath = resolveFallbackPath(userMenus)
         if (fallbackPath === to.path) {
           next({ name: 'NoPermission' })
         } else {
@@ -368,12 +400,30 @@ router.beforeEach((to: any, _from: any, next: any) => {
         return
       }
     } catch (e) {
+      // 快照解析失败 = 本地会话已失效，不能只打日志后穿透到末尾的 next()：
+      // 那样会跳过上面所有角色 / 模式 / menu:* 检查，把读不出权限的账号直接放行。
+      // 这里清掉属于该身份的本地副本（user_info、导航快照等）并回登录页，
+      // 让用户重新登录拿一份完好的快照。
       console.error("Router guard parse error", e)
+      clearUserSession()
+      next({ name: 'Login' })
+      return
     }
   }
 
   next()
 })
+
+/**
+ * 用户模式的默认落地页。
+ *
+ * 「智能助手」(/dashboard/chat) 挂着 `menu:ai_chat`：把缺这个权限的账号兜到这里，
+ * 下一次进守卫仍会因缺权限被弹走，最终停在无权限页。所以先看快照里到底有没有
+ * 该权限，没有就退到「我的工作台」——它在路由表里只有 title、不带任何权限码，
+ * 任何登录用户都能进。
+ */
+const resolveUserModeHomePath = (menus: readonly string[]): string =>
+  menus.includes('menu:ai_chat') ? '/dashboard/chat' : '/dashboard/workbench'
 
 /**
  * 兜底落地页。
@@ -382,10 +432,10 @@ router.beforeEach((to: any, _from: any, next: any) => {
  * 后端随导航树一起下发并缓存在本机快照里。守卫必须同步返回，因此只读快照不请求接口。
  * 快照还没有时退回「我的工作台」——它不带权限码，任何登录用户都可进入。
  */
-const resolveFallbackPath = (): string => {
+const resolveFallbackPath = (menus: readonly string[]): string => {
   // 用户模式优先：菜单快照里的 landing 是给专业模式配的（通常是概览或工作台），
   // 普通用户被弹到那一页再自己找入口，等于白绕一圈。
-  if (getCachedUiMode() === 'user') return '/dashboard/chat'
+  if (getCachedUiMode() === 'user') return resolveUserModeHomePath(menus)
   const landing = getSnapshotLandingPath()
   if (landing) return landing
   return '/dashboard/workbench'

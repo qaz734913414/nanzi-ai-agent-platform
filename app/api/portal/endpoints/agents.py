@@ -25,6 +25,7 @@ from app.schemas.agent import (
     AIAgentReorderRequest,
     AIAgentVersionResponse, AIAgentVersionBase,
     AgentDuplicateRequest,
+    AgentGroupUpdateRequest,
     AgentExecutionHistoryResponse,
     AgentOnboardingCreateRequest,
     AgentOnboardingResponse,
@@ -36,6 +37,7 @@ from app.schemas.agent import (
     AgentSystemReviewRequest,
     AgentSystemUnpublishPreview,
     AgentSystemUnpublishRequest,
+    DelegationScopeUpdate,
 )
 
 router = APIRouter()
@@ -291,6 +293,26 @@ async def list_allowed_agents(
     return await AgentManagerService.attach_team_metadata(session, agents)
 
 
+@router.get(
+    "/assigned",
+    response_model=List[AIAgentResponse],
+    summary="分配给我的智能体（只读）",
+)
+async def list_assigned_agents(
+    session: AsyncSession = Depends(get_db_session),
+    user: Dict[str, Any] = Depends(require_permission("menu", "menu:agent_management")),
+):
+    """他人创建、管理员授权给我使用、且当前启用的智能体。
+
+    只读视图：``is_editable`` / ``can_edit_versions`` / ``can_publish_version``
+    由服务层定死为 False，接口不做二次判定——单一来源才不会漏。
+
+    权限沿用 ``menu:agent_management``（与智能体中心页面一致），不新增权限点。
+    路由必须排在 ``/{agent_id}`` 系列之前，否则 "assigned" 会被当成 agent_id。
+    """
+    return await AgentManagerService.list_assigned_agents(session, user=user)
+
+
 @router.get("/{agent_id}/embed-access", response_model=AIAgentResponse)
 async def get_embed_agent_access(
     agent_id: str,
@@ -349,11 +371,21 @@ async def list_agents(session: AsyncSession = Depends(get_db_session), user: Dic
 async def get_agent_toolcall_timeout(
     user: Dict[str, Any] = Depends(require_permission("menu", "menu:agent_management")),
 ):
-    """返回智能体管理页需要展示的全局工具调用超时。"""
+    """返回智能体管理页需要展示的全局工具调用超时，以及整轮看门狗时长。
+
+    看门狗要一起返回：工具级超时允许配得比它大，但那样整轮会先被取消、配置白配，
+    配置界面必须能据此提示——否则用户以为配了 1200s，实际 600s 就被掐断。
+    """
     from app.services.ai.runtime.agentscope.tool_timeout import load_agent_max_toolcall_timeout
+    from app.services.ai.runtime.producer_watchdog import load_producer_hard_timeout
 
     timeout_seconds = await load_agent_max_toolcall_timeout()
-    return {"seconds": int(timeout_seconds)}
+    producer_hard_timeout = await load_producer_hard_timeout()
+    return {
+        "seconds": int(timeout_seconds),
+        # 0 表示看门狗已关闭，此时不存在整轮天花板
+        "producer_hard_timeout_seconds": int(producer_hard_timeout),
+    }
 
 
 @router.get(
@@ -517,6 +549,33 @@ async def update_agent(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not agent:
         raise HTTPException(status_code=403, detail="Forbidden: You can only edit your own agents")
+    return agent
+
+
+@router.put(
+    "/{agent_id}/group",
+    response_model=AIAgentResponse,
+    dependencies=[Depends(require_permission("element", "element:agent:edit"))],
+    summary="设置智能体业务分组（只改这一列，不触发其它元数据校验）",
+)
+async def update_agent_group(
+    agent_id: str,
+    data: AgentGroupUpdateRequest,
+    session: AsyncSession = Depends(get_db_session),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """只改「业务分组」；空白或 null 表示清空（回到未分组）。
+
+    不走 `PUT /{agent_id}`：那条路为「元数据整表单保存」服务，会连带校验待审冻结、
+    是否系统级、引擎是否可改，用户只是想把智能体归个类，不该因此被拒。
+    """
+    agent = await AgentManagerService.set_agent_group(
+        session, agent_id, data.group_name, user=user
+    )
+    if not agent:
+        raise HTTPException(
+            status_code=404, detail="智能体不存在，或你没有权限修改它的分组"
+        )
     return agent
 
 
@@ -803,6 +862,114 @@ async def publish_agent_version(agent_id: str, version_id: str, session: AsyncSe
         raise HTTPException(status_code=403, detail="Forbidden: Failed to publish version (check ownership)")
     return {"status": "success"}
 
+def _delegation_scope_error(exc: Exception) -> HTTPException:
+    """把服务层的领域异常翻译成前端能直接分支的错误码。"""
+    from app.services.ai.agent_delegation_scope_service import (
+        AgentNotVisibleError,
+        DelegationScopeError,
+        DelegationToolDisabledError,
+        NoPublishedVersionError,
+        TooManyMembersError,
+    )
+
+    if isinstance(exc, NoPublishedVersionError):
+        return HTTPException(
+            status_code=409,
+            detail={"code": "NO_PUBLISHED_VERSION", "message": str(exc)},
+        )
+    if isinstance(exc, DelegationToolDisabledError):
+        return HTTPException(
+            status_code=409,
+            detail={"code": "DELEGATION_TOOL_DISABLED", "message": str(exc)},
+        )
+    if isinstance(exc, TooManyMembersError):
+        return HTTPException(
+            status_code=422,
+            detail={
+                "code": "TOO_MANY_MEMBERS",
+                "message": str(exc),
+                "count": exc.count,
+            },
+        )
+    if isinstance(exc, AgentNotVisibleError):
+        # 不存在与无权共用一个 404：分开会变成存在性探测
+        return HTTPException(
+            status_code=404,
+            detail={"code": "AGENT_NOT_FOUND", "message": str(exc)},
+        )
+    if isinstance(exc, DelegationScopeError):
+        return HTTPException(
+            status_code=403,
+            detail={"code": "SCOPE_NOT_WRITABLE", "message": str(exc)},
+        )
+    raise exc
+
+
+@router.get(
+    "/{agent_id}/delegation-scope",
+    dependencies=[Depends(require_permission("element", "element:agent:edit"))],
+)
+async def read_delegation_scope(
+    agent_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """专家团成员现状：版本号、是否有已发布版本、委派工具是否启用、当前名单。
+
+    三项前置条件一次带回去，前端才能直接决定「成员区可编辑 / 换成说明」，
+    不用让用户点一次保存才发现配不了。
+    """
+    from app.services.ai.agent_delegation_scope_service import (
+        AgentDelegationScopeService,
+    )
+
+    try:
+        # 必须带上 user：版本号与成员名单属于配置信息，不能凭 agent_id 裸读
+        state = await AgentDelegationScopeService.read_scope(session, agent_id, user)
+    except Exception as exc:  # noqa: BLE001
+        raise _delegation_scope_error(exc) from exc
+    return state.as_dict()
+
+
+@router.put(
+    "/{agent_id}/delegation-scope",
+    dependencies=[Depends(require_permission("element", "element:agent:edit"))],
+)
+async def save_delegation_scope(
+    agent_id: str,
+    data: DelegationScopeUpdate,
+    session: AsyncSession = Depends(get_db_session),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """保存成员名单：生成一份新版本，**只**替换名单，其余配置原样沿用。
+
+    不走「新建草稿 → 发布」两段式：运行时读的就是最新 PUBLISHED 版本，
+    在这里复刻一份并立刻发布，用户感知是「改完就生效」，版本历史仍然完整。
+    """
+    from app.services.ai.agent_delegation_scope_service import (
+        AgentDelegationScopeService,
+    )
+
+    try:
+        state = await AgentDelegationScopeService.save_scope(
+            session,
+            agent_id,
+            data.delegable_agent_ids,
+            enable_tool=data.enable_delegation_tool,
+            user=user,
+        )
+    except Exception as exc:  # noqa: BLE001 —— 统一在这里翻译成 HTTP 语义
+        from app.services.ai.agent_manager import AgentNotReadyError
+
+        if isinstance(exc, AgentNotReadyError):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "AGENT_NOT_READY", "missing": list(exc.missing)},
+            ) from exc
+        raise _delegation_scope_error(exc) from exc
+    return state.as_dict()
+
+
 @router.delete("/{agent_id}/versions/{version_id}", dependencies=[Depends(require_permission("element", "element:agent:edit"))])
 async def delete_agent_version(agent_id: str, version_id: str, session: AsyncSession = Depends(get_db_session), user: Dict[str, Any] = Depends(get_current_user)):
     """删除指定版本 (仅限 DRAFT 或 ARCHIVED)"""
@@ -982,9 +1149,18 @@ async def submit_version_release_request(
     所有者改完草稿后走这条通道，管理员审核通过即发布该版本，
     不必线下沟通「你去点一下 V3」。
     """
-    request = await AgentSystemPublicationService.submit_release_request(
-        session, agent_id, data.version_id, user, comment=data.comment
-    )
+    from app.services.ai.agent_manager import AgentNotReadyError
+
+    try:
+        request = await AgentSystemPublicationService.submit_release_request(
+            session, agent_id, data.version_id, user, comment=data.comment
+        )
+    except AgentNotReadyError as exc:
+        # 前端按 code 把 missing 翻成中文清单；不要把 ValueError 漏成 500。
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "AGENT_NOT_READY", "missing": list(exc.missing)},
+        ) from exc
     return {"request_id": request.id, "status": request.status}
 
 

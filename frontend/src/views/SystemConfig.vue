@@ -12,6 +12,8 @@ import ToolRegistry from '../components/system/ToolRegistry.vue'
 import ChatTour from '../components/embed/ChatTour.vue'
 import { SYSTEM_CONFIG_TOUR_STEPS } from '../components/system/systemConfigTourSteps'
 import { useSystemConfigTour } from '../composables/system/useSystemConfigTour'
+import InstanceNodesPanel from '../components/system/InstanceNodesPanel.vue'
+import SystemBroadcastPanel from '../components/system/SystemBroadcastPanel.vue'
 import LangfuseConfig from '../components/system/LangfuseConfig.vue'
 import RagFlowResourceSelector from '../components/RagFlowResourceSelector.vue'
 import ConfirmModal from '../components/ConfirmModal.vue'
@@ -33,6 +35,7 @@ import {
   EyeSlashIcon,
   CpuChipIcon,
   AdjustmentsHorizontalIcon,
+  ShieldCheckIcon,
   SparklesIcon,
   WrenchScrewdriverIcon,
   TrashIcon,
@@ -51,7 +54,8 @@ import {
   ExclamationTriangleIcon,
   DocumentDuplicateIcon,
   ChartBarSquareIcon,
-  EnvelopeIcon
+  EnvelopeIcon,
+  MegaphoneIcon
 } from '@heroicons/vue/24/outline'
 
 const router = useRouter()
@@ -61,6 +65,15 @@ const canSave = hasPermission('element:system:config_save')
 
 const activeTab = ref<'diagnostics' | 'configs' | 'models' | 'tools' | 'logs' | 'branding' | 'langfuse'>('configs')
 const diagSubTab = ref<'console' | 'redis'>('console')
+// 系统诊断内部的二级左栏：诊断（原有内容）/ 实例（多节点心跳）/ 站内信群发（仅 admin）
+const diagSection = ref<'diag' | 'instances' | 'broadcast'>('diag')
+// 站内信群发是广播动作，入口与后端接口都只对管理员开放
+const isAdmin = computed(() => userInfo.value?.role === 'admin')
+const instanceSummary = ref<{ online: number; total: number }>({ online: 0, total: 0 })
+
+function onInstanceSummary(value: { online: number; total: number }) {
+  instanceSummary.value = value
+}
 // 「Redis 向量搜索」的检测详情默认收起，避免顶部操作区占用过多高度
 const vectorHealthExpanded = ref(false)
 // 对外访问地址的使用场景说明较长，默认折叠成一行摘要，点「查看说明」再展开
@@ -1111,10 +1124,12 @@ const normalizeAgentToolcallTimeoutInput = (item: ConfigItem) => {
     : '120'
 }
 // producer 硬超时看门狗。与工具超时的唯一区别是下界：0 是合法值，表示关闭看门狗
-// （后端 validate_producer_hard_timeout 接受 0 或 60-3600）。注意「清空输入框」不等于
+// （后端 validate_producer_hard_timeout 接受 0 或 60-86400）。注意「清空输入框」不等于
 // 「填 0」——空值一律回落默认值，否则用户误删一下就静默关掉了兜底。
+// 上限与工具级/版本级超时同口径：工具级允许配到 86400，看门狗若只到 3600，那些长预算
+// 就永远跑不完（整轮先被取消），配置等于白配。
 const PRODUCER_HARD_TIMEOUT_MIN = 0
-const PRODUCER_HARD_TIMEOUT_MAX = 3600
+const PRODUCER_HARD_TIMEOUT_MAX = 86400
 const PRODUCER_HARD_TIMEOUT_DEFAULT = 600
 const getProducerHardTimeoutValue = (item: ConfigItem) => {
   const raw = String(item.value ?? '').trim()
@@ -1627,6 +1642,8 @@ const getCategoryLabel = (cat: string, short = true) => {
     'sandbox':       { short: '安全沙箱',    full: '安全沙箱 (Sandbox)' },
     'other':         { short: '其他参数',    full: '其他参数 (Other Parameters)' },
     'email':         { short: '邮件服务',    full: '邮件服务 (Mail Service)' },
+    // 这个分组里只有 secret_policy_*：既然全是凭据注入的闸门，就叫它凭证策略
+    'security':      { short: '凭证策略',    full: '凭证策略 (Credential Policy)' },
   }
   const entry = map[cat]
   if (!entry) return cat.toUpperCase()
@@ -1653,9 +1670,62 @@ const CATEGORY_ICONS: Record<string, any> = {
   'sandbox':       CommandLineIcon,
   'other':         WrenchScrewdriverIcon,
   'email':         EnvelopeIcon,
+  'security':      ShieldCheckIcon,
 }
 
 const getCategoryIcon = (cat: string) => CATEGORY_ICONS[cat] || CATEGORY_ICONS['general']
+
+/**
+ * 0/1 语义的开关型参数。这些值存的是 '0'/'1' 字符串（种子 SQL 里就是 '0'/'1'），
+ * 让用户在输入框里手打 0 和 1 有两个问题：看不出当前是开还是关，而且打成 '01'、
+ * 'true'、空串都能提交，最后是解析层去兜。这里显式列出，渲染成开关。
+ */
+const BOOLEAN_FLAG_KEYS = new Set([
+  'secret_policy_allow_external_host',
+  'secret_policy_allow_script_env',
+])
+
+const isBooleanFlag = (item: ConfigItem) => BOOLEAN_FLAG_KEYS.has(item.key)
+
+const isFlagOn = (item: ConfigItem) => (item.value ?? '').trim() === '1'
+
+const toggleFlag = (item: ConfigItem) => {
+  item.value = isFlagOn(item) ? '0' : '1'
+}
+
+/**
+ * 单次注入上限：只允许 1-50 的整数。
+ *
+ * 它原来是一个普通文本框，中文也能打进去、存库也不报错，读取侧再退回默认值——
+ * 「改了但没生效」是最难查的一类问题。这里换成加减器，输入框也限成 number，
+ * 失焦时纠正到合法区间。后端 `validate_config_update` 是硬闸门，前端只负责别
+ * 让人先输错再吃一个 400。
+ */
+const SECRET_MAX_INJECT_KEY = 'secret_policy_max_inject_per_call'
+const SECRET_MAX_INJECT_RANGE = [1, 50] as const
+
+const isSecretMaxInject = (item: ConfigItem) => item.key === SECRET_MAX_INJECT_KEY
+
+const clampLimit = (item: ConfigItem) => {
+  const raw = Number(String(item.value ?? '').trim())
+  const [low, high] = SECRET_MAX_INJECT_RANGE
+  const next = Number.isFinite(raw) ? Math.round(raw) : low
+  item.value = String(Math.min(high, Math.max(low, next)))
+}
+
+const nudgeLimit = (item: ConfigItem, delta: number) => {
+  const raw = Number(String(item.value ?? '').trim())
+  const [low, high] = SECRET_MAX_INJECT_RANGE
+  const next = (Number.isFinite(raw) ? raw : low) + delta
+  item.value = String(Math.min(high, Math.max(low, Math.round(next))))
+}
+
+const canNudge = (item: ConfigItem, delta: number) => {
+  const raw = Number(String(item.value ?? '').trim())
+  const [low, high] = SECRET_MAX_INJECT_RANGE
+  const base = Number.isFinite(raw) ? raw : low
+  return delta > 0 ? base < high : base > low
+}
 
 const isLongText = (item: ConfigItem) => {
   if (item.key === 'sandbox_docker_base_image') return false
@@ -2642,6 +2712,9 @@ const configShortDescriptions: Record<string, string> = {
   agent_context_llm_summary_enabled: '是否用当前会话模型对历史做语义摘要，失败或超时会自动降级为确定性摘录。',
   sandbox_policy: '安全沙箱执行策略。local 表示在宿主机扩展进程内直接执行（当前默认）；docker 表示在自动构建的 Docker 容器内执行；e2b 表示在 E2B 云端沙箱内执行；ssh 表示在 SSH 远程主机上执行。',
   sandbox_docker_base_image: 'docker 策略使用的容器基础镜像（留空默认使用官方标准镜像 python:3.11-slim）。',
+  sandbox_docker_memory_limit_mb: 'docker 策略沙箱容器的内存上限（整数 MB，默认 2048；填 0 表示不限）。同时把 swap 上限压到与内存一致，避免内存打满后继续吃宿主机 swap。改完只对新容器生效。',
+  sandbox_docker_cpu_limit: 'docker 策略沙箱容器的 CPU 上限（核数，可填小数如 1.5，默认 2；填 0 表示不限）。防止单个死循环打满宿主机 CPU。改完只对新容器生效。',
+  sandbox_docker_pids_limit: 'docker 策略沙箱容器内的进程数上限（默认 512；填 0 表示不限）。用于阻断 fork bomb，同时给 pip/uv 并发编译留足余量。改完只对新容器生效。',
   sandbox_k8s_namespace: 'k8s 策略沙箱 Pod 运行的命名空间（默认与平台同命名空间 nanzi-ai-agent；留空表示自动跟随平台命名空间）。注意：只有与平台同命名空间，沙箱才能通过 sandbox_k8s_existing_pvc 共享用户工作区（PVC 为命名空间级资源）。',
   sandbox_k8s_image: 'k8s 策略沙箱容器运行的基础镜像（默认 python:3.11-slim）。可填自动构建的“网关预置镜像” nanzi-sandbox-k8s:<版本> 加速冷启动（构建方式见下方提示）。',
   sandbox_k8s_existing_pvc: 'k8s 策略的共享数据卷：留空则自动探测平台自身数据卷并共享用户工作区（推荐，零配置，与 Docker 沙箱一致）；填 none 强制使用每工作区独立空卷（沙箱内看不到用户工作区）；填具体 PVC 名则显式指向该共享卷（须与平台同命名空间）。',
@@ -2830,7 +2903,10 @@ const getVisibleItems = (items: ConfigItem[] | undefined, category: string) => {
     // 按当前 sandbox 策略动态过滤：仅展示与该策略相关的配置项
     const policy = targetSandboxPolicy()
     const policyKeySets: Record<string, string[]> = {
-      docker: ['sandbox_docker_base_image'],
+      docker: [
+        'sandbox_docker_base_image',
+        'sandbox_docker_memory_limit_mb', 'sandbox_docker_cpu_limit', 'sandbox_docker_pids_limit'
+      ],
       k8s: [
         'sandbox_k8s_namespace', 'sandbox_k8s_image', 'sandbox_k8s_existing_pvc',
         'sandbox_k8s_storage_class', 'sandbox_k8s_storage_size',
@@ -3590,7 +3666,56 @@ onUnmounted(() => {
        </div>
 
         <!-- DIAGNOSTICS TAB -->
-        <div v-else-if="activeTab === 'diagnostics'" class="flex flex-col gap-4 h-full min-h-0 pb-6 overflow-y-auto custom-scrollbar">
+        <div v-else-if="activeTab === 'diagnostics'" class="flex h-full min-h-0 flex-col gap-3 lg:flex-row lg:gap-4">
+          <!-- 二级导航：窄屏横排成一行页签，宽屏才恢复左侧栏。
+               固定 176px 的左栏在手机上会把右侧压到 200px 以下：卡片标题、按钮、
+               说明文字全部折成竖排字，按钮还会被裁到屏幕外。 -->
+          <aside class="flex shrink-0 lg:w-44">
+            <!-- 通高白卡：左栏只放两个页签，别让下面的版面底色露出来 -->
+            <div class="flex w-full flex-col rounded-xl border border-gray-200/80 bg-white p-2 shadow-sm lg:flex-1">
+              <div class="hidden px-2 pb-1.5 pt-1 text-[10.5px] font-semibold tracking-wide text-gray-400 lg:block">系统诊断</div>
+              <div class="flex items-center gap-1 lg:flex-col lg:items-stretch lg:gap-0">
+                <button
+                  type="button"
+                  class="flex flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-lg px-2 py-1.5 text-[13px] transition-colors cursor-pointer lg:mb-0.5 lg:flex-none lg:justify-start"
+                  :class="diagSection === 'diag' ? 'bg-primary/10 font-semibold text-primary ring-1 ring-primary/20' : 'text-gray-600 hover:bg-gray-50'"
+                  @click="diagSection = 'diag'"
+                >
+                  <BoltIcon class="h-4 w-4 shrink-0" />
+                  诊断
+                </button>
+                <button
+                  type="button"
+                  class="flex flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-lg px-2 py-1.5 text-[13px] transition-colors cursor-pointer lg:flex-none lg:justify-start"
+                  :class="diagSection === 'instances' ? 'bg-primary/10 font-semibold text-primary ring-1 ring-primary/20' : 'text-gray-600 hover:bg-gray-50'"
+                  @click="diagSection = 'instances'"
+                >
+                  <ServerStackIcon class="h-4 w-4 shrink-0" />
+                  实例
+                  <span
+                    v-if="instanceSummary.total"
+                    class="ml-1 rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-bold text-emerald-700 lg:ml-auto"
+                  >
+                    {{ instanceSummary.online }}/{{ instanceSummary.total }}
+                  </span>
+                </button>
+                <button
+                  v-if="isAdmin"
+                  type="button"
+                  class="flex flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-lg px-2 py-1.5 text-[13px] transition-colors cursor-pointer lg:flex-none lg:justify-start"
+                  :class="diagSection === 'broadcast' ? 'bg-primary/10 font-semibold text-primary ring-1 ring-primary/20' : 'text-gray-600 hover:bg-gray-50'"
+                  @click="diagSection = 'broadcast'"
+                >
+                  <MegaphoneIcon class="h-4 w-4 shrink-0" />
+                  站内信群发
+                </button>
+                </div>
+              <div v-if="diagSection !== 'broadcast'" class="mt-auto hidden rounded-lg border border-dashed border-gray-200 bg-gray-50/60 px-2 py-1.5 text-[10.5px] leading-relaxed text-gray-500 lg:block">
+                主 / 从只影响定时调度，其他能力每个实例都一样。
+              </div>
+            </div>
+          </aside>
+          <div v-show="diagSection === 'diag'" class="flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto custom-scrollbar pb-6">
           <!-- 顶部：连接与能力检查区域（支持智能 Mini 摘要条折叠/展开） -->
           <div class="flex-shrink-0 transition-all duration-200">
             <!-- 状态 1：折叠态 Mini 状态胶囊栏 -->
@@ -3671,15 +3796,15 @@ onUnmounted(() => {
             <!-- 状态 2：展开态完整双卡片 -->
             <div v-else class="space-y-2">
               <!-- 卡片上方轻量操作栏（放收起按钮） -->
-              <div class="flex items-center justify-between px-1 text-xs text-gray-500">
-                <span class="font-medium text-gray-600 flex items-center gap-1.5">
+              <div class="flex flex-wrap items-center justify-between gap-2 px-1 text-xs text-gray-500">
+                <span class="flex items-center gap-1.5 font-medium text-gray-600">
                   <span class="h-1.5 w-1.5 rounded-full bg-primary/80"></span>
                   服务连接与组件能力概览
                 </span>
                 <button
                   @click="toggleDiagnosticsOverview"
                   type="button"
-                  class="inline-flex items-center gap-1 py-1 px-2 rounded-lg text-xs font-medium text-gray-500 hover:text-primary hover:bg-gray-100 transition-colors cursor-pointer"
+                  class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg px-2 py-1 text-xs font-medium text-gray-500 transition-colors hover:bg-gray-100 hover:text-primary cursor-pointer"
                 >
                   <span>收起概览</span>
                   <ChevronUpIcon class="h-3.5 w-3.5" />
@@ -3692,14 +3817,14 @@ onUnmounted(() => {
             <div class="rounded-xl border border-gray-200/80 bg-white shadow-sm hover:shadow-md transition-all duration-200 p-4 sm:p-5 flex flex-col justify-between">
               <div>
                 <!-- 卡片头部与状态徽章 -->
-                <div class="flex items-start justify-between gap-3">
+                <div class="flex flex-wrap items-start justify-between gap-3">
                   <div class="flex items-center gap-3 min-w-0">
                     <div class="h-10 w-10 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center flex-shrink-0 text-primary shadow-xs">
                       <CircleStackIcon class="h-5 w-5" />
                     </div>
                     <div class="min-w-0">
-                      <div class="flex items-center gap-2">
-                        <h3 class="text-base font-semibold text-gray-900 tracking-tight">Redis 服务</h3>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <h3 class="whitespace-nowrap text-base font-semibold text-gray-900 tracking-tight">Redis 服务</h3>
                         <span class="text-[10px] font-mono text-gray-500 bg-gray-100/90 border border-gray-200/60 px-1.5 py-0.5 rounded">Core Cache</span>
                       </div>
                       <p class="text-xs text-gray-500 mt-0.5 truncate">缓存加速、会话维持与限流队列</p>
@@ -3724,8 +3849,8 @@ onUnmounted(() => {
                 </div>
 
                 <!-- 架构信息条 -->
-                <div class="mt-3.5 mb-3 py-1.5 px-3 rounded-lg bg-gray-50/80 border border-gray-100 text-xs text-gray-500 flex items-center justify-between">
-                  <span class="flex items-center gap-1.5 text-gray-600">
+                <div class="mt-3.5 mb-3 py-1.5 px-3 rounded-lg bg-gray-50/80 border border-gray-100 text-xs text-gray-500 flex flex-wrap items-center justify-between gap-2">
+                  <span class="flex min-w-0 items-center gap-1.5 text-gray-600">
                     <InformationCircleIcon class="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
                     <span>核心组件：分布式缓存与热点数据读写</span>
                   </span>
@@ -3734,8 +3859,8 @@ onUnmounted(() => {
               </div>
 
               <!-- 底部操作按钮组 -->
-              <div class="border-t border-gray-100 pt-3 flex items-center justify-between flex-wrap gap-2">
-                <div class="flex items-center gap-2">
+              <div class="border-t border-gray-100 pt-3 flex flex-wrap items-center justify-between gap-2">
+                <div class="flex flex-wrap items-center gap-2">
                   <!-- 主按钮：测试连接 -->
                   <button
                     @click="testConnection('redis')"
@@ -3776,14 +3901,14 @@ onUnmounted(() => {
             <div class="rounded-xl border border-gray-200/80 bg-white shadow-sm hover:shadow-md transition-all duration-200 p-4 sm:p-5 flex flex-col justify-between">
               <div>
                 <!-- 卡片头部与状态徽章 -->
-                <div class="flex items-start justify-between gap-3">
+                <div class="flex flex-wrap items-start justify-between gap-3">
                   <div class="flex items-center gap-3 min-w-0">
                     <div class="h-10 w-10 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center flex-shrink-0 text-primary shadow-xs">
                       <CpuChipIcon class="h-5 w-5" />
                     </div>
                     <div class="min-w-0">
-                      <div class="flex items-center gap-2">
-                        <h3 class="text-base font-semibold text-gray-900 tracking-tight">Redis 向量搜索</h3>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <h3 class="whitespace-nowrap text-base font-semibold text-gray-900 tracking-tight">Redis 向量搜索</h3>
                         <span class="text-[10px] font-mono text-gray-500 bg-gray-100/90 border border-gray-200/60 px-1.5 py-0.5 rounded">RediSearch</span>
                       </div>
                       <p class="text-xs text-gray-500 mt-0.5 truncate">检测会话摘要、长期记忆与本地向量引擎能力</p>
@@ -3817,8 +3942,8 @@ onUnmounted(() => {
                 </div>
 
                 <!-- 架构信息条 -->
-                <div class="mt-3.5 mb-3 py-1.5 px-3 rounded-lg bg-gray-50/80 border border-gray-100 text-xs text-gray-500 flex items-center justify-between">
-                  <span class="flex items-center gap-1.5 text-gray-600">
+                <div class="mt-3.5 mb-3 py-1.5 px-3 rounded-lg bg-gray-50/80 border border-gray-100 text-xs text-gray-500 flex flex-wrap items-center justify-between gap-2">
+                  <span class="flex min-w-0 items-center gap-1.5 text-gray-600">
                     <InformationCircleIcon class="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
                     <span>检索算法：HNSW 向量近似邻近索引</span>
                   </span>
@@ -3827,8 +3952,8 @@ onUnmounted(() => {
               </div>
 
               <!-- 底部操作按钮组 -->
-              <div class="border-t border-gray-100 pt-3 flex items-center justify-between flex-wrap gap-2">
-                <div class="flex items-center gap-2">
+              <div class="border-t border-gray-100 pt-3 flex flex-wrap items-center justify-between gap-2">
+                <div class="flex flex-wrap items-center gap-2">
                   <!-- 主按钮：重新检测 -->
                   <button
                     @click="testRedisVectorSearch(true)"
@@ -3894,13 +4019,13 @@ onUnmounted(() => {
 
           <!-- 下方：诊断控制台 / Redis 浏览器（全宽一体化面板） -->
           <div class="flex-1 min-h-[520px] bg-white rounded-xl shadow-sm border border-gray-200/80 flex flex-col overflow-hidden">
-            <div class="px-4 py-2.5 flex justify-between items-center border-b border-gray-100 bg-white/95 flex-shrink-0">
+            <div class="flex flex-shrink-0 flex-wrap items-center justify-between gap-2 border-b border-gray-100 bg-white/95 px-4 py-2.5">
               <!-- 分段控制器 Tab -->
               <div class="inline-flex p-0.5 bg-gray-100/90 rounded-lg border border-gray-200/40">
                 <button
                   @click="diagSubTab = 'console'"
                   type="button"
-                  class="px-3.5 py-1.5 rounded-md text-xs transition-all duration-150 flex items-center cursor-pointer"
+                  class="flex cursor-pointer items-center whitespace-nowrap rounded-md px-3.5 py-1.5 text-xs transition-all duration-150"
                   :class="diagSubTab === 'console' ? 'bg-white text-gray-900 shadow-xs font-semibold' : 'text-gray-500 hover:text-gray-900 font-medium'"
                 >
                   <CommandLineIcon class="w-3.5 h-3.5 mr-1.5" :class="diagSubTab === 'console' ? 'text-primary' : 'text-gray-400'" />
@@ -3909,7 +4034,7 @@ onUnmounted(() => {
                 <button
                   @click="diagSubTab = 'redis'"
                   type="button"
-                  class="px-3.5 py-1.5 rounded-md text-xs transition-all duration-150 flex items-center cursor-pointer"
+                  class="flex cursor-pointer items-center whitespace-nowrap rounded-md px-3.5 py-1.5 text-xs transition-all duration-150"
                   :class="diagSubTab === 'redis' ? 'bg-white text-gray-900 shadow-xs font-semibold' : 'text-gray-500 hover:text-gray-900 font-medium'"
                 >
                   <CircleStackIcon class="w-3.5 h-3.5 mr-1.5" :class="diagSubTab === 'redis' ? 'text-primary' : 'text-gray-400'" />
@@ -3941,9 +4066,9 @@ onUnmounted(() => {
             </div>
 
             <!-- Tab: Redis Browser -->
-            <div v-else-if="diagSubTab === 'redis'" class="flex-1 flex space-x-4 overflow-hidden p-4 bg-gray-50/60">
+            <div v-else-if="diagSubTab === 'redis'" class="flex-1 flex flex-col gap-3 overflow-y-auto p-4 bg-gray-50/60 lg:flex-row lg:gap-0 lg:space-x-4 lg:overflow-hidden">
               <!-- Left Column: Keys list -->
-              <div class="w-2/5 bg-white border border-gray-200/80 rounded-xl p-3 flex flex-col h-full overflow-hidden shadow-xs">
+              <div class="flex max-h-[45vh] min-h-[240px] w-full flex-col overflow-hidden rounded-xl border border-gray-200/80 bg-white p-3 shadow-xs lg:h-full lg:max-h-none lg:w-2/5">
                 <!-- 一体化搜索栏 -->
                 <div class="mb-3 relative flex items-center flex-shrink-0">
                   <div class="pointer-events-none absolute inset-y-0 left-0 pl-3 flex items-center">
@@ -4067,7 +4192,7 @@ onUnmounted(() => {
               </div>
 
               <!-- Right Column: Key detail -->
-              <div class="flex-1 bg-white border border-gray-200 rounded-lg p-4 flex flex-col h-full overflow-hidden">
+              <div class="flex min-h-[240px] flex-1 flex-col overflow-hidden rounded-lg border border-gray-200 bg-white p-4 lg:h-full">
                 <div v-if="redisDetailLoading" class="flex-1 flex flex-col items-center justify-center">
                   <span class="animate-spin h-8 w-8 border-2 border-primary border-t-transparent rounded-full mb-2"></span>
                   <p class="text-gray-400 text-xs">正在加载详情...</p>
@@ -4112,6 +4237,15 @@ onUnmounted(() => {
               </div>
             </div>
           </div>
+          </div>
+
+          <!-- 实例：多节点心跳（数据来自共享 Redis，15s 自动刷新） -->
+          <div v-show="diagSection === 'instances'" class="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto custom-scrollbar pb-6">
+            <InstanceNodesPanel @summary="onInstanceSummary" />
+          </div>
+
+          <!-- 站内信群发：仅 admin 可见（后端 /broadcast 两个端点同样 require_admin） -->
+          <SystemBroadcastPanel v-if="isAdmin && diagSection === 'broadcast'" />
         </div>
 
       <!-- BRANDING TAB -->
@@ -4570,6 +4704,62 @@ onUnmounted(() => {
                                  <option value="observe">observe (仅观测：保持传统布局发送，仅统计供应商命中指标)</option>
                                  <option value="enabled">enabled (启用优化：按灰度比例启用稳定层前置缓存布局)</option>
                               </select>
+                          </div>
+                          <div v-else-if="isBooleanFlag(item)">
+                            <div class="flex items-center gap-3">
+                              <button
+                                type="button"
+                                role="switch"
+                                :disabled="isConfigItemDisabled(String(category), item)"
+                                :aria-checked="isFlagOn(item)"
+                                :aria-label="item.key"
+                                @click="toggleFlag(item)"
+                                class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed shadow-inner"
+                                :class="isFlagOn(item) ? 'bg-primary' : 'bg-gray-200'"
+                              >
+                                <span
+                                  aria-hidden="true"
+                                  class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out"
+                                  :class="isFlagOn(item) ? 'translate-x-5' : 'translate-x-0'"
+                                ></span>
+                              </button>
+                              <span
+                                class="text-xs font-medium"
+                                :class="isFlagOn(item) ? 'text-primary font-semibold' : 'text-gray-500'"
+                              >
+                                {{ isFlagOn(item) ? '允许' : '不允许' }}
+                              </span>
+                            </div>
+                          </div>
+                          <div v-else-if="isSecretMaxInject(item)">
+                            <div class="flex items-center gap-2">
+                              <button
+                                type="button"
+                                :disabled="isConfigItemDisabled(String(category), item) || !canNudge(item, -1)"
+                                :aria-label="'减少一条'"
+                                class="flex h-9 w-9 items-center justify-center rounded-md border border-gray-300 bg-white text-gray-600 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                @click="nudgeLimit(item, -1)"
+                              >−</button>
+                              <input
+                                v-model="item.value"
+                                type="number"
+                                min="1"
+                                max="50"
+                                step="1"
+                                inputmode="numeric"
+                                :disabled="isConfigItemDisabled(String(category), item)"
+                                class="h-9 w-20 rounded-md border border-gray-300 bg-white text-center text-sm tabular-nums focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary disabled:cursor-not-allowed disabled:bg-gray-100 disabled:opacity-70"
+                                @blur="clampLimit(item)"
+                              />
+                              <button
+                                type="button"
+                                :disabled="isConfigItemDisabled(String(category), item) || !canNudge(item, 1)"
+                                aria-label="增加一条"
+                                class="flex h-9 w-9 items-center justify-center rounded-md border border-gray-300 bg-white text-gray-600 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                @click="nudgeLimit(item, 1)"
+                              >+</button>
+                              <span class="text-xs text-gray-500">条（1-50）</span>
+                            </div>
                           </div>
                           <div v-else-if="item.key === 'agent_graceful_finish_enabled'">
                             <div class="flex items-center gap-3">

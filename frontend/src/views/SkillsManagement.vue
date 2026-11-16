@@ -11,10 +11,21 @@ import { useToast } from '../composables/useToast'
 import SkillFileTree from '../components/SkillFileTree.vue'
 import ConfirmModal from '../components/ConfirmModal.vue'
 import MarkdownIt from 'markdown-it'
+import { sanitizeRenderedHtml } from '../utils/sanitizeHtml'
 import { copyToClipboard } from '../utils/clipboard'
 import { useUser } from '../composables/useUser'
 import InputModal from '../components/InputModal.vue'
 import { isSkillEnabled } from '@/utils/skillEnabled'
+import ToolGroupTabs from '@/components/system/ToolGroupTabs.vue'
+import {
+  ALL_GROUP_KEY,
+  computeGroupTabs,
+  matchesToolFilters,
+  toolGroupName,
+  type GroupableTool,
+  type ToolFilterState,
+  type ToolSearchField,
+} from '@/utils/toolGroupTabs'
 
 /** 发布状态：与后端 skill_publication_service 的取值一一对应（新增状态必须同步这里）。 */
 type PublicationStatus = 'UNPUBLISHED' | 'PENDING' | 'PUBLISHED' | 'REJECTED' | 'WITHDRAWN' | 'REVOKED'
@@ -30,6 +41,8 @@ interface Skill {
   scope?: 'global' | 'personal'
   modified_at?: number
   enabled?: string
+  /** 业务分组：来自 SKILL.md frontmatter 的 `group:`，单值，空 = 未分组 */
+  group?: string | null
   publication_id?: string | null
   publication_status?: PublicationStatus
   current_public_version?: number | null
@@ -203,6 +216,31 @@ const route = useRoute()
 const resolvePersonalMenu = (): PersonalMenuKey =>
   normalizePersonalMenu(String(route.query.skills_tab || '') || props.initialPersonalMenu)
 const personalMenu = ref<PersonalMenuKey>(resolvePersonalMenu())
+
+/**
+ * 「个人技能」左侧栏是否收起。
+ *
+ * 默认收起：第一次进来就是 64px 图标条，把 200px 让给右侧卡片（那里才是要看的东西），
+ * 需要文字时点一下箭头展开。存过 '0'（展开）的老用户保持展开，不强行改掉已有选择。
+ */
+const PERSONAL_MENU_COLLAPSED_KEY = 'skills.personalMenu.collapsed'
+const readPersonalMenuCollapsed = (): boolean => {
+  try {
+    const raw = localStorage.getItem(PERSONAL_MENU_COLLAPSED_KEY)
+    // 读不到（首次进入 / 隐私模式 / 禁用 storage）时按默认收起处理
+    return raw === null ? true : raw === '1'
+  } catch {
+    return true
+  }
+}
+const personalMenuCollapsed = ref(readPersonalMenuCollapsed())
+watch(personalMenuCollapsed, (collapsed) => {
+  try {
+    localStorage.setItem(PERSONAL_MENU_COLLAPSED_KEY, collapsed ? '1' : '0')
+  } catch {
+    /* 存不了就算了，不影响当前会话 */
+  }
+})
 const shareDialogSkill = ref<Skill | null>(null)
 const shareMenuCounts = ref({ received_pending: 0, sent_pending: 0, sent_total: 0 })
 
@@ -256,7 +294,9 @@ const showCreateModal = ref(false)
 const newSkill = ref({
   id: '',
   name: '',
-  description: ''
+  description: '',
+  /** 业务分组：会写进 SKILL.md 的 `group:`，空 = 未分组 */
+  group: '',
 })
 const creating = ref(false)
 
@@ -570,7 +610,7 @@ const closeActionMenu = () => {
   actionMenu.value = null
 }
 
-const runSkillAction = (action: 'share' | 'export' | 'rename' | 'delete') => {
+const runSkillAction = (action: 'share' | 'export' | 'rename' | 'group' | 'delete') => {
   const skill = actionMenu.value?.skill
   closeActionMenu()
   if (!skill) return
@@ -578,7 +618,41 @@ const runSkillAction = (action: 'share' | 'export' | 'rename' | 'delete') => {
   if (action === 'share') openShareDialog(skill)
   else if (action === 'export') exportSkill(skill.id, scope)
   else if (action === 'rename') renameSkill(skill.id, scope)
+  else if (action === 'group') openGroupDialog(skill)
   else deleteSkill(skill.id)
+}
+
+/**
+ * 「设置分组」弹窗的状态。改的是 SKILL.md frontmatter 里的一行（`group:`），
+ * 不走整文件编辑接口——列表页只有元数据，按整文件覆盖会在并发编辑时冲掉正文。
+ */
+const groupDialog = ref<{ skill: Skill; value: string } | null>(null)
+const savingGroup = ref(false)
+
+const openGroupDialog = (skill: Skill) => {
+  groupDialog.value = { skill, value: String(skill.group || '') }
+}
+
+const saveSkillGroup = async () => {
+  const target = groupDialog.value
+  if (!target) return
+  const scope = target.skill.scope === 'personal' ? 'personal' : 'global'
+  const url = scope === 'personal'
+    ? `/api/portal/skills/personal/${encodeURIComponent(target.skill.id)}/group`
+    : `/api/portal/skills/${encodeURIComponent(target.skill.id)}/group`
+  savingGroup.value = true
+  try {
+    const res = await axios.put(url, { group: target.value.trim() || null })
+    const saved = (res.data?.group ?? null) as string | null
+    // 就地更新本地对象，避免整页重拉：重拉会把用户当前的搜索词/页签滚动位置一起抖掉
+    target.skill.group = saved
+    groupDialog.value = null
+    showToast(saved ? `已归入「${saved}」分组` : '已设为未分组', 'success')
+  } catch (e: any) {
+    showToast(e.response?.data?.detail || '设置技能分组失败', 'error')
+  } finally {
+    savingGroup.value = false
+  }
 }
 
 const openShareDialog = (skill: Skill) => {
@@ -884,20 +958,96 @@ const importSkillApiUrl = computed(() =>
   activeScope.value === 'personal' ? '/api/portal/skills/personal/import' : '/api/portal/skills/import'
 )
 
-const filteredSkills = computed(() => {
-  const query = searchQuery.value.trim().toLowerCase()
-  if (!query) return currentScopeSkills.value
-  return currentScopeSkills.value.filter(s => 
-    s.id.toLowerCase().includes(query) ||
-    s.name.toLowerCase().includes(query) ||
-    s.description.toLowerCase().includes(query)
-  )
+/**
+ * 「未分组」页签的哨兵值。与分组页签、筛选下拉共用同一个常量——各写一份会导致
+ * 点页签等于没点（哨兵对不上，过滤条件永远不成立）。
+ */
+const UNGROUPED_SKILL_GROUP = '__ungrouped__'
+
+/** 技能的搜索字段：ID 必须在内（用户经常直接搜 `weather_travel_advice` 这种 ID）。 */
+const SKILL_SEARCH_FIELDS: readonly ToolSearchField[] = ['id', 'name', 'description']
+
+/**
+ * 交给共享分组模块的技能形状。
+ *
+ * 技能与工具的两处差异在**这里**适配掉，而不是在页面里另写一套过滤：`enabled` 是
+ * frontmatter 里的字符串（真值口径见 isSkillEnabled），共享模块要的是布尔 `is_active`；
+ * 技能的「名字」只有一个字段，`name`/`display_name` 同值即可。
+ */
+const toGroupableSkill = (skill: Skill): GroupableTool => ({
+  id: skill.id,
+  name: skill.name || skill.id,
+  display_name: skill.name || skill.id,
+  description: skill.description || '',
+  is_active: isSkillEnabled(skill.enabled),
+  group_name: skill.group ?? '',
+})
+
+const skillFilterState = computed<ToolFilterState>(() => ({
+  keyword: searchQuery.value,
+  searchFields: SKILL_SEARCH_FIELDS,
+}))
+
+/**
+ * 关键词过滤。走共享的 matchesToolFilters，**不在这里再写一份**：页签计数与列表过滤
+ * 必须是同一条规则，否则会出现「页签说这组有 3 个、点进去只有 2 条」。
+ */
+const filteredSkills = computed(() =>
+  currentScopeSkills.value.filter((skill) => matchesToolFilters(toGroupableSkill(skill), skillFilterState.value)),
+)
+
+/** 当前选中的业务分组（`all` / 具体分组名 / 未分组哨兵）。 */
+const skillGroupFilter = ref(ALL_GROUP_KEY)
+
+/**
+ * 按分组收窄。计数不含分组条件（见 matchesToolFilters 注释）：否则未选中的组永远显示
+ * 完整数量，点过去才发现被搜索词筛空了。
+ */
+const groupedSkills = computed(() => {
+  const current = skillGroupFilter.value
+  if (current === ALL_GROUP_KEY) return filteredSkills.value
+  return filteredSkills.value.filter((skill) => {
+    const name = toolGroupName(toGroupableSkill(skill))
+    return current === UNGROUPED_SKILL_GROUP ? !name : name === current
+  })
+})
+
+const skillGroupCounts = computed(() =>
+  computeGroupTabs(currentScopeSkills.value.map(toGroupableSkill), skillFilterState.value, UNGROUPED_SKILL_GROUP),
+)
+
+const skillGroupTabs = computed(() => skillGroupCounts.value.items)
+
+/** 新建 / 改分组时的候选：跨「平台 + 我的」两个列表聚合，避免同一业务域被写成两个名字。 */
+const skillGroupOptions = computed(() => {
+  const names = new Set<string>()
+  for (const skill of [...skills.value, ...personalSkills.value]) {
+    const name = String(skill.group || '').trim()
+    if (name) names.add(name)
+  }
+  return [...names].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+})
+
+/**
+ * 选中分组被搜空 / 分组名被改掉后回到「全部」。
+ *
+ * `currentScopeSkills.length > 0` 是必须的：首屏加载期间列表还是空的，此刻若按「这个分组
+ * 已经不存在」处理，用户刚点的分组会在数据回来之前被清掉。
+ */
+watch(skillGroupTabs, (tabs) => {
+  if (!currentScopeSkills.value.length) return
+  if (!tabs.some((tab) => tab.key === skillGroupFilter.value)) skillGroupFilter.value = ALL_GROUP_KEY
+})
+
+// 切视图 / 切二级菜单后按旧分组过滤，用户会看到「空列表 + 一个对不上的页签」
+watch([activeScope, activeWorkspaceTab, personalMenu], () => {
+  skillGroupFilter.value = ALL_GROUP_KEY
 })
 
 const getSkillStatusRank = (skill: Skill) => !isSkillEnabled(skill.enabled) ? 1 : 0
 
 const sortedSkills = computed(() => {
-  const list = [...filteredSkills.value]
+  const list = [...groupedSkills.value]
   const dir = skillSortOrder.value === 'asc' ? 1 : -1
   list.sort((a, b) => {
     const statusOrder = getSkillStatusRank(a) - getSkillStatusRank(b)
@@ -1017,7 +1167,7 @@ const copyEditorContent = async () => {
 
 // 打开创建弹窗
 const openCreateModal = () => {
-  newSkill.value = { id: '', name: '', description: '' }
+  newSkill.value = { id: '', name: '', description: '', group: '' }
   showCreateModal.value = true
 }
 
@@ -1042,7 +1192,9 @@ const createSkill = async () => {
     const response = await axios.post(apiPrefix, {
       id: newSkill.value.id.trim(),
       name: newSkill.value.name.trim(),
-      description: newSkill.value.description.trim()
+      description: newSkill.value.description.trim(),
+      // 空串在后端归一为 None（不写 group 行），这里不必区分「没填」与「清空」
+      group: newSkill.value.group.trim() || null,
     })
     if (response.data && response.data.status === 'success') {
       showToast(`${activeScope.value === 'personal' ? '个人' : ''}技能创建成功！`, 'success')
@@ -1482,9 +1634,12 @@ const isMarkdownFile = computed(() => {
 const renderedMarkdown = computed(() => {
   if (!editingContent.value) return '<p class="preview-empty">暂无内容，请先在编辑视图中编写</p>'
   try {
-    return mdParser.render(editingContent.value)
+    // 技能可能来自他人分享 / 导入包，SKILL.md 里的原始 HTML 会被 `html: true` 原样保留；
+    // 预览直接走 v-html，不消毒等于让分享者在查看者浏览器里执行脚本（如 <img onerror>）。
+    return sanitizeRenderedHtml(mdParser.render(editingContent.value))
   } catch (e) {
-    return `<p class="text-red-400 p-4">渲染解析 Markdown 时遇到错误: ${e}</p>`
+    // 异常文案同样会进 v-html：先转义，避免其中的尖括号被当成标签解析
+    return `<p class="text-red-400 p-4">渲染解析 Markdown 时遇到错误: ${mdParser.utils.escapeHtml(String(e))}</p>`
   }
 })
 
@@ -1969,9 +2124,9 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div :class="personalOnly ? 'space-y-6' : 'space-y-5'">
-    <!-- Header：标题单独一行；搜索 + 排序/视图 + 新建同一工具行 -->
-    <div class="flex flex-col gap-4">
+  <div :class="personalOnly ? 'space-y-5' : 'space-y-4'">
+    <!-- Header：只剩标题与说明入口 -->
+    <div class="flex flex-wrap items-center gap-3">
       <div class="flex min-w-0 items-center gap-2.5">
         <h1
           class="font-bold tracking-normal text-gray-900"
@@ -1999,7 +2154,6 @@ onUnmounted(() => {
           <span class="whitespace-nowrap">显示指引</span>
         </button>
       </div>
-
     </div>
 
     <!-- 技能工作台全生命周期指引横幅 -->
@@ -2256,7 +2410,9 @@ onUnmounted(() => {
         :active="personalMenu"
         :received-count="shareMenuCounts.received_pending"
         :sent-pending-count="shareMenuCounts.sent_pending"
+        :collapsed="personalMenuCollapsed"
         @select="personalMenu = $event"
+        @toggle-collapsed="personalMenuCollapsed = !personalMenuCollapsed"
       />
       <div class="min-w-0 flex-1 space-y-4">
         <ReceivedSharesPanel
@@ -2280,92 +2436,99 @@ onUnmounted(() => {
               <input
                 v-model="searchQuery"
                 type="search"
-                placeholder="搜索技能名称或描述..."
+                placeholder="搜索技能名称、ID 或描述..."
                 class="w-full rounded-lg border border-gray-300 bg-white py-2.5 pl-9 pr-4 text-sm shadow-sm transition-all focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
             </div>
 
-            <div class="flex shrink-0 flex-wrap items-center gap-2">
-              <div class="flex select-none items-center gap-0.5 rounded-lg border border-gray-300 bg-gray-200/60 p-0.5">
-                <button
-                  type="button"
-                  class="rounded-md px-2.5 py-1.5 text-xs font-medium transition-all"
-                  :class="skillSortBy === 'name' ? 'border border-gray-200 bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200 hover:text-gray-800'"
-                  title="按名称排序"
-                  @click="skillSortBy = 'name'"
-                >
-                  名称
-                </button>
-                <button
-                  type="button"
-                  class="rounded-md px-2.5 py-1.5 text-xs font-medium transition-all"
-                  :class="skillSortBy === 'time' ? 'border border-gray-200 bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200 hover:text-gray-800'"
-                  title="按更新时间排序"
-                  @click="skillSortBy = 'time'"
-                >
-                  时间
-                </button>
-                <button
-                  type="button"
-                  class="rounded-md p-1.5 text-gray-500 transition-all hover:bg-gray-200 hover:text-gray-800"
-                  :title="skillSortOrder === 'asc' ? '当前升序，点击切换降序' : '当前降序，点击切换升序'"
-                  @click="toggleSkillSortOrder"
-                >
-                  <svg class="h-4 w-4 transition-transform" :class="skillSortOrder === 'desc' ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 4h13M3 8h9m-9 4h6m4 0v4m0 0l-3-3m3 3l3-3" />
-                  </svg>
-                </button>
-              </div>
-
-              <div class="flex select-none items-center gap-0.5 rounded-lg border border-gray-300 bg-gray-200/60 p-0.5">
-                <button
-                  type="button"
-                  class="flex items-center justify-center rounded-md p-1.5 transition-all duration-200"
-                  :class="viewMode === 'card' ? 'border border-gray-200 bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200 hover:text-gray-800'"
-                  title="卡片视图"
-                  @click="viewMode = 'card'"
-                >
-                  <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
-                  </svg>
-                </button>
-                <button
-                  type="button"
-                  class="flex items-center justify-center rounded-md p-1.5 transition-all duration-200"
-                  :class="viewMode === 'list' ? 'border border-gray-200 bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200 hover:text-gray-800'"
-                  title="列表视图"
-                  @click="viewMode = 'list'"
-                >
-                  <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
-                  </svg>
-                </button>
-              </div>
-
-              <button
-                v-if="!personalOnly"
-                type="button"
-                class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-gray-300 bg-white text-gray-700 shadow-sm transition-all hover:bg-gray-50 active:scale-95"
-                title="统计查看"
-                @click="openStatsModal"
+            <!-- 排序 / 视图 / 统计 留在可滑区；新建跟在可滑区之后。
+                 新建不能塞进这个滚动容器：它的「更多创建方式」是 absolute 定位，
+                 overflow 会直接把菜单裁掉，点开看起来毫无反应。 -->
+            <div class="flex min-w-0 items-center gap-2">
+              <div
+                class="-my-1 flex min-w-0 items-center gap-2 overflow-x-auto py-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
               >
-                <svg class="h-4 w-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                </svg>
-              </button>
+                <div class="flex shrink-0 select-none items-center gap-0.5 rounded-lg border border-gray-300 bg-gray-200/60 p-0.5">
+                  <button
+                    type="button"
+                    class="shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium transition-all"
+                    :class="skillSortBy === 'name' ? 'border border-gray-200 bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200 hover:text-gray-800'"
+                    title="按名称排序"
+                    @click="skillSortBy = 'name'"
+                  >
+                    名称
+                  </button>
+                  <button
+                    type="button"
+                    class="shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium transition-all"
+                    :class="skillSortBy === 'time' ? 'border border-gray-200 bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200 hover:text-gray-800'"
+                    title="按更新时间排序"
+                    @click="skillSortBy = 'time'"
+                  >
+                    时间
+                  </button>
+                  <button
+                    type="button"
+                    class="shrink-0 rounded-md p-1.5 text-gray-500 transition-all hover:bg-gray-200 hover:text-gray-800"
+                    :title="skillSortOrder === 'asc' ? '当前升序，点击切换降序' : '当前降序，点击切换升序'"
+                    @click="toggleSkillSortOrder"
+                  >
+                    <svg class="h-4 w-4 transition-transform" :class="skillSortOrder === 'desc' ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 4h13M3 8h9m-9 4h6m4 0v4m0 0l-3-3m3 3l3-3" />
+                    </svg>
+                  </button>
+                </div>
+
+                <div class="flex shrink-0 select-none items-center gap-0.5 rounded-lg border border-gray-300 bg-gray-200/60 p-0.5">
+                  <button
+                    type="button"
+                    class="flex items-center justify-center rounded-md p-1.5 transition-all duration-200"
+                    :class="viewMode === 'card' ? 'border border-gray-200 bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200 hover:text-gray-800'"
+                    title="卡片视图"
+                    @click="viewMode = 'card'"
+                  >
+                    <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="flex items-center justify-center rounded-md p-1.5 transition-all duration-200"
+                    :class="viewMode === 'list' ? 'border border-gray-200 bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200 hover:text-gray-800'"
+                    title="列表视图"
+                    @click="viewMode = 'list'"
+                  >
+                    <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
+                    </svg>
+                  </button>
+                </div>
+
+                <button
+                  v-if="!personalOnly"
+                  type="button"
+                  class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-gray-300 bg-white text-gray-700 shadow-sm transition-all hover:bg-gray-50 active:scale-95"
+                  title="统计查看"
+                  @click="openStatsModal"
+                >
+                  <svg class="h-4 w-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                  </svg>
+                </button>
+              </div>
 
               <div class="relative shrink-0" @click.stop>
                 <div class="flex items-stretch overflow-hidden rounded-lg shadow-sm">
                   <button
                     type="button"
-                    class="flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white transition-all active:scale-[0.98]"
+                    class="flex shrink-0 items-center justify-center gap-2 whitespace-nowrap px-3 py-2 text-sm font-medium text-white transition-all active:scale-[0.98] sm:px-4"
                     :class="activeScope === 'personal' ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-blue-600 hover:bg-blue-700'"
                     @click="openCreateModal"
                   >
                     <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
                     </svg>
-                    新建技能
+                    新建<span class="hidden sm:inline">技能</span>
                   </button>
                   <button
                     type="button"
@@ -2407,6 +2570,18 @@ onUnmounted(() => {
               </div>
             </div>
           </div>
+
+    <!-- 业务分组页签：与工具注册表、元数据管理同一套组件 / 计数口径 / 溢出方案。
+         位置固定在右侧内容区（不放进「我的技能」的左侧二级菜单），否则一级 Tab + 二级菜单
+         + 分组页签会变成三层混排。 -->
+    <div v-if="showSkillList && !loading" class="mt-3">
+      <ToolGroupTabs
+        v-model="skillGroupFilter"
+        :items="skillGroupTabs"
+        aria-label="按业务分组浏览技能"
+      />
+    </div>
+
     <template v-if="showSkillList">
     <!-- 技能列表网格 -->
     <div v-if="loading" class="flex flex-col items-center justify-center py-16">
@@ -2569,6 +2744,20 @@ onUnmounted(() => {
         <p class="mt-4 flex-1 text-sm leading-relaxed text-gray-500 line-clamp-3">
           {{ skill.description || '暂无描述' }}
         </p>
+
+        <!-- 业务分组：锁定某组时不再逐条重复显示（每条都一样，纯噪音） -->
+        <div v-if="skillGroupFilter === ALL_GROUP_KEY" class="mt-2">
+          <button
+            v-if="skill.group"
+            type="button"
+            class="inline-flex items-center gap-1 rounded-full border border-indigo-100 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700 transition-colors hover:bg-indigo-100"
+            :title="`只看「${skill.group}」分组`"
+            @click.stop="skillGroupFilter = String(skill.group)"
+          >
+            {{ skill.group }}
+          </button>
+          <span v-else class="inline-flex items-center rounded-full border border-dashed border-gray-300 px-2 py-0.5 text-[10px] text-gray-400">未分组</span>
+        </div>
 
         <div v-if="skill.scope === 'personal'" class="mt-3 flex items-center justify-between gap-2">
           <span v-if="skill.last_review_comment" class="min-w-0 truncate text-[10px] text-red-500" :title="skill.last_review_comment">{{ skill.publication_status === 'REVOKED' ? '下架原因' : '驳回' }}：{{ skill.last_review_comment }}</span>
@@ -3137,11 +3326,30 @@ onUnmounted(() => {
               </label>
               <textarea 
                 v-model="newSkill.description"
-                rows="3"
+                rows="2"
                 placeholder="描述此技能的核心能力或针对的典型任务约束..." 
                 class="w-full px-3 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:outline-none text-sm transition-all"
                 :class="activeScope === 'personal' ? 'focus:ring-emerald-500' : 'focus:ring-blue-500'"
               ></textarea>
+            </div>
+
+            <div>
+              <label class="block text-xs font-bold text-gray-500 uppercase mb-1">
+                业务分组
+              </label>
+              <input
+                v-model="newSkill.group"
+                type="text"
+                list="skill-group-options"
+                maxlength="64"
+                placeholder="如 天气出行（留空 = 未分组）"
+                class="w-full px-3 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:outline-none text-sm transition-all"
+                :class="activeScope === 'personal' ? 'focus:ring-emerald-500' : 'focus:ring-blue-500'"
+              />
+              <span class="text-[10px] text-gray-400 mt-1 block">
+                单选，只用于技能列表的分组页签与筛选。会写进 SKILL.md 的 frontmatter（group: …），
+                所以复制、分享、发布技能时分组跟着走。
+              </span>
             </div>
           </div>
 
@@ -3958,6 +4166,17 @@ onUnmounted(() => {
       </svg>
       重命名
     </button>
+    <button
+      type="button"
+      role="menuitem"
+      class="flex w-full items-center gap-2.5 px-3 py-2 text-left text-xs text-gray-700 transition-colors hover:bg-gray-50"
+      @click="runSkillAction('group')"
+    >
+      <svg class="h-4 w-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" />
+      </svg>
+      设置分组
+    </button>
     <div class="my-1 border-t border-gray-100"></div>
     <button
       type="button"
@@ -3971,6 +4190,65 @@ onUnmounted(() => {
       删除技能
     </button>
   </div>
+
+  <!-- 设置分组弹窗：只改 SKILL.md 里的一行，正文不碰。
+       必须 Teleport 到 body：祖先一旦带 transform（卡片 hover 的 -translate-y 就是），
+       fixed 遮罩就只盖住卡片而不是视口。 -->
+  <Teleport to="body">
+    <div
+      v-if="groupDialog"
+      class="fixed inset-0 z-[9990] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm"
+      @click.self="!savingGroup && (groupDialog = null)"
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="skill-group-title"
+        class="w-full max-w-sm rounded-2xl border border-gray-200 bg-white p-5 shadow-2xl"
+      >
+        <h2 id="skill-group-title" class="mb-1 flex items-center gap-2 text-base font-bold text-gray-800">
+          设置业务分组
+        </h2>
+        <p class="mb-4 text-xs text-gray-500">
+          {{ groupDialog.skill.name || groupDialog.skill.id }}
+          <span class="font-mono text-[10px] text-gray-400">（{{ groupDialog.skill.id }}）</span>
+        </p>
+        <input
+          v-model="groupDialog.value"
+          type="text"
+          list="skill-group-options"
+          maxlength="64"
+          placeholder="如 天气出行（留空 = 未分组）"
+          class="w-full rounded-xl border border-gray-300 px-3 py-2 text-sm transition-all focus:outline-none focus:ring-2"
+          :class="groupDialog.skill.scope === 'personal' ? 'focus:ring-emerald-500' : 'focus:ring-blue-500'"
+          @keydown.enter.prevent="saveSkillGroup"
+          @keydown.esc.prevent="!savingGroup && (groupDialog = null)"
+        />
+        <p class="mt-1.5 text-[10px] leading-relaxed text-gray-400">
+          单选，写进该技能的 SKILL.md（<code class="rounded bg-gray-100 px-1">group: …</code>）。
+          它只影响技能工作台的页签与筛选，不参与权限、也不会改变技能的可用范围。
+        </p>
+        <div class="mt-5 flex justify-end gap-2 border-t border-gray-100 pt-4">
+          <button
+            type="button"
+            class="rounded-xl border border-gray-300 px-4 py-2 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-50"
+            @click="groupDialog = null"
+          >取消</button>
+          <button
+            type="button"
+            class="rounded-xl bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
+            :disabled="savingGroup"
+            @click="saveSkillGroup"
+          >{{ savingGroup ? '保存中…' : '保存' }}</button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <!-- 分组候选：新建技能 / 设置分组两处共用，避免同一业务域被写成两个名字 -->
+  <datalist id="skill-group-options">
+    <option v-for="name in skillGroupOptions" :key="name" :value="name"></option>
+  </datalist>
 
   <SkillShareDialog
     :visible="!!shareDialogSkill"

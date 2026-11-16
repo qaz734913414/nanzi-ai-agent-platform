@@ -350,6 +350,50 @@ async def test_consume_sub_agent_stream_legacy_promote_still_counts_as_answer():
     assert interrupt is None
 
 
+@pytest.mark.asyncio
+async def test_consume_sub_agent_stream_keeps_reasoning_out_of_the_payload():
+    """子代理思考流不得进入委派工具结果；但要以**折叠日志**的形式回流一次。
+
+    回归背景：THINKING_BLOCK_DELTA 被翻译成 ``{"type": "reasoning_content",
+    "content": delta}``，而 ``_extract_delegation_text`` 对任何带 content 的
+    chunk 都当正文，导致父智能体收到的工具结果被子代理的完整思考过程占满，
+    最终正文反而在 64KB 截断时被丢掉。
+
+    后来补了另一半需求：用户要能分辨「这段是子代理想的」。所以思考改走
+    ``category="reasoning"`` 的 log 帧挂进子代理容器（前端默认折叠），
+    但**正文与工具结果这两条路仍然不能碰**——那才是当初出问题的原因。
+    """
+    from app.services.ai.tools.agent_delegate_tool import _consume_sub_agent_stream
+
+    async def sub_stream():
+        yield {"type": "thinking", "status": "continuing"}
+        yield {"type": "reasoning_content", "content": "先分析用户意图，"}
+        yield {"type": "reasoning_content", "content": "再决定查哪张表。"}
+        yield {"content": "最终结论：销售额为 42。"}
+
+    eq = asyncio.Queue()
+    ctx = AgentContext(agent_id="main", agent_name="MainAgent", event_queue=eq)
+    full_output, interrupt = await _consume_sub_agent_stream(
+        sub_stream(),
+        main_ctx=ctx,
+        sub_display_name="数据分析师",
+    )
+
+    assert full_output == "最终结论：销售额为 42。"
+    assert "先分析用户意图" not in full_output
+    assert interrupt is None
+
+    forwarded = []
+    while not eq.empty():
+        forwarded.append(eq.get_nowait())
+    reasoning_logs = [f for f in forwarded if f.get("category") == "reasoning"]
+    assert len(reasoning_logs) == 1, "思考应当作为一条折叠日志回流"
+    assert reasoning_logs[0]["details"] == "先分析用户意图，再决定查哪张表。"
+    assert reasoning_logs[0]["type"] == "log"
+    # 不能有任何一帧把思考当成正文塞给主聊天
+    assert all(f.get("type") != "reasoning_content" for f in forwarded)
+
+
 def test_finalize_delegation_output_empty():
     assert finalize_delegation_output("") == EMPTY_DELEGATION_RESULT_MESSAGE
     assert finalize_delegation_output("   ") == EMPTY_DELEGATION_RESULT_MESSAGE
@@ -842,6 +886,9 @@ async def test_sub_agent_call_context_inheritance_and_user_info():
         user_dimensions={
             "user_name": "test_user",
             "real_name": "Test User",
+            # 凭据定位规则可按 user.email 命中，子代理跑在独立执行上下文时
+            # ContextVar 不传播，必须靠 user_info 显式带过去
+            "email": "test_user@example.com",
             "dept_code": "DEPT01",
             "org_path": "/ROOT/DEPT01",
             "extra_data": {"role_level": 3},
@@ -909,6 +956,7 @@ async def test_sub_agent_call_context_inheritance_and_user_info():
             "api_key": "sk-main-key",
             "user_name": "test_user",
             "real_name": "Test User",
+            "email": "test_user@example.com",
             "dept_code": "DEPT01",
             "org_path": "/ROOT/DEPT01",
             "extra_data": {"role_level": 3},

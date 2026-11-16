@@ -105,12 +105,23 @@ def _clamp_select_row_limit(sql: str, *, dialect: str, max_rows: int) -> str:
     远程模式此前只在导出时加 LIMIT，AI 分析可拉全表；用 AST 而不是正则，
     避免注释或子查询里的 LIMIT 顶掉外层上限。
     """
+    from app.services.ai.sql_dialect_limit import strip_trailing_comment_and_terminator
     from app.services.sql_query_execution_service import to_sqlglot_dialect
 
     read_dialect = to_sqlglot_dialect(dialect)
-    expression = sqlglot.parse_one(sql.strip().rstrip(";"), read=read_dialect)
+    # 末尾为 `; -- 注释` 时 sqlglot 会解析成 Block（多语句容器），此前会落到
+    # 「不是 SELECT 就原样返回」的分支 —— 等于一条行数上限都没加。先剥掉再解析。
+    expression = sqlglot.parse_one(
+        strip_trailing_comment_and_terminator(sql), read=read_dialect
+    )
     set_operation = getattr(exp, "SetOperation", None)
     limited_types = (exp.Select,) + ((set_operation,) if isinstance(set_operation, type) else ())
+    block_type = getattr(exp, "Block", None)
+    if isinstance(block_type, type) and isinstance(expression, block_type):
+        statements = [stmt for stmt in expression.expressions if isinstance(stmt, limited_types)]
+        if len(statements) != 1:
+            return sql
+        expression = statements[0]
     if not isinstance(expression, limited_types):
         return sql
     limit_node = expression.args.get("limit")
@@ -316,46 +327,38 @@ async def call_external_sql_api(
 
         # 强制行数限制：AI 分析口径 1000 行；完整导出口径放宽到 10 万行。
         # 根据数据库类型转换方言。
-        from app.services.ai.sql_dialect_limit import apply_dialect_row_limit
+        from app.services.ai.sql_dialect_limit import (
+            apply_dialect_row_limit,
+            strip_trailing_comment_and_terminator,
+        )
         from app.services.data_adapter.oracle import OracleAdapter
         from app.services.data_adapter.sqlserver import SQLServerAdapter
 
         row_limit = MAX_EXPORT_SQL_ROWS if for_export else MAX_LOCAL_SQL_ROWS
 
         if isinstance(adapter, OracleAdapter):
-            clean_sql = sql.strip().rstrip(";")
-            sql_upper = clean_sql.upper()
-
-            rownum_match = re.search(r"\bROWNUM\s*(<=|<)\s*(\d+)", sql_upper)
-            fetch_match = re.search(r"\bFETCH\s+FIRST\s+(\d+)\s+ROWS", sql_upper)
-
-            if rownum_match:
-                limit_val = int(rownum_match.group(2))
-                if limit_val > row_limit:
-                    sql_limited = clean_sql[:rownum_match.start(2)] + str(row_limit) + clean_sql[rownum_match.end(2):]
-                else:
-                    sql_limited = clean_sql
-            elif fetch_match:
-                limit_val = int(fetch_match.group(1))
-                if limit_val > row_limit:
-                    sql_limited = clean_sql[:fetch_match.start(1)] + str(row_limit) + clean_sql[fetch_match.end(1):]
-                else:
-                    sql_limited = clean_sql
-            else:
-                sql_limited = f"SELECT * FROM ({clean_sql}) WHERE ROWNUM <= {row_limit}"
-        elif isinstance(adapter, SQLServerAdapter):
-            clean_sql = sql.strip().rstrip(";")
+            # 统一交给 apply_dialect_row_limit：它一律在外层套 ROWNUM，内层子查询里
+            # 的 ROWNUM/FETCH 不会再被当成外层上限，从而整条跳过封顶（那会退化成
+            # 全表拉取）；末尾 `--` 注释也会先剥掉，避免包装的 `)` 被注释吞掉。
             sql_limited = apply_dialect_row_limit(
-                clean_sql,
+                sql,
+                dialect="oracle",
+                limit=row_limit,
+                max_limit=row_limit,
+            )
+        elif isinstance(adapter, SQLServerAdapter):
+            sql_limited = apply_dialect_row_limit(
+                sql,
                 dialect="tsql",
                 limit=row_limit,
                 max_limit=row_limit,
             )
         else:
             # MySQL / ClickHouse 使用 LIMIT。
-            # 不能再用正则找第一个 LIMIT：注释/字符串/子查询里的 LIMIT 会顶掉
-            # 外层上限，导致 AI 分析实际拉到全表。这里只认 AST 顶层 LIMIT。
-            clean_sql = sql.strip().rstrip(";")
+            # 统一交给 apply_dialect_row_limit：它只认 AST 最外层 LIMIT（注释/字符串/
+            # 子查询里的 LIMIT 不再顶掉外层上限），并且会先剥掉末尾行注释、
+            # 换行后再拼 LIMIT，避免被注释吞掉。
+            clean_sql = strip_trailing_comment_and_terminator(sql)
             dialect_name = dialect_from_data_source(data_source)
             try:
                 parsed_sql = sqlglot.parse_one(
@@ -364,16 +367,15 @@ async def call_external_sql_api(
                 )
             except Exception:
                 parsed_sql = None
-            if isinstance(parsed_sql, exp.Select) and parsed_sql.args.get("limit") is not None:
-                sql_limited = _clamp_select_row_limit(
-                    clean_sql,
-                    dialect=dialect_name,
-                    max_rows=row_limit,
-                )
-            elif isinstance(parsed_sql, exp.Select) or isinstance(
+            if isinstance(parsed_sql, exp.Select) or isinstance(
                 parsed_sql, getattr(exp, "SetOperation", ())
             ):
-                sql_limited = f"SELECT * FROM ({clean_sql}) AS _sub LIMIT {row_limit}"
+                sql_limited = apply_dialect_row_limit(
+                    clean_sql,
+                    dialect=dialect_name,
+                    limit=row_limit,
+                    max_limit=row_limit,
+                )
             else:
                 # SHOW / DESCRIBE 等元数据语句没有行集可包，保持原样。
                 sql_limited = clean_sql
@@ -664,6 +666,18 @@ async def get_dataset_schema(keywords: Optional[str] = None, metadata_dataset_id
         is_admin = ctx.is_admin if ctx else False
         api_key = ctx.api_key if ctx else None
         authorized_dataset_ids = _normalize_metadata_dataset_ids(metadata_dataset_ids)
+        if authorized_dataset_ids is None and metadata_dataset_ids:
+            # 本轮手选可能以数据集名称/名称列表传入，纯数字归一化会把它们全部丢掉，
+            # 于是范围又变回「全部有权限的数据集」。下游 fetch_dataset_schema_core
+            # 支持 id / name / display_name / rag_dataset_id 多字段匹配，这里原样透传。
+            raw_items = (
+                metadata_dataset_ids
+                if isinstance(metadata_dataset_ids, (list, tuple, set))
+                else [metadata_dataset_ids]
+            )
+            authorized_dataset_ids = [
+                str(item).strip() for item in raw_items if str(item).strip()
+            ] or None
 
         trace_buffer = ctx.trace_buffer if ctx else None
         if trace_buffer is not None:
@@ -701,6 +715,68 @@ async def get_dataset_schema(keywords: Optional[str] = None, metadata_dataset_id
         logger.error(f"[Tool Error] Schema Retrieval Failed: {e}", exc_info=True)
         return f"[Tool Error] Failed to retrieve metadata: {str(e)}"
 
+async def _ensure_dataset_in_mounted_scope(
+    session: Any,
+    *,
+    dataset_name: str,
+    mounted: list[str],
+) -> Optional[str]:
+    """本轮手选了数据集时，只允许查这些数据集。
+
+    ``mounted`` 里可能是 ID，也可能是名称（前端两种都传过），所以要先把 ID 解析成名称
+    再比对；没有挂载（用户没选）时不做限制，保持历史行为。
+    """
+    if not mounted:
+        return None
+
+    from sqlalchemy import func, or_, select
+
+    from app.models.metadata import MetaDataset
+
+    wanted_ids: list[int] = []
+    wanted_names: set[str] = set()
+    for item in mounted:
+        text_value = str(item).strip()
+        if not text_value:
+            continue
+        if text_value.isdigit():
+            wanted_ids.append(int(text_value))
+        else:
+            wanted_names.add(text_value.lower())
+    if not wanted_ids and not wanted_names:
+        return None
+
+    conditions = []
+    if wanted_ids:
+        conditions.append(MetaDataset.id.in_(wanted_ids))
+    if wanted_names:
+        conditions.append(func.lower(MetaDataset.name).in_(sorted(wanted_names)))
+    rows = (
+        await session.execute(
+            select(MetaDataset.id, MetaDataset.name, MetaDataset.display_name).where(or_(*conditions))
+        )
+    ).all()
+    if not rows:
+        # 挂载的 ID 解析不出数据集：多半是刚被删除，按不放行处理更安全
+        return (
+            "[Permission Denied] 本次会话限定的数据集已不存在，无法执行查询。"
+            "请重新选择数据集后再试。"
+        )
+
+    allowed = {str(row[1]).lower() for row in rows if row[1]}
+    allowed |= {str(row[2]).lower() for row in rows if row[2]}
+    if str(dataset_name).strip().lower() in allowed:
+        return None
+
+    readable = "、".join(
+        sorted({str(row[2] or row[1]) for row in rows if (row[2] or row[1])})
+    )
+    return (
+        f"[Permission Denied] 本次会话已限定数据集范围（{readable}），"
+        f"不能查询数据集 '{dataset_name}'。请让用户在该范围内重新选择数据集。"
+    )
+
+
 @tool
 async def execute_sql_query(sql: str, data_source: str, dataset_name: str) -> str:
     """
@@ -722,8 +798,19 @@ async def execute_sql_query(sql: str, data_source: str, dataset_name: str) -> st
     user_id = ctx.user_id if ctx else None
     is_admin = bool(ctx and getattr(ctx, "is_admin", False))
     permission_notice: dict[str, Any] = {}
+    from app.services.ai.metadata_dataset_scope import resolve_mounted_dataset_scope_ids
+
+    mounted_dataset_ids = resolve_mounted_dataset_scope_ids()
 
     async def _run_query(session):
+        # 检索阶段被限定住还不够：模型凭记忆写下别的 dataset_name 时照样能过，
+        # 而那张表可能恰好注册在另一个「用户有权限」的数据集里，等于绕开手选。
+        scope_err = await _ensure_dataset_in_mounted_scope(
+            session, dataset_name=dataset_name, mounted=mounted_dataset_ids
+        )
+        if scope_err:
+            return scope_err
+
         res = await execute_sql_query_core(
             session,
             sql=sql,

@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from httpx import AsyncClient, ASGITransport
 from app.main import app
 from app.core import database, redis
-from sqlalchemy import delete, select
+from sqlalchemy import Delete, delete, event, select
+from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import TextClause
 from app.models.user import User
 from app.core.orm import AsyncSessionLocal
 from app.services.audit_service import AuditService
@@ -18,6 +20,55 @@ from unittest.mock import AsyncMock, patch
 # event_loop fixture removed to let pytest-asyncio handle it automatically
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# 护栏：禁止测试执行「不带 WHERE 的批量删除」
+#
+# 本项目测试连的是**真实开发库**（下面 db_session 用的就是 AsyncSessionLocal），
+# 没有任何库级隔离。历史上因此出过两次真实数据丢失：
+#   - tests/api/portal/test_notifications.py 里 delete(UserNotificationConfig)
+#     无 WHERE，每跑一次测试就清空所有用户配好的钉钉/飞书/企微群；
+#   - tests/services/test_scheduler_service.py 的 cleanup_tasks 里
+#     delete(AgentScheduledTask) 无 WHERE，清空所有人的定时任务。
+# 两者都立即 commit，删掉就回不来。靠「记得别这么写」不够 —— 这里直接拦。
+#
+# 需要跨用例清场时，用 user_id / name 前缀过滤限定到测试自己造的数据。
+# --------------------------------------------------------------------------- #
+
+_FORBIDDEN_BULK_SQL = "DELETE FROM"
+
+
+def _describe_statement(statement) -> str:
+    table = getattr(statement, "table", None)
+    name = getattr(table, "name", None) or str(statement)[:80]
+    return str(name)
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _forbid_unscoped_delete(execute_state) -> None:  # pragma: no cover - 触发即失败
+    statement = execute_state.statement
+
+    if isinstance(statement, Delete) and statement.whereclause is None:
+        raise RuntimeError(
+            "测试试图执行不带 WHERE 的批量删除：delete(%s)。"
+            "测试连的是真实数据库，这会清空真实用户数据。"
+            "请用 where(...) 限定到本测试自己造的数据。"
+            % _describe_statement(statement)
+        )
+
+    if isinstance(statement, TextClause):
+        sql = " ".join(str(statement).split()).upper()
+        if sql.startswith(_FORBIDDEN_BULK_SQL) and " WHERE " not in sql:
+            raise RuntimeError(
+                "测试试图执行不带 WHERE 的批量删除 SQL：%s。"
+                "测试连的是真实数据库，这会清空真实用户数据。"
+                % str(statement)[:120]
+            )
+        if sql.startswith("TRUNCATE"):
+            raise RuntimeError(
+                "测试禁止执行 TRUNCATE（会清空真实表）：%s" % str(statement)[:120]
+            )
 
 
 def _should_flush_redis_for_tests() -> bool:
@@ -33,16 +84,25 @@ def _should_flush_redis_for_tests() -> bool:
     }
 
 
-@pytest.fixture(scope="function", autouse=True)
-async def init_infrastructure(request):
-    """Initialize DB and Redis for each function."""
-    if request.node.get_closest_marker("no_infrastructure"):
-        yield
-        return
+@pytest.fixture(scope="session", autouse=True)
+async def init_infrastructure():
+    """整个测试会话初始化一次 DB 与 Redis。
 
-    # Force reset engine pool to bind to current loop
-    await database.close_db() 
-    
+    以前是 ``scope="function"``：每个用例前都 ``engine.dispose()`` + ``init_db()``
+    + ``init_redis()``，结束时再关一遍。原因是默认的 function 级 event loop 每个
+    用例都换一个，而 async engine 的连接绑在创建它的 loop 上，不重建就会在下一个
+    loop 里报 "attached to a different loop"。
+
+    现在 pytest.ini 把 fixture / test 的 loop 都提到 session 级，loop 不再变，
+    于是只需要初始化一次：全量跑从「每用例 2 次 dispose + 1 次握手」降到一次。
+    之前那种写法一次全量测试要向 MySQL 建 8000+ 个连接，纯属无谓负载。
+
+    ``no_infrastructure`` 标记原本用于跳过按用例的初始化；session 级无法按用例
+    判断，改为无条件初始化——被标记的用例本来就不访问 DB，多一个空闲连接无影响。
+    """
+    # 会话开始时保险起见先 dispose 一次：上一轮进程可能留下半开连接。
+    await database.close_db()
+
     await database.init_db()
     await redis.init_redis()
     
@@ -80,18 +140,16 @@ async def init_infrastructure(request):
             
     yield
 
-    # 泄漏检测：dispose 不会关闭已 checkout 的连接。用例结束时若仍有连接未归还，
-    # 说明有 session / 异步生成器 / 后台任务没释放。先用告警观察，避免把偶发的
-    # 后台任务误判成测试失败；确认无噪音后可升级为断言。
+    # 泄漏检测：dispose 不会关闭已 checkout 的连接。会话结束时若仍有连接未归还，
+    # 说明有 session / 异步生成器 / 后台任务没释放。
     try:
         leaked = database.engine.pool.checkedout()
     except Exception:  # pragma: no cover - 防御：engine 被替换时不做判定
         leaked = 0
     if leaked:
         logger.warning(
-            "用例结束后仍有 %s 个数据库连接未归还（疑似 session/生成器泄漏）: %s",
+            "测试会话结束时仍有 %s 个数据库连接未归还（疑似 session/生成器泄漏）",
             leaked,
-            getattr(request.node, "nodeid", "unknown"),
         )
 
     await database.close_db()
@@ -716,3 +774,24 @@ def pytest_collection_modifyitems(config, items):
     known_failures.mark_known_failures(
         items, known, strict=config.getoption("--strict-known-failures")
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_delegation_session_store(monkeypatch):
+    """默认不让单测把子代理会话缓存写进真实 Redis。
+
+    开发机 Redis 与业务共用且默认不 FLUSHDB，而委派用例普遍带 user_id /
+    conversation_id，不隔离就会：① 把测试对话内容写进真实 Redis；
+    ② 不同用例用相同硬编码会话 id 时互相读到彼此的缓存，出现「明明是新 ctx
+    却读到 6 条历史」这种假象。需要真实缓存语义的用例自己 patch ``from_runtime``
+    （参考 tests/ai/tools/test_delegation_session_store.py 里的 FakeRedis）。
+    """
+    from app.services.ai.delegation_session_store import DelegationSessionStore
+
+    async def _no_redis(cls):
+        return cls(None)
+
+    monkeypatch.setattr(
+        DelegationSessionStore, "from_runtime", classmethod(_no_redis)
+    )
+    yield

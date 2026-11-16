@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, computed, nextTick, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, nextTick, watch, provide } from 'vue'
 import { toolApi, scriptToolApi, type SysApiTool } from '../../api/tool'
 import { SUPPORTED_HTTP_METHODS } from '../../utils/toolMethods'
 import { parseToolSchema, validateSystemParams } from '../../utils/toolSchema'
+import { computeGroupTabs, matchesToolFilters, toolGroupName } from '../../utils/toolGroupTabs'
 import { isValidSigningKeyId, isValidSigningSecret } from '../../utils/requestSigning'
 import { useToast } from '../../composables/useToast'
 import { useUser } from '../../composables/useUser'
@@ -11,6 +12,7 @@ import ApiToolTester from './ApiToolTester.vue'
 import ToolHeadersEditor from './ToolHeadersEditor.vue'
 import ToolParamEditor from './ToolParamEditor.vue'
 import GroupSelect from './GroupSelect.vue'
+import ToolGroupTabs from './ToolGroupTabs.vue'
 import ToolWizard from './ToolWizard.vue'
 import ToolSigningEditor from './ToolSigningEditor.vue'
 import ScriptToolList from './ScriptToolList.vue'
@@ -44,6 +46,45 @@ const showDiscardConfirm = ref(false)
 const saving = ref(false)
 const formError = ref('')
 const fieldErrors = ref<Partial<Record<'name' | 'url_template' | 'headers_str' | 'parameter_schema_str' | 'signing', string>>>({})
+
+/**
+ * Headers 编辑器：新建时选的凭据先暂存在它内部，保存拿到工具 id 后要它补写。
+ * 不补写的话界面显示「已绑定」，实际一条绑定都没有。
+ */
+const paramEditorRef = ref<{
+    flushPending: (consumerId: string) => Promise<string[]>
+} | null>(null)
+/** 向导模式下的那一份：新建默认走向导，走这里才拿得到新建态记下的凭据绑定 */
+const wizardRef = ref<{
+    flushPending: (consumerId: string) => Promise<string[]>
+} | null>(null)
+const headersEditorRef = ref<{
+  flushPending: (consumerId: string) => Promise<string[]>
+} | null>(null)
+
+/**
+ * 参数定义里声明了 `source: credential` 的参数名。
+ *
+ * 只认声明过的：普通参数的值由模型填，平台不该去猜哪个「看起来像密钥」。
+ */
+/** 「来自凭据」但还没选凭据的参数名；非空时保存按钮禁用。 */
+const paramUnboundNames = ref<string[]>([])
+const formUnboundNames = ref<string[]>([])
+const wizardUnboundNames = ref<string[]>([])
+/**
+ * 弹窗内跨填写模式（向导 ↔ 表单）共享的新建态参数凭据/规则草稿与修订版本号：
+ * 切页不丢未保存选择，且编辑态一边改了绑定另一边能同步重载。
+ */
+const draftParamBindings = ref<Record<string, any>>({})
+const draftParamRules = ref<Record<string, any>>({})
+const paramBindingRevision = ref(0)
+provide('apiToolDraftParamPending', {
+    bindings: draftParamBindings,
+    rules: draftParamRules,
+    revision: paramBindingRevision,
+    bumpRevision: () => { paramBindingRevision.value += 1 },
+})
+
 const suppressFormWatch = ref(false)
 const wizardDirty = ref(false)
 const initialFormSnapshot = ref('')
@@ -66,6 +107,8 @@ const toggleSaving = ref(false)
 const UNGROUPED_FILTER = '__ungrouped__'
 // 列表视图（扁平行）/ 分组视图（按业务分组折叠）
 const viewMode = ref<'list' | 'group'>('list')
+// 业务分组页签（方案 A：常驻第一级导航）。页签渲染与溢出处理在 ToolGroupTabs.vue 里，
+// 这里只算数据并持有 `groupFilter`——它同时被页签和筛选面板的下拉读写。
 const collapsedRegistryGroups = ref<Set<string>>(new Set())
 
 type ToolForm = {
@@ -170,23 +213,34 @@ const urlPlaceholders = computed(() => {
     return Array.from(names)
 })
 
-const filteredTools = computed(() => {
-    const keyword = toolSearchQuery.value.trim().toLowerCase()
-    return tools.value.filter((tool) => {
-        const matchesKeyword = !keyword || [tool.name, tool.description, tool.url_template]
-            .some((value) => String(value || '').toLowerCase().includes(keyword))
-        const matchesMethod = toolMethodFilter.value === 'all'
-            || String(tool.method || '').toUpperCase() === toolMethodFilter.value
-        const matchesStatus = toolStatusFilter.value === 'all'
-            || (toolStatusFilter.value === 'active' && tool.is_active)
-            || (toolStatusFilter.value === 'inactive' && !tool.is_active)
-        const groupName = String(tool.group_name || '').trim()
-        const matchesGroup = groupFilter.value === 'all'
+const registryFilters = computed(() => ({
+    keyword: toolSearchQuery.value.trim().toLowerCase(),
+    method: toolMethodFilter.value,
+    status: toolStatusFilter.value,
+}))
+
+const filteredTools = computed(() =>
+    tools.value.filter((tool) => {
+        if (!matchesToolFilters(tool, registryFilters.value)) return false
+        const groupName = toolGroupName(tool)
+        return groupFilter.value === 'all'
             || (groupFilter.value === UNGROUPED_FILTER && !groupName)
             || groupName === groupFilter.value
-        return matchesKeyword && matchesMethod && matchesStatus && matchesGroup
     })
-})
+)
+
+/**
+ * 页签 / 筛选面板用的分组计数：按「关键词 + 方法 + 状态」过滤后的命中数。
+ *
+ * 与 `groupFilterOptions`（全量计数）刻意分开——表单里的分组下拉与「分组管理」问的是
+ * 「这个组一共有多少工具」，跟着搜索框变就是错的；页签问的是「当前条件下这一组还能
+ * 看到几个」。混用必然有一边说谎。计算本身在 utils/toolGroupTabs.ts，测试直接跑它。
+ */
+const groupTabCounts = computed(() =>
+    computeGroupTabs(tools.value, registryFilters.value, UNGROUPED_FILTER)
+)
+
+const groupTabItems = computed(() => groupTabCounts.value.items)
 
 // 分组统计：下拉里带上每组规模，并让「还有多少没归类」一眼可见
 const groupFilterOptions = computed(() => {
@@ -210,6 +264,17 @@ const groupFilterOptions = computed(() => {
 })
 
 const ungroupedToolsCount = computed(() => groupFilterOptions.value.ungrouped)
+
+watch(groupTabItems, (items) => {
+    // 当前分组不在页签里（搜索后该组已无命中、或分组刚被删）就回「全部」：
+    // 否则页签消失、表格空白、下拉显示空值，用户只会认为功能坏了。
+    // `tools.length > 0` 是必须的：加载中列表为空时会走到这里，没有这个条件就会把
+    // 用户刚选的分组顺手清掉，表现成「刷新一下筛选没了」。
+    if (tools.value.length > 0 && groupFilter.value !== 'all'
+        && !items.some((item) => item.key === groupFilter.value)) {
+        groupFilter.value = 'all'
+    }
+})
 
 // 已有业务分组名：表单用 datalist 复用，避免同一业务域被写成「履约罚款」「履约罚金」两个组
 
@@ -398,6 +463,21 @@ const toolPendingCredentials = (tool: SysApiTool) => pendingCredentialHeaders(to
 // saveTool() 也仍然只有一条保存路径。
 const editorMode = ref<'form' | 'wizard'>('form')
 
+const syncParamUnboundNames = () => {
+    paramUnboundNames.value = editorMode.value === 'wizard'
+        ? wizardUnboundNames.value
+        : formUnboundNames.value
+}
+const onWizardUnboundChanged = (names: string[]) => {
+    wizardUnboundNames.value = names
+    if (editorMode.value === 'wizard') paramUnboundNames.value = names
+}
+const onFormUnboundChanged = (names: string[]) => {
+    formUnboundNames.value = names
+    if (editorMode.value === 'form') paramUnboundNames.value = names
+}
+watch(editorMode, syncParamUnboundNames)
+
 const openModal = (tool?: SysApiTool, isClone = false) => {
     if (tool) {
         isEditing.value = !isClone
@@ -440,6 +520,12 @@ const openModal = (tool?: SysApiTool, isClone = false) => {
     }
     // 新建优先走向导；编辑已有工具走完整表单，避免用户每次都被迫从第 1 步开始。
     editorMode.value = tool && !isClone ? 'form' : 'wizard'
+    // 上一次编辑留下的「未绑定参数」必须清掉；同时清空新建态共享的暂存凭据与规则。
+    formUnboundNames.value = []
+    wizardUnboundNames.value = []
+    draftParamBindings.value = {}
+    draftParamRules.value = {}
+    paramUnboundNames.value = []
     clearFormErrors()
     advancedOpen.value = false
     wizardDirty.value = false
@@ -662,8 +748,31 @@ const saveTool = async () => {
             await toolApi.update(toolForm.value.id, payload)
             showToast('更新成功', 'success')
         } else {
-            await toolApi.create(payload)
+            const created = await toolApi.create(payload)
             showToast('创建成功', 'success')
+            // 新建时选的凭据此时才有工具 id 可挂：补写失败要说出来，不能让它
+            // 静默变成「界面显示已绑定、实际没有」
+            const newId = String(created?.data?.id || '')
+            if (newId) {
+                const failed: string[] = []
+                if (headersEditorRef.value) {
+                    failed.push(...await headersEditorRef.value.flushPending(newId))
+                }
+                // 参数位的凭据也是新建态先记账，这里一起补写。
+                // 向导与表单通过 v-show 保活且共享同一份新建态 pending，
+                // 按当前激活模式调用 flushPending(newId) 即可，避免同一份 pending 重复提交两次。
+                if (editorMode.value === 'wizard' && wizardRef.value) {
+                    failed.push(...await wizardRef.value.flushPending(newId))
+                } else if (paramEditorRef.value) {
+                    failed.push(...await paramEditorRef.value.flushPending(newId))
+                }
+                if (failed.length) {
+                    showToast(
+                        `工具已创建，但 ${failed.map((s) => s.replace(/^(header|query|body|\?param):/, '')).join('、')} 的凭据绑定失败，请重新绑定`,
+                        'error',
+                    )
+                }
+            }
         }
         // 密钥已经交给服务端加密保存，前端不再保留明文
         toolForm.value.signing_secret = ''
@@ -854,9 +963,9 @@ onBeforeUnmount(() => {
                                 v-model="groupFilter"
                                 class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-xs outline-none focus:border-primary focus:ring-2 focus:ring-primary/20"
                             >
-                                <option value="all">全部分组（{{ groupFilterOptions.all }}）</option>
-                                <option :value="UNGROUPED_FILTER">未分组（{{ groupFilterOptions.ungrouped }}）</option>
-                                <option v-for="[name, count] in groupFilterOptions.groups" :key="name" :value="name">{{ name }}（{{ count }}）</option>
+                                <option value="all">全部分组（{{ groupTabCounts.total }}）</option>
+                                <option v-if="groupTabCounts.ungrouped > 0" :value="UNGROUPED_FILTER">未分组（{{ groupTabCounts.ungrouped }}）</option>
+                                <option v-for="[name, count] in groupTabCounts.groups" :key="name" :value="name">{{ name }}（{{ count }}）</option>
                             </select>
                         </div>
 
@@ -969,7 +1078,15 @@ onBeforeUnmount(() => {
                 </div>
             </div>
          </div>
-         
+
+         <!-- 业务分组页签：与筛选面板的「业务分组」下拉共用 groupFilter，切哪边另一边同步 -->
+         <ToolGroupTabs
+            :items="groupTabItems"
+            :model-value="groupFilter"
+            aria-label="按业务分组筛选 API 工具"
+            @update:model-value="groupFilter = $event"
+         />
+
          <div
             v-if="canSave && ungroupedToolsCount > 0 && groupFilter !== UNGROUPED_FILTER"
             class="flex flex-wrap items-center gap-2 border-b border-amber-100 bg-amber-50/70 px-4 py-2 text-xs text-amber-800"
@@ -1023,7 +1140,8 @@ onBeforeUnmount(() => {
                     </th>
                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider whitespace-nowrap">名称</th>
                     <th class="w-24 px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider whitespace-nowrap">Method</th>
-                    <th class="w-32 px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider whitespace-nowrap">业务分组</th>
+                    <!-- 页签已经表明「在看哪一组」，不再重复一列，把宽度还给名称与 URL -->
+                    <th v-if="groupFilter === 'all'" class="w-32 px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider whitespace-nowrap">业务分组</th>
                     <th class="w-32 px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider whitespace-nowrap">状态</th>
                     <th class="w-44 px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider whitespace-nowrap">操作</th>
                 </tr>
@@ -1059,7 +1177,7 @@ onBeforeUnmount(() => {
                             {{ t.method }}
                         </span>
                     </td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm">
+                    <td v-if="groupFilter === 'all'" class="px-6 py-4 whitespace-nowrap text-sm">
                         <button
                             v-if="t.group_name"
                             type="button"
@@ -1142,7 +1260,7 @@ onBeforeUnmount(() => {
                      </td>
                 </tr>
                 <tr v-if="group.tools.length === 0">
-                    <td colspan="6" class="px-6 py-8 text-center text-gray-400 text-sm">{{ hasToolFilters ? '暂无匹配工具' : '暂无工具配置' }}</td>
+                    <td :colspan="groupFilter === 'all' ? 6 : 5" class="px-6 py-8 text-center text-gray-400 text-sm">{{ hasToolFilters ? '暂无匹配工具' : '暂无工具配置' }}</td>
                 </tr>
             </tbody>
          </table>
@@ -1201,14 +1319,16 @@ onBeforeUnmount(() => {
                     {{ formError }}
                 </div>
               
-                <!-- 向导模式：4 步引导，写的是同一份 toolForm -->
+                <!-- 向导模式：4 步引导，写的是同一份 toolForm；v-show 保活防止切回表单时步骤与暂存状态丢失 -->
                 <ToolWizard
-                    v-if="editorMode === 'wizard'"
+                    v-show="editorMode === 'wizard'"
+                    ref="wizardRef"
                     :tool-form="toolForm"
                     @dirty-change="wizardDirty = $event"
+                    @unbound-changed="onWizardUnboundChanged"
                 />
 
-                <div v-else class="space-y-4">
+                <div v-show="editorMode === 'form'" class="space-y-4">
                     <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
                         <div>
                            <label for="tool-name" class="block text-sm font-medium text-gray-700">工具名称 (唯一标识)</label>
@@ -1244,10 +1364,20 @@ onBeforeUnmount(() => {
                     </div>
 
                     <div data-tool-field="parameter_schema_str" class="rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-primary/30" tabindex="-1">
+                        <!--
+                          `is-global`：API 工具目前全部是平台级（管理员在这里统一配置，
+                          所有人共用），所以传 true。真出现「个人级 API 工具」时，
+                          把这里换成按工具归属判断——组件内部不再写死，改一处就够。
+                        -->
                         <ToolParamEditor
+                            ref="paramEditorRef"
                             v-model="toolForm.parameter_schema_str"
                             :method="toolForm.method"
                             :url-template="toolForm.url_template"
+                            :consumer-id="isEditing && toolForm.id ? String(toolForm.id) : ''"
+                            :consumer-type="'api_tool'"
+                            :is-global="true"
+                            @unbound-changed="onFormUnboundChanged"
                         />
                         <p v-if="fieldErrors.parameter_schema_str" class="mt-1 text-xs text-red-600">{{ fieldErrors.parameter_schema_str }}</p>
                     </div>
@@ -1277,9 +1407,13 @@ onBeforeUnmount(() => {
                         </summary>
                         <div class="space-y-4 border-t border-gray-200 px-3 py-3">
                             <div data-tool-field="headers_str" class="rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-primary/30" tabindex="-1">
+                                <!-- 同 ToolParamEditor 的 is-global：API 工具都是平台级 -->
                                 <ToolHeadersEditor
+                                    ref="headersEditorRef"
                                     v-model="toolForm.headers_str"
                                     :error="fieldErrors.headers_str"
+                                    :consumer-id="isEditing && toolForm.id ? String(toolForm.id) : ''"
+                                    :is-global="true"
                                 />
                             </div>
 
@@ -1324,7 +1458,10 @@ onBeforeUnmount(() => {
                     >取消</button>
                     <button
                         type="button"
-                        :disabled="saving"
+                        :disabled="saving || paramUnboundNames.length > 0"
+                        :title="paramUnboundNames.length
+                            ? '先给这些参数选凭据：' + paramUnboundNames.join('、')
+                            : ''"
                         class="inline-flex items-center gap-2 px-4 py-2 bg-primary border border-transparent rounded-md text-sm font-medium text-white hover:bg-primary-dark disabled:cursor-not-allowed disabled:opacity-60"
                         @click="saveTool"
                     >

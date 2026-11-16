@@ -391,6 +391,9 @@ async def delete_script_tool(
     await db.delete(row)
     await db.commit()
     ToolRegistry.clear_db_tool_cache()
+    from app.services.secrets import center as secret_center
+
+    await secret_center.detach_consumer(db, consumer_type="script_tool", consumer_id=tool_id)
     return {"ok": True}
 
 
@@ -417,9 +420,10 @@ async def preview_script_tool(
     db: AsyncSession = Depends(get_db_session),
     user: Dict = Depends(require_permission("element", "element:system:config_save")),
 ):
-    """试运行：走与真实调用完全相同的执行器，但落在预览目录、不进沙箱。
+    """试运行：走与真实调用相同的执行器，但落在预览目录。
 
-    试跑不写库；``tool_id`` 存在时用库里的代码，允许用提交的字段覆盖。
+    ``tool_id`` 存在时用库里的代码，允许用提交的字段覆盖。非 ``local`` 策略下
+    直接拒绝：试运行没有会话工作区，容器沙箱起不来，放行就等于在宿主机上跑。
     """
     from dataclasses import replace as dataclass_replace
 
@@ -464,9 +468,29 @@ async def preview_script_tool(
     if overrides:
         config = dataclass_replace(config, **overrides)
 
-    workdir = await _preview_workdir(user)
-    runner = ScriptToolRunner(config, workdir=workdir, sandbox_ws=None, sandbox_root=None, user_info=user)
     policy = await current_sandbox_policy()
+    # 试运行没有会话 ID：docker/k8s 起不了会话沙箱，e2b/ssh 没有「会话工作区 →
+    # 沙箱路径」的映射。除 local 外的策略在这里唯一「能跑」的就是后端进程的宿主机
+    # 权限——任意代码与 pip install 都会提到平台权限下，响应却仍报 sandbox_policy=docker。
+    # 宁可拒绝，也不静默降级。
+    if policy != "local":
+        return SysScriptToolPreviewResponse(
+            ok=False,
+            sandbox_policy=policy,
+            message=(
+                f"当前沙箱策略（{policy}）下无法试运行：试运行没有会话工作区，"
+                "容器沙箱无法启动，已拒绝执行，不会退回平台后端进程运行。"
+                "请保存后在智能体会话中调用该工具验证；只有 local 策略才可直接试运行"
+                "（脚本以平台后端权限运行，不是安全边界）。"
+            ),
+        )
+
+    workdir = await _preview_workdir(user)
+    # local 策略就是后端进程执行，这里不传 sandbox_ws 即代表本地通道；上面的
+    # 策略判断已经挡住了所有本应进容器的场景。
+    from app.services.secrets.redact import redact_text
+
+    runner = ScriptToolRunner(config, workdir=workdir, user_info=user)
 
     try:
         result = await runner.run(payload.params or {})
@@ -474,18 +498,33 @@ async def preview_script_tool(
         return SysScriptToolPreviewResponse(
             ok=False,
             sandbox_policy=policy,
-            message=str(exc),
+            message=redact_text(str(exc), where="脚本工具试运行异常"),
         )
+
+    # 先脱敏再截断，防止注入凭据横跨输出截断边界导致半段明文逃逸回前端
+    safe_stdout = redact_text(result.stdout or "", where="脚本工具试运行输出")
+    safe_stderr = redact_text(result.stderr or "", where="脚本工具试运行错误输出")
+    raw_message = result.message or ""
+    if result.credential_denials:
+        denial_tip = f"凭据环境变量未注入：{result.credential_denials}"
+        raw_message = f"{raw_message}；{denial_tip}" if raw_message else denial_tip
+    safe_message = (
+        redact_text(raw_message, where="脚本工具试运行消息")
+        if raw_message
+        # 空消息必须给空串，不能给 None：SysScriptToolPreviewResponse.message 是
+        # 非 Optional 的 str，成功且无消息（最常见的一条路径）会直接 500。
+        else ""
+    )
 
     return SysScriptToolPreviewResponse(
         ok=result.ok,
         exit_code=result.exit_code,
-        stdout=result.stdout[:20000],
-        stderr=result.stderr[:8000],
+        stdout=safe_stdout[:20000],
+        stderr=safe_stderr[:8000],
         duration_ms=result.duration_ms,
         timed_out=result.timed_out,
         sandbox_policy=policy,
-        message=result.message,
+        message=safe_message,
     )
 
 

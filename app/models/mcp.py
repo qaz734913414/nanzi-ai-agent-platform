@@ -24,6 +24,9 @@ class McpServer(Base):
     
     scope = Column(String(20), default="global", nullable=False)
     user_id = Column(Integer, nullable=True)
+    # 业务分组：单值归属，只服务「MCP 工具集」左栏页签与筛选。
+    # 与 remark（自由备注）、scope（global/personal 归属范围）都不是一回事，见 V215 迁移注释。
+    group_name = Column(String(64), nullable=True)
     
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
@@ -38,6 +41,10 @@ class McpToolCache(Base):
     tool_name = Column(String(255), nullable=False)
     tool_description = Column(Text, nullable=True)
     parameter_schema = Column(Text, nullable=True) # JSON Schema string
+    #: 值由凭据中心提供的参数名，JSON 数组。声明过的参数从模型可见的 schema 里
+    #: 剔除，运行时按 ``arg:<短工具名>:<参数名>`` 槽位注入。
+    #: 不塞进 ``parameter_schema``：同步时整体覆盖，且 ``x-nanzi-*`` 会被剥掉。
+    credential_params = Column(Text, nullable=True)
     is_published = Column(Boolean, default=False)
     is_available = Column(Boolean, nullable=False, default=True)
     

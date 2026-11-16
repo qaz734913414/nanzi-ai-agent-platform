@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import re
+
 import pytest
 
 pytestmark = pytest.mark.no_infrastructure
@@ -89,9 +91,19 @@ def test_library_is_the_only_locked_entry(menu: str) -> None:
     assert 'permission: "menu:knowledge_management"' in library_block
 
 
-def test_system_menu_is_removed(menu: str) -> None:
-    """「系统管理」已从用户模式移除：管理员要看后台就切专业模式。"""
-    assert 'key: "system"' not in menu
+def test_user_mode_keeps_system_admin_as_one_admin_only_shortcut(menu: str) -> None:
+    """用户模式不放「系统管理」整组，只留一个管理员专用「系统设置」直达。
+
+    历史：这里原来断言 `key: "system" not in menu`，理由是「管理员要看后台就切
+    专业模式」。实际用起来那一步很烦——改一个开关要先切模式、再从左侧菜单找。
+    现在改成：26 个后台入口仍然不进用户模式，但给一个直达入口兜住高频操作，
+    并且 adminOnly + menu:system:config 双保险（见 probe 里的 userHasSystem）。
+    """
+    # system 只作为「更多」的一个子项出现，不能变成多入口的「系统管理」分组
+    assert menu.count('key: "system"') == 1
+    system_block = menu.split('key: "system"', 1)[1].split("},", 1)[0]
+    assert "adminOnly: true" in system_block
+    assert 'path: "/dashboard/system"' in system_block
 
 
 def test_sidebar_renders_locked_hint_instead_of_navigating(sidebar: str) -> None:
@@ -204,9 +216,21 @@ def test_user_mode_lands_on_new_task_after_login() -> None:
 
     assert "resolveInitialUiMode" in login
     assert "query: { new: '1' }" in login
-    # 根路径与守卫兜底同样按模式分流
+    # 根路径同样按模式分流
     assert "getCachedUiMode() === 'user' ? '/dashboard/chat' : '/dashboard'" in router_source
-    assert "if (getCachedUiMode() === 'user') return '/dashboard/chat'" in router_source
+    # 守卫兜底必须按菜单快照判断：写死回 chat 时，缺 menu:ai_chat 的账号会自指 NoPermission
+    assert "if (getCachedUiMode() === 'user') return resolveUserModeHomePath(menus)" in router_source
+
+
+def test_user_mode_fallback_does_not_strand_users_without_ai_chat() -> None:
+    """没有 menu:ai_chat 的用户模式账号要退到无权限要求的工作台，不能死锁在 NoPermission。"""
+    router_source = _read("frontend/src/router/index.ts")
+
+    assert "menus.includes('menu:ai_chat') ? '/dashboard/chat' : '/dashboard/workbench'" in router_source
+    # 工作台在路由表里不能带权限码，否则兜底页自身进不去（路由挂在 /dashboard 下，是相对路径）
+    workbench = re.search(r"path:\s*'workbench'.{0,300}?\}", router_source, re.S)
+    assert workbench, "未找到 /dashboard/workbench 路由定义"
+    assert "perm:" not in workbench.group(0)
 
 
 def test_user_mode_hides_the_top_header_and_moves_actions_to_sidebar() -> None:
@@ -268,14 +292,33 @@ def test_knowledge_and_workspace_are_siblings(menu: str) -> None:
     assert "permission" not in workspace_block
 
 
-def test_more_menu_drops_memory_and_system_adds_overview(menu: str) -> None:
+def test_more_menu_holds_curated_entries_plus_admin_only_system_config(menu: str) -> None:
+    """「更多」收纳不常用入口；其中系统设置只给管理员。
+
+    这里原来断言的是 `key: "system" not in more_block`——那时系统入口只属于
+    专业模式的动态菜单。现在反过来：管理员在用户模式下也要能直接改配置，
+    否则每改一个开关都得先切专业模式、再从左侧菜单进。
+    普通用户没有 menu:system:config，露出来只会被守卫踢回落地页，所以这一项
+    同时挂权限码和 adminOnly，两个条件都满足才渲染。
+    """
     more_block = menu.split('key: "more"', 1)[1]
     assert 'key: "overview"' in more_block
     assert 'path: "/dashboard"' in more_block
     assert 'key: "memory"' not in more_block
-    assert 'key: "system"' not in more_block
     # 个人中心入口收敛到头像弹层（AccountMenu），侧栏不重复第二份
     assert 'key: "personal"' not in more_block
+
+    # 三个后台入口同一套口径：path + 菜单码 + adminOnly，缺一个就会漏给普通用户
+    for key, label, path, perm in (
+        ("users", "用户管理", "/dashboard/users", "menu:system:users"),
+        ("roles", "角色管理", "/dashboard/roles", "menu:system:roles"),
+        ("system", "系统设置", "/dashboard/system", "menu:system:config"),
+    ):
+        block = more_block.split(f'key: "{key}"', 1)[1].split("},", 1)[0]
+        assert f'label: "{label}"' in block
+        assert f'path: "{path}"' in block
+        assert f'permission: "{perm}"' in block
+        assert "adminOnly: true" in block
 
 
 def test_workspace_page_hides_session_mount_action() -> None:
@@ -553,8 +596,9 @@ def test_submenu_items_carry_icons() -> None:
     menu = _read("frontend/src/constants/userModeMenu.ts")
     sidebar = _read("frontend/src/components/layout/UserModeSidebar.vue")
 
-    # 三个专家子项 + 更多里的三项
-    for key in ('"expert"', '"skill"', '"connector"', '"workbench"', '"token"', '"overview"'):
+    # 三个专家子项 + 更多里的六项
+    for key in ('"expert"', '"skill"', '"connector"', '"workbench"', '"token"',
+                '"overview"', '"users"', '"roles"', '"system"'):
         segment = menu.split(f"key: {key}", 1)[1].split("}", 1)[0]
         assert "icon:" in segment, f"{key} 缺少图标"
 
@@ -642,10 +686,10 @@ def test_menu_and_task_list_scroll_independently() -> None:
     """菜单固定、任务区独立滚动：任务多时菜单不能被一起滚走。"""
     sidebar = _read("frontend/src/components/layout/UserModeSidebar.vue")
 
-    menu_index = sidebar.index("max-h-[52vh] overflow-y-auto custom-scrollbar")
+    menu_index = sidebar.index('ref="menuScrollRef"')
     task_index = sidebar.index('ref="scrollRef"')
     assert menu_index < task_index
-    assert 'class="min-h-0 flex-1 overflow-y-auto px-2.5 pb-3 custom-scrollbar"' in sidebar
+    assert 'class="min-h-[9rem] flex-1 overflow-y-auto px-2.5 pb-3 custom-scrollbar"' in sidebar
 
 
 def test_new_chat_highlight_requires_no_active_conversation() -> None:
@@ -782,3 +826,129 @@ def test_group_header_does_not_highlight_with_active_child(sidebar: str) -> None
     assert "navItemClass(item, isChildActive(item))" not in sidebar
     # 子项选中仍要高亮
     assert "navSubClass(isActive(child.path), child.locked)" in sidebar
+
+
+def test_conversation_list_has_manual_refresh(sidebar: str) -> None:
+    """会话列表要能手动刷新：用户想「看看有没有新会话」时不必刷新整页。"""
+    assert 'aria-label="刷新会话列表"' in sidebar
+    assert '@click="refreshTasks"' in sidebar
+    # 刷新期间按钮禁用 + 图标旋转，避免重复点击与「点了没反应」
+    assert ':disabled="refreshingTasks"' in sidebar
+    assert "refreshingTasks ? 'animate-spin' : ''" in sidebar
+    # 任务列表与置顶一起刷新，否则置顶块会停在旧数据
+    assert "await Promise.all([loadTasks(), pinnedApi.load()])" in sidebar
+    # 内网请求太快时也要有可见反馈
+    assert "const remain = 500 - (Date.now() - startedAt)" in sidebar
+
+
+def test_task_row_time_hugs_right_and_yields_to_actions(sidebar: str) -> None:
+    """时间贴右边缘，鼠标移上来淡出把位置让给操作按钮。"""
+    # hover 时时间淡出（仅 sm+，移动端没有 hover，时间保持可见）
+    assert "sm:group-hover/item:opacity-0" in sidebar
+    # 操作按钮改成同层绝对定位：不再占宽度，时间才贴得到右边缘
+    assert 'class="absolute right-1 top-1/2 flex h-5 w-5 -translate-y-1/2' in sidebar
+    # 行容器需要 relative 才能挂住绝对定位按钮
+    assert 'class="group/item relative"' in sidebar
+    # 小屏按钮常显，行按钮留出位置，文字不被压到按钮下面
+    assert "px-2.5 pr-7 text-left text-sm transition-colors sm:pr-2.5" in sidebar
+
+
+def test_conversation_list_supports_filters(sidebar: str) -> None:
+    """会话列表支持来源 / 智能体 / 状态 / 时间筛选，面板与聊天页共用同一组件。"""
+    # 面板复用的是历史页那套组件，条件不会两边漂移
+    assert "ConversationFilterPanel" in sidebar
+    # 筛选参数由公共工具生成，后端 /history 已支持这些字段
+    assert "buildHistoryFilterParams(taskFilters.value)" in sidebar
+    # 触发按钮与激活条件回显：筛完要看得见自己筛了什么
+    assert 'aria-label="筛选会话"' in sidebar
+    assert "activeFilterChips" in sidebar
+    assert "@click.stop=\"removeTaskFilter(chip.key)\"" in sidebar
+    # 浮层用 teleport + fixed，避免被侧栏滚动容器裁剪
+    assert "<Teleport to=\"body\">" in sidebar
+    assert "data-conversation-filter-panel" in sidebar
+    # 智能体列表懒加载，拉不到也不影响其它条件
+    assert "agentApi.listAllowedAgents()" in sidebar
+
+
+def test_filter_panel_closes_on_outside_pointer_down(sidebar: str) -> None:
+    """点外部必须能收起筛选浮层。
+
+    判定挂在**捕获阶段**：侧栏里的筛选 chips、会话行的「⋯」都带 `@click.stop`
+    （点它们不该触发外层动作），冒泡阶段的 click 根本到不了 document，
+    浮层就会一直悬在页面上——表现就是「点了别处没反应」。
+    """
+    assert 'document.addEventListener("pointerdown", onFilterPanelOutsidePointerDown, true)' in sidebar
+    assert 'document.removeEventListener("pointerdown", onFilterPanelOutsidePointerDown, true)' in sidebar
+    # 面板与漏斗按钮内部不关（按钮的 click 还要负责开合）
+    assert 'closest("[data-conversation-filter-panel]")' in sidebar
+    assert "filterButtonRef.value?.contains(target)" in sidebar
+    # target 可能是 document / window（点滚动条、点 html 外沿），不能直接调 closest
+    assert "target instanceof Node" in sidebar
+    assert "target instanceof Element" in sidebar
+    # 关闭判定不能再依赖冒泡阶段的 click
+    click_handler = sidebar.split("const onDocumentClick = (event: MouseEvent) => {", 1)[1].split("}", 1)[0]
+    assert "filterPanelOpen" not in click_handler
+
+
+def test_filter_panel_closes_on_escape_and_route_change(sidebar: str) -> None:
+    """Esc 与换页都要收起浮层：它 teleport 在 body 上，不属于任何路由。"""
+    assert 'event.key !== "Escape"' in sidebar
+    route_watch = sidebar.split("watch(() => route.path", 1)[1].split("})", 1)[0]
+    assert "filterPanelOpen.value = false" in route_watch
+
+
+def test_filter_panel_has_backdrop_so_iframe_clicks_close_it(sidebar: str) -> None:
+    """点外部要真的生效，必须有一层遮罩。
+
+    用户模式的主工作区是全屏 `<iframe>`（Chat.vue）。点进去时主文档收不到
+    pointerdown / keydown，`document` 上的判定形同虚设——浮层会一直挂着，
+    或者在 iframe 上点哪都没反应。遮罩铺满视口、层级压在面板下面，
+    点它（包括 iframe 覆盖的区域）就能收起。
+    """
+    assert "data-conversation-filter-backdrop" in sidebar
+    # 遮罩必须在面板(z-[80])之下，否则会挡住面板里的筛选操作
+    assert 'z-[75]' in sidebar
+    # 遮罩与面板同一开关：不能出现「有面板没遮罩」或反之
+    assert sidebar.count('v-if="filterPanelOpen"') >= 2
+    backdrop = sidebar.split("data-conversation-filter-backdrop", 1)[1].split("/>", 1)[0]
+    assert "pointerdown" in backdrop
+
+
+def test_menu_scroll_area_signals_more_content_below() -> None:
+    """菜单区仍要能提示「下面还有」，但只在真的装不下时才滚动。
+
+    真实翻车：菜单区曾经死锁 52vh，加完「系统设置」后自己也漏看过——「更多」展开的
+    子项落到滚动条之外，那里没有任何视觉线索，看起来就像菜单只有这么多。
+
+    现在菜单区按内容自然高度铺开（展开「更多」时整组可见，会话列表让位、下移），
+    只有窗口矮到会话列表已经顶到 min-h、菜单区被迫滚动时才需要渐隐提示。
+    所以这里锁四件事：不再写死 52vh、溢出判据仍在、渐隐仍只在真有溢出时显示、
+    展开后会把新出现的子项滚进视野。
+    """
+    sidebar = _read("frontend/src/components/layout/UserModeSidebar.vue")
+
+    # 不再写死高度：菜单区撑开、会话列表让位
+    assert "max-h-[52vh]" not in sidebar
+    assert 'class="relative flex min-h-0 px-2.5"' in sidebar
+    assert 'class="min-h-0 w-full overflow-y-auto custom-scrollbar"' in sidebar
+
+    # 滚动容器可定位、可观察
+    assert 'ref="menuScrollRef"' in sidebar
+    assert '@scroll.passive="updateMenuOverflow"' in sidebar
+
+    # 判据：还有内容在下面才显示
+    assert 'menuOverflowBelow.value = el.scrollHeight - el.scrollTop - el.clientHeight > 4' in sidebar
+    assert 'v-show="menuOverflowBelow"' in sidebar
+    # 纯视觉：不能挡住「更多」组最后一项的点击
+    assert "pointer-events-none absolute inset-x-2.5 bottom-0 h-8 bg-gradient-to-t" in sidebar
+
+    # 展开分组只改内部高度，scroll 事件不会触发，必须用 ResizeObserver 补；
+    # 容器自身被压缩时尺寸会变，所以两个都要观察
+    assert "new ResizeObserver(() => updateMenuOverflow())" in sidebar
+    assert "menuResizeObserver.observe(nav)" in sidebar
+    assert "menuResizeObserver.observe(menuScrollRef.value)" in sidebar
+    assert "menuResizeObserver?.disconnect()" in sidebar
+
+    # 展开后把这一组的子项滚进视野，否则点了「更多」还是看不到最后一项
+    assert ':data-group-body="item.key"' in sidebar
+    assert "revealGroupBody(item.key)" in sidebar

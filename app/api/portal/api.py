@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 from app.core.dependencies import require_admin, require_api_key
-from app.api.portal.endpoints import auth, audit, management, user_import, keys, dashboard, system, chat, metadata, agents, prompts, slash_commands, health, models, tools, script_tools, tool_bundles, ragflow, roles, menus, departments, mcp, mcp_service, changelog, chat_feedback, examples, chatbi_briefs, chatbi_monitors, chatbi_export, skills, personal_skills, skill_gallery, memory, saved_reports, portal_prefs, quota, notifications, inbox, data_portal, scenario_templates, workbench, langfuse, web_preview, access_requests, resource_square, chat_shares
+from app.api.portal.endpoints import auth, audit, management, user_import, keys, dashboard, system, chat, metadata, agents, prompts, slash_commands, health, models, tools, script_tools, tool_bundles, ragflow, roles, menus, departments, mcp, mcp_service, changelog, chat_feedback, examples, chatbi_briefs, chatbi_monitors, chatbi_export, skills, personal_skills, skill_gallery, memory, saved_reports, portal_prefs, quota, notifications, inbox, broadcast, data_portal, scenario_templates, workbench, langfuse, web_preview, access_requests, resource_square, chat_shares, secrets, instances
 
 portal_router = APIRouter()
 
@@ -39,6 +39,9 @@ portal_router.include_router(system.router, prefix="/system", tags=["系统配�
 
 # 7.1 LLM 链路追踪配置 (Langfuse) —— 独立表与独立 Tab，权限单独控制
 portal_router.include_router(langfuse.router, prefix="/system/langfuse", tags=["Langfuse串联追踪"], dependencies=[Depends(require_api_key)])
+
+# 7.2 多实例心跳（系统诊断 → 实例）：只读运维信息 + 别名编辑，端点内部要求管理员
+portal_router.include_router(instances.router, prefix="/system/instances", tags=["实例监控"], dependencies=[Depends(require_api_key)])
 
 # 8. API 密钥 (Keys)
 portal_router.include_router(keys.router, prefix="/keys", tags=["API密钥"], dependencies=[Depends(require_api_key)])
@@ -83,6 +86,12 @@ portal_router.include_router(ragflow.router, prefix="/ragflow", tags=["RAGFlow�
 portal_router.include_router(mcp.router, prefix="/mcp", tags=["MCP管理"], dependencies=[Depends(require_api_key)])
 portal_router.include_router(mcp_service.router, prefix="/mcp-service", tags=["MCP服务台"], dependencies=[Depends(require_api_key)])
 
+# 15.1 凭据中心 (Credential Center)
+#      用户侧 `/secrets`（个人凭据 + 被授权的系统级），管理员侧 `/secrets/admin`。
+#      任何一条路径都不返回凭据明文：credential 类型建完即不可读，
+#      唯一的值出口 `/secrets/{id}/value` 只对 variable（租户号/接口地址）开放。
+portal_router.include_router(secrets.router, prefix="/secrets", tags=["凭据中心"], dependencies=[Depends(require_api_key)])
+
 # 16. 变更日志 (Changelog)
 portal_router.include_router(changelog.router, prefix="/changelog", tags=["变更日志"], dependencies=[Depends(require_api_key)])
 
@@ -123,6 +132,9 @@ portal_router.include_router(notifications.router, prefix="/notifications", tags
 
 # 23. 站内消息中心
 portal_router.include_router(inbox.router, prefix="/inbox", tags=["站内消息"], dependencies=[Depends(require_api_key)])
+
+# 23.1 管理员站内信群发（仅 admin，见 broadcast.py 顶部说明为何不并入 inbox）
+portal_router.include_router(broadcast.router, prefix="/broadcast", tags=["站内信群发"], dependencies=[Depends(require_api_key)])
 
 # 24. 网页预览内嵌实测 (Web Preview Embed Check)
 # 由服务端读取目标站点响应头判定「能否内嵌」，替代前端按域名名单猜测（曾误拦 baidu.com）。

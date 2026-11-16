@@ -17,6 +17,21 @@ from app.utils.skill_metadata import is_skill_enabled, parse_skill_frontmatter
 
 logger = logging.getLogger(__name__)
 
+
+def _current_tool_temperature() -> Optional[float]:
+    """读取当前工具级温度覆盖（智能体「工具高级配置」里配的温度）。
+
+    只有内部自调 LLM 的工具（如 read_image）才需要它：平台把工具级覆盖挂在调用上下文里，
+    未配置或不在工具调用栈内时返回 None，调用方按各自历史的默认值处理。
+    """
+    try:
+        from app.core.context import get_current_tool_temperature
+
+        return get_current_tool_temperature()
+    except Exception:  # noqa: BLE001 - 取不到上下文就退回默认行为
+        return None
+
+
 def validate_safe_path(path: str) -> str:
     """
     安全校验：限制物理读写仅允许在合法的 data 安全目录下，防止路径穿越 (..)。
@@ -565,6 +580,7 @@ async def read_image(path: str, question: str = "") -> str:
         from app.services.ai.config import AgentConfigProvider
         from app.services.ai.runtime.agentscope.compat import HumanMessage
 
+        configured_temperature = _current_tool_temperature()
         human = HumanMessage(
             content=[
                 {"type": "text", "text": prompt_text},
@@ -575,7 +591,11 @@ async def read_image(path: str, question: str = "") -> str:
         llm = await AgentConfigProvider.get_configured_llm(
             streaming=False,
             model_override=vision_model,
-            temp_override=0.0,
+            # 工具级温度覆盖：智能体「工具高级配置」里给 read_image 调过温度才生效，
+            # 没配时保持历史上的 0.0（最精确）。纯函数工具不会走到这里。
+            temp_override=(
+                0.0 if configured_temperature is None else configured_temperature
+            ),
         )
         response = await llm.ainvoke([human])
 
@@ -1138,10 +1158,17 @@ def _resolve_skill_dir_for_asset(skill_id: str, scope: str, user_info) -> tuple[
         raise ValueError("scope 仅支持 personal 或 global")
 
     if resolved_scope == "global":
-        if user_info:
-            role = str(user_info.get("role", "") or "")
-            if not (role == "admin" or "admin" in role.lower()):
-                raise ValueError("权限不足：仅系统管理员可以写入平台全局技能（global）")
+        # 与 create_skills(scope="global") / import_skill_from_sandbox 共用同一道闸门：
+        # element:skills:admin（admin 角色恒放行），且**无身份一律拒绝**。此前这里是
+        # `if user_info:` 只看 role 字符串，于是无身份调用（上下文缺失）会直接落盘，
+        # 而只被授予该权限、但没有 admin 角色的用户却在页面能点、在这里被拒。
+        from app.services.ai.skills.platform_admin import can_manage_platform_skills
+
+        if not can_manage_platform_skills(user_info):
+            raise ValueError(
+                "权限不足：仅持有平台技能管理权限（element:skills:admin）的用户可以写入"
+                "平台全局技能（global）。个人技能请传 scope=personal。"
+            )
         from app.core.config import settings
 
         skills_dir = settings.SKILLS_DIR
@@ -1220,7 +1247,7 @@ def write_skill_file(
         content: 文件内容。文本按 encoding="utf8" 直接写入；二进制（png/jpg/xlsx 等）
                  需先把字节做 Base64 编码，再用 encoding="base64" 传入。
         encoding: "utf8"（默认）或 "base64"。base64 时必须能正确解码，否则拒绝写入。
-        scope: "personal"（个人技能，默认）或 "global"（平台全局，仅管理员）。
+        scope: "personal"（个人技能，默认）或 "global"（平台全局，需 element:skills:admin）。
         overwrite: 是否允许覆盖已存在的同名文件。默认 false：目标已存在时**不写任何内容**，
                    返回 NANZI_SKILL_FILE_EXISTS，需先向用户确认再带 overwrite=true 重试。
 
@@ -1487,7 +1514,11 @@ def _skill_md_meta_warnings(skill_md_path: str) -> list:
             content = f.read(8192).lstrip("\ufeff")
     except OSError:
         return ["skill_md_unreadable"]
-    match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    # 与技能列表/预铺同一口径：自带的严格正则曾把「闭合 --- 在文件末尾」判成没有
+    # frontmatter，于是给模型回一条其实不成立的 missing_frontmatter 警告。
+    from app.utils.skill_metadata import SKILL_FRONTMATTER_PATTERN
+
+    match = SKILL_FRONTMATTER_PATTERN.match(content)
     if not match:
         return ["missing_frontmatter"]
     keys = set()

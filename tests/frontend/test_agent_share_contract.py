@@ -169,10 +169,19 @@ def test_admin_has_all_agents_tab():
     tabs_block = src[src.index("const workspaceTabs") : src.index("const workspaceTabs") + 700]
     assert "isAdminViewer.value" in tabs_block
 
-    # 归属过滤必须真的按 created_by 收窄
-    filter_block = src[src.index("const filteredAgents"): src.index("const filteredAgents") + 700]
+    # 归属过滤必须真的按 created_by 收窄。
+    # 加了业务分组页签后，原来的 filteredAgents 拆成两段：
+    #   agentsMatchingFilters = 视图 + 关键词 + 全部筛选（不含分组）
+    #   filteredAgents        = 上一段结果再套分组，最后排序
+    # 归属过滤属于前者——顺带成为「页签数字 = 点进去的条数」的口径来源。
+    filter_block = src[
+        src.index("const agentsMatchingFilters") : src.index("const agentsMatchingFilters") + 900
+    ]
     assert "workspaceTab.value === 'mine'" in filter_block
     assert "a.created_by === me" in filter_block
+    # 分组过滤只能在过滤之后的第二段里
+    group_block = src[src.index("const filteredAgents") : src.index("const filteredAgents") + 700]
+    assert "agentGroupFilter.value" in group_block
 
 
 def test_admin_default_tab_does_not_shrink_scope():
@@ -257,9 +266,15 @@ def test_view_switch_tabs_are_outside_list_only_block():
     assert "搜索名称或标识符" not in inside
     assert "搜索智能体或分享人" not in inside
 
-    # 反过来：批量 / 网格列表切换 / 筛选 只服务于智能体列表
-    assert "filterPanelOpen" in inside
+    # 反过来：批量 / 网格列表切换 只服务于智能体列表
     assert "toggleBatchMode" in inside
+    # 「筛选」跟在批量之后（同在列表专属块内），但不在页头第一行；
+    # 它仍必须只在列表视图出现，否则分享视图会多出一个无意义的入口
+    filter_start = src.index("<!-- 高级筛选：状态/类型/引擎/就绪度/来源")
+    # 从注释结束（-->）之后再找标签，否则会命中注释自己的 ">"
+    after_comment = src.index("-->", filter_start) + 3
+    filter_tag = src[after_comment : src.index(">", src.index("<div", after_comment)) + 1]
+    assert 'workspaceTab === \'mine\' || workspaceTab === \'all\'' in filter_tag
 
 
 def test_share_panels_receive_search_keyword():
@@ -278,3 +293,167 @@ def test_share_panels_receive_search_keyword():
         panel = _read(panel_path)
         assert "keyword" in panel, f"{panel_path.name} 未声明 keyword 属性"
         assert "visible" in panel, f"{panel_path.name} 未按关键词过滤"
+
+
+def test_workspace_tabs_scroll_instead_of_wrapping_on_mobile():
+    """视图页签条在移动端必须一行横向滚动，不能换行。
+
+    换行会把「专家团」挤到第二行，而这些是并列的视图，分两行读起来像两组
+    不同的东西。子项同时要 shrink-0 + whitespace-nowrap，否则 flex 会先压窄
+    文字再折行，滚动就失效了。
+    """
+    page = Path("frontend/src/views/AgentManagement.vue").read_text()
+    start = page.index('ref="workspaceTabsRef"')
+    block = page[start : page.index('@click="switchWorkspaceTab', start)]
+
+    assert "overflow-x-auto" in block
+    assert "flex-wrap" not in block
+    assert "shrink-0 whitespace-nowrap" in block
+    # 滚动条隐藏，但保留滑动与键盘可达（不设 overflow-hidden）
+    assert "[scrollbar-width:none]" in block
+    assert "overflow-hidden" not in block
+
+
+def test_active_workspace_tab_is_scrolled_into_view():
+    """滚到看不见的页签被选中时，要自动滚进来——否则用户看不出选中了哪个。"""
+    page = Path("frontend/src/views/AgentManagement.vue").read_text()
+    assert "const ensureActiveTabVisible" in page
+    assert 'inline: "nearest", block: "nearest"' in page
+    # 两条进入路径都要覆盖：点击切换、站内信/URL 直达
+    assert page.count("ensureActiveTabVisible()") >= 2
+
+
+def test_group_toggle_stays_outside_the_scrolling_tab_strip():
+    """「隐藏分组」不能被塞进页签的滚动容器。
+
+    塞进去的后果是双重的：它会被滚到屏幕外，而且 `ml-auto` 在滚动容器里
+    失效（没有剩余空间可分配），窄屏下会被压成一个字一行。
+    """
+    page = Path("frontend/src/views/AgentManagement.vue").read_text()
+    strip = page.index('ref="workspaceTabsRef"')
+    strip_close = page.index("</div>", page.index("@click=\"switchWorkspaceTab", strip))
+    toggle = page.index("agentGroupTabsVisible ? '隐藏分组'", strip)
+    assert toggle > strip_close, "「隐藏分组」仍在滚动容器内"
+    # 它**自己的开标签**要有 shrink-0 + nowrap，否则被 flex 压窄后逐字换行。
+    # 只看开标签：按钮内部 svg 也带 shrink-0，扫整段会让断言恒真。
+    toggle_start = page.rindex("<button", strip_close, toggle)
+    toggle_tag = page[toggle_start : page.index(">", toggle_start)]
+    assert "shrink-0" in toggle_tag
+    assert "whitespace-nowrap" in toggle_tag
+
+
+def test_header_stacks_vertically_on_mobile():
+    """窄屏下标题与操作按钮必须纵向堆叠。
+
+    并排时 375px 宽度里按钮区（发布审核 + 新建智能体 + 下拉）抢走大半，
+    标题被压断、状态摘要被挤成一个字一行。
+    """
+    page = Path("frontend/src/views/AgentManagement.vue").read_text()
+    anchor = page.index("flex flex-col gap-3 sm:flex-row sm:items-start")
+    head = page[anchor : anchor + 200]
+    assert "justify-between" in head
+
+
+def test_tab_strip_shows_clickable_scroll_arrows():
+    """藏了滚动条就必须给可点的翻页箭头。
+
+    否则用户只看到「分享给我」被切一半，第一反应是页面坏了，而不是「可以右滑」。
+    箭头按滚动位置出现，滑到头就消失，不长期遮挡页签。
+    """
+    page = Path("frontend/src/views/AgentManagement.vue").read_text()
+
+    assert 'aria-label="向右查看更多视图"' in page
+    assert 'aria-label="向左查看更多视图"' in page
+    assert 'v-if="canScrollRight"' in page
+    assert 'v-if="canScrollLeft"' in page
+
+    # 位置判断要跟着滚动实时更新，否则滑完箭头还在
+    assert '@scroll.passive="updateScrollHints"' in page
+    # 把比较运算钉住：只断言状态名存在，改坏边界也照样绿
+    assert "el.scrollLeft < max - 4" in page
+    assert "el.scrollLeft > 4" in page
+    # 首次挂载就要算一次，否则箭头要等第一次滚动才出现
+    assert "nextTick(updateScrollHints)" in page
+
+
+def test_narrow_row_holds_search_review_and_create():
+    """窄屏第二行就是主操作条：搜索框 + 审核 + 新建，同一行。
+
+    搜索框不再折叠进页头的放大镜——收起后这一行只剩两颗按钮，
+    等于把「搜一下」这个最常用的动作藏起来。
+    「筛选」在窄屏不出现：它有 9 项条件，是低频动作，这一行要留给三颗高频入口；
+    原来筛选占的那个位置改由「发布审核」顶上（文案收成「审核」）。
+    """
+    page = Path("frontend/src/views/AgentManagement.vue").read_text()
+
+    assert "mobileSearchOpen" not in page, "搜索框不再有折叠态"
+    assert "toggleMobileSearch" not in page
+
+    # 搜索框常显：不能在窄屏挂隐藏
+    anchor = page.index('id="agent-search-row"')
+    tag = page[page.rindex("<div", 0, anchor) : page.index(">", anchor)]
+    assert "hidden" not in tag, "窄屏也要直接显示搜索框"
+    assert "flex-1" in tag, "搜索框吃掉剩余宽度，审核与新建才排得进一行"
+
+    # 筛选只在桌面渲染
+    filter_note = page.index("<!-- 窄屏不放筛选")
+    filter_tag_at = page.index("<div", filter_note)
+    filter_tag = page[filter_tag_at : page.index(">", filter_tag_at)]
+    assert "!isMobile" in filter_tag, "窄屏不显示筛选"
+
+    # 顺序：搜索 → 批量/视图（桌面）→ 筛选（桌面）→ 审核（窄屏）→ 新建（窄屏）
+    row_start = page.index("<!-- 第 2 行：搜索独占一栏")
+    row = page[row_start : page.index("<!-- 智能体 5 步全流程指引", row_start)]
+    positions = [
+        row.index('id="agent-search-row"'),
+        row.index("toggleBatchMode"),
+        row.index('aria-label="筛选"'),
+        row.index('v-if="canReviewSystem && isMobile"'),
+        row.index('<AgentCreateButton\n        v-if="isMobile"'),
+    ]
+    assert positions == sorted(positions), "顺序应为 搜索 → 批量/视图 → 筛选 → 审核 → 新建"
+
+    # 窄屏那颗审核只留图标：多两个字就把搜索框压窄一截
+    review_at = row.index('v-if="canReviewSystem && isMobile"')
+    review_chunk = row[review_at : row.index("</button>", review_at)]
+    assert 'aria-label="审核"' in review_chunk, "纯图标按钮必须有可读名称"
+    assert "<svg" in review_chunk, "图标要在"
+    # 去掉无障碍名称与 title 后，按钮里不该再有可见的「审核」文本
+    visible = review_chunk.replace('aria-label="审核"', "").replace(
+        "查看待审核的「发布为系统级」申请", ""
+    )
+    assert "审核" not in visible, "窄屏不显示文字，只留图标"
+    # 待审数量用角标，不占按钮宽度
+    assert "absolute -right-1 -top-1" in review_chunk
+
+
+def test_desktop_header_keeps_create_but_narrow_hides_it():
+    """页头动作区（桌面）：显示指引 / 发布审核 / 新建。
+
+    窄屏只留「发布审核」这类低频入口，新建让位到搜索行末尾（见上一条用例）。
+    动作区仍然不能成为滚动容器——新建下拉是 absolute 定位，会被裁掉。
+    """
+    page = Path("frontend/src/views/AgentManagement.vue").read_text()
+
+    bar_start = page.index("flex flex-wrap items-center gap-1.5")
+    bar = page[bar_start : page.index("<!-- 搜索、筛选与两个横幅", bar_start)]
+    bar_tag = bar.split(">")[0]
+    assert "overflow-x-auto" not in bar_tag, "动作区不能成为滚动容器（会裁掉 absolute 面板）"
+    assert "flex-wrap" in bar_tag, "放不下时靠换行兜底"
+    assert "sm:flex-nowrap" in bar_tag, "桌面端不换行"
+
+    positions = [
+        bar.index("显示指引"),
+        bar.index("发布审核"),
+        bar.index('<AgentCreateButton\n          v-if="!isMobile"'),
+    ]
+    assert positions == sorted(positions), "顺序应为 显示指引 → 发布审核 → 新建"
+
+    # 搜索与筛选都已经搬到第二行，不该再出现在页头
+    assert 'aria-controls="agent-search-row"' not in bar
+    assert 'aria-label="筛选"' not in bar
+
+    # 短文案只作用于移动端，桌面保留全称（新建那半句已随组件搬走）
+    create_btn = Path("frontend/src/components/agent/AgentCreateButton.vue").read_text()
+    assert '新建<span class="hidden sm:inline">智能体</span>' in create_btn
+    assert '<span class="hidden sm:inline">筛选</span>' in page

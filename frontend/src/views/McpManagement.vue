@@ -5,10 +5,12 @@ import axios from '../utils/axios'
 import McpServerRegistry from '../components/system/McpServerRegistry.vue'
 import McpFlowGuideBanner from '../components/mcp/McpFlowGuideBanner.vue'
 import McpAuditLogTab from '../components/mcp/McpAuditLogTab.vue'
+import McpCallSummary from '../components/mcp/McpCallSummary.vue'
 import McpPersonalMenu from '../components/mcp/McpPersonalMenu.vue'
 import McpShareDialog from '../components/mcp/McpShareDialog.vue'
 import ReceivedMcpSharesPanel from '../components/mcp/ReceivedMcpSharesPanel.vue'
 import SentMcpSharesPanel from '../components/mcp/SentMcpSharesPanel.vue'
+import PlatformMcpCredentialPanel from '../components/mcp/PlatformMcpCredentialPanel.vue'
 import { useUser } from '../composables/useUser'
 import { useToast } from '../composables/useToast'
 import type { McpPersonalMenuKey } from '../utils/mcpShare'
@@ -30,10 +32,35 @@ const { showToast } = useToast()
 
 // 「我的 MCP」里的二级菜单：我的 MCP / 收到的分享 / 我的分享
 const normalizePersonalMenu = (value?: string): McpPersonalMenuKey =>
-  value === 'received' || value === 'sent' ? value : 'mine'
+  value === 'received' || value === 'sent' || value === 'platform' ? value : 'mine'
 const resolvePersonalMenu = (): McpPersonalMenuKey =>
   normalizePersonalMenu(String(route.query.mcp_tab || '') || props.initialPersonalMenu)
 const mcpMenu = ref<McpPersonalMenuKey>(resolvePersonalMenu())
+
+/**
+ * 「个人 MCP」左侧栏是否收起。
+ *
+ * 与「我的技能」一致：默认收起成 64px 图标条，把空间让给右侧的调用概览 + 服务列表。
+ * 存过 '0'（展开）的老用户保持展开，不强行改掉已有选择。
+ */
+const MCP_PERSONAL_MENU_COLLAPSED_KEY = 'mcp.personalMenu.collapsed'
+const readPersonalMenuCollapsed = (): boolean => {
+  try {
+    const raw = localStorage.getItem(MCP_PERSONAL_MENU_COLLAPSED_KEY)
+    // 读不到（首次进入 / 隐私模式 / 禁用 storage）时按默认收起处理
+    return raw === null ? true : raw === '1'
+  } catch {
+    return true
+  }
+}
+const personalMenuCollapsed = ref(readPersonalMenuCollapsed())
+watch(personalMenuCollapsed, (collapsed) => {
+  try {
+    localStorage.setItem(MCP_PERSONAL_MENU_COLLAPSED_KEY, collapsed ? '1' : '0')
+  } catch {
+    /* 存不了就算了，不影响当前会话 */
+  }
+})
 const shareDialogServer = ref<{ id: string; server_name: string; sse_url: string } | null>(null)
 const mcpShareCounts = ref({ received_pending: 0, sent_pending: 0, sent_total: 0 })
 // 平台 MCP 列表/工具/日志已收紧为 admin；非管理员直接落到「我的 MCP」，不显示会 403 的平台页签。
@@ -206,7 +233,9 @@ const handleBannerAction = (action: 'add' | 'marketplace') => {
           个人私有
         </span>
       </div>
-      <p class="mcp-page-desc text-xs leading-relaxed text-gray-500 dark:text-gray-400 sm:text-sm">
+      <!-- 窄屏隐藏：这行有 40 多个字，一张卡片的位置只换来一句介绍，
+           而且它撑高页头后会把下面的二级 tab 挤出可视区 -->
+      <p class="mcp-page-desc hidden text-xs leading-relaxed text-gray-500 dark:text-gray-400 sm:block sm:text-sm">
         {{
           personalOnly
             ? '登记并管理仅对自己可见的 MCP，可在对话中挂载使用'
@@ -285,7 +314,7 @@ const handleBannerAction = (action: 'add' | 'marketplace') => {
     <McpPersonalMenu
       v-if="!personalOnly && !isAdmin && activeScope === 'personal'"
       variant="tabs"
-      class="mb-2"
+      class="mb-2 flex-shrink-0"
       :active="mcpMenu"
       :counts="mcpShareCounts"
       @select="mcpMenu = $event"
@@ -305,12 +334,15 @@ const handleBannerAction = (action: 'add' | 'marketplace') => {
           variant="aside"
           :active="mcpMenu"
           :counts="mcpShareCounts"
+          :collapsed="personalMenuCollapsed"
           @select="mcpMenu = $event"
+          @toggle-collapsed="personalMenuCollapsed = !personalMenuCollapsed"
         />
         <div class="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
           <McpPersonalMenu
             v-if="isAdmin"
             variant="chips"
+            class="shrink-0"
             :active="mcpMenu"
             :counts="mcpShareCounts"
             @select="mcpMenu = $event"
@@ -336,6 +368,8 @@ const handleBannerAction = (action: 'add' | 'marketplace') => {
             @updated="handleShareUpdated"
             @open-mine="mcpMenu = 'mine'"
           />
+          <!-- 平台服务：普通用户在别处看不到它们，这里给他们绑自己凭据的地方 -->
+          <PlatformMcpCredentialPanel v-else-if="mcpMenu === 'platform'" />
         </div>
       </div>
 

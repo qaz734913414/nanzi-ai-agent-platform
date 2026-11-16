@@ -23,12 +23,24 @@ class SystemParamConfigError(ValueError):
     """系统级参数配置不合法。"""
 
 
+#: ``literal`` 平台写死；``credential`` 绑一条固定凭据；``rule`` 按定位规则动态选。
+#: 后两者对模型都不可见（值由平台注入），区别只在「谁来选这条凭据」。
+PARAM_SOURCES = frozenset({"literal", "credential", "rule"})
+
+
 @dataclass(frozen=True)
 class SystemParamSpec:
     name: str
     type: str
     value: str
     description: str = ""
+    source: str = "literal"
+    # ``literal`` = 平台写死一个值；``credential`` = 值来自凭据中心，按当前用户解析。
+    #
+    # 参数为什么不能像 header 那样「直接在配置行上选凭据」：header 是配置里的固定行，
+    # 而参数值由模型在运行时填，平台分不清「模型没填」和「模型编了一个值」。所以
+    # 必须先在这里声明「这个参数来自凭据」，它才会从模型可见的 properties 里消失，
+    # 改由凭据中心强制写入。
 
 
 def _schema_mapping(parameter_schema: Any) -> dict[str, Any]:
@@ -82,14 +94,25 @@ def parse_system_params(parameter_schema: Any) -> list[SystemParamSpec]:
         type_name = str(entry.get("type") or "string").strip()
         if type_name not in SYSTEM_PARAM_TYPES:
             raise SystemParamConfigError(f"系统级参数 {name} 的类型不支持：{type_name}")
+        source = str(entry.get("source") or "literal").strip().lower()
+        if source not in PARAM_SOURCES:
+            raise SystemParamConfigError(f"系统级参数 {name} 的来源不支持：{source}")
         value = entry.get("value")
-        if not isinstance(value, str) or not value.strip():
+        if source != "literal":
+            # 凭据来源（固定凭据 / 按规则）的值运行时才知道，配置里不存任何东西
+            if type_name != "string":
+                raise SystemParamConfigError(
+                    f"系统级参数 {name} 由凭据提供，类型只能是 string"
+                )
+            value = ""
+        elif not isinstance(value, str) or not value.strip():
             raise SystemParamConfigError(f"系统级参数 {name} 缺少固定值")
         specs.append(SystemParamSpec(
             name=name,
             type=type_name,
             value=value,
             description=str(entry.get("description") or ""),
+            source=source,
         ))
         seen.add(name)
     return specs
@@ -137,6 +160,19 @@ def apply_system_params(
     specs = validate_system_params(parameter_schema)
     prepared = dict(params)
     for spec in specs:
+        if spec.source != "literal":
+            # 由注入层按绑定/规则补；这里不能塞空串，否则「没绑定」会变成一个空值请求。
+            # 必须用 != "literal" 而不是 == "credential"：漏掉 rule 的话，规则未命中的
+            # 参数会被填成空串发出去，`unresolved_params` 也检测不到，用户只会收到远端的 401。
+            prepared.pop(spec.name, None)
+            continue
         raw = replace_user_placeholders(spec.value, variables, expected_type=spec.type)
         prepared[spec.name] = _coerce_literal(raw, spec.type, spec.name)
     return prepared
+
+
+def credential_param_names(parameter_schema: Any) -> list[str]:
+    """声明为「来自凭据」的参数名，按声明顺序。"""
+    # 「不是 literal」都算：固定凭据和按规则都从模型可见 schema 里移除，
+    # 值由平台注入。只认 credential 的话，选了「按规则匹配」的参数模型照样能编一个值。
+    return [spec.name for spec in validate_system_params(parameter_schema) if spec.source != "literal"]

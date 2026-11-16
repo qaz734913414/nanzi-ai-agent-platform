@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import uuid
@@ -34,6 +35,16 @@ ECHO_SERVER_NAME = "NanZi Echo 测试 MCP"
 ECHO_TOOL_LOCAL_NAME = "echo"
 ECHO_TOOL_NAME = f"{ECHO_SERVER_NAME}:{ECHO_TOOL_LOCAL_NAME}"
 ECHO_TOOL_DESCRIPTION = "验证 MCP 请求是否收到，以及 NanZi 用户身份断言是否验签成功。"
+ECHO_MAIL_TOOL_LOCAL_NAME = "send_mail"
+ECHO_MAIL_TOOL_NAME = f"{ECHO_SERVER_NAME}:{ECHO_MAIL_TOOL_LOCAL_NAME}"
+ECHO_MAIL_TOOL_DESCRIPTION = (
+    "模拟给某个用户发一封邮件。参数名与「邮箱 SMTP 发送」凭据模板的字段一一对齐"
+    "（host / port / security / username / password / from_name），一条结构化凭据就能"
+    "把这几个参数一次铺满；``mailkey`` 则留给单值凭据验收。把它们标成「来自凭据」后"
+    "模型看不到，由平台按 ``to`` 匹配后注入。返回每个参数的到达情况：非敏感的给明文"
+    "（一眼看出映射对不对），敏感的只给掩码与指纹（验证「不同 to 取到了不同的值」，"
+    "但看不到明文）。"
+)
 # 个人 Echo 与平台 Echo 共用同一个 FastMCP 端点，靠路径里的 server_id 区分实例。
 ECHO_SERVER_ID_HEADER = "X-Nanzi-Echo-Server"
 ECHO_PATH_PREFIX = "/mcp/echo/"
@@ -313,13 +324,53 @@ async def echo_mcp_lifespan():
 
 
 @echo_mcp.tool(name="echo", description=ECHO_TOOL_DESCRIPTION)
-async def echo(ctx: Context) -> dict[str, Any]:
-    """返回 Echo 请求的安全认证诊断。"""
+async def echo(
+    ctx: Context,
+    api_key: str | None = None,
+    tenant_token: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """返回 Echo 请求的安全认证诊断。
+
+    参数专供**凭据注入验收**：在 MCP 管理页把 ``api_key`` / ``tenant_token``
+    标成「来自凭据」后，模型侧看不到它们，由平台在 ``tools/call`` 里补上。
+    这里回显的是掩码值和长度——能看到「注入了、多长」，但看不到明文。
+    """
     request = getattr(getattr(ctx, "request_context", None), "request", None)
     headers = getattr(request, "headers", {}) if request is not None else {}
     server = await _load_echo_server(echo_server_id_from_headers(headers))
     private_key = load_mcp_private_key(server)
-    return build_echo_diagnostics(headers, server, private_key)
+    result = build_echo_diagnostics(headers, server, private_key)
+    result["received_arguments"] = _describe_arguments(
+        api_key=api_key, tenant_token=tenant_token, note=note
+    )
+    return result
+
+
+def _describe_arguments(
+    *, api_key: str | None, tenant_token: str | None, note: str | None
+) -> dict[str, Any]:
+    """把收到的入参做成可核对的描述，**不含明文**。
+
+    ``note`` 是普通参数（模型填），``api_key`` / ``tenant_token`` 是凭据参数
+    （平台注入）。放在一起就是为了对比：前者随模型措辞变化，后者每次都是
+    你在凭据中心绑的那条。
+    """
+
+    def describe(value: str | None) -> dict[str, Any]:
+        if not value:
+            return {"received": False}
+        return {
+            "received": True,
+            "length": len(value),
+            "masked": _mask_secret(value),
+        }
+
+    return {
+        "api_key": describe(api_key),
+        "tenant_token": describe(tenant_token),
+        "note": note or None,
+    }
 
 
 ECHO_SLOW_TOOL_NAME = "echo_slow"
@@ -329,6 +380,110 @@ ECHO_SLOW_TOOL_DESCRIPTION = (
 )
 #: 每步默认间隔（毫秒）。测试里传 0 可以直接跑完，不真正等待。
 ECHO_SLOW_DEFAULT_INTERVAL_MS = 800
+
+
+def _receipt(name: str, value: Any, *, sensitive: bool) -> dict[str, Any]:
+    """一个注入参数的「回执」：到了没有、是什么。
+
+    非敏感参数（host / port / username …）直接回显明文——验收时要能一眼看出
+    「host 映射到了 host」，只给指纹反而要拿凭据原文去对。
+    敏感参数（password / mailkey）只给掩码与指纹：明文回显等于把凭据
+    泄露进对话与 trace，而指纹足够回答「注入的是 A 那条还是 B 那条」。
+    """
+    text = "" if value is None else str(value)
+    receipt: dict[str, Any] = {"present": bool(text)}
+    if not text:
+        return receipt
+    if sensitive:
+        receipt["masked"] = _mask_secret(text)
+        receipt["fingerprint"] = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+        receipt["length"] = len(text)
+    else:
+        receipt["value"] = value
+    return receipt
+
+
+@echo_mcp.tool(name=ECHO_MAIL_TOOL_LOCAL_NAME, description=ECHO_MAIL_TOOL_DESCRIPTION)
+async def send_mail(
+    ctx: Context,
+    to: str,
+    subject: str = "",
+    host: str | None = None,
+    port: int | None = None,
+    security: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    from_name: str | None = None,
+    mailkey: str | None = None,
+) -> dict[str, Any]:
+    """模拟发一封邮件，并把每个 SMTP 参数回显出来。
+
+    参数名**刻意与内置「邮箱 SMTP 发送」模板的字段一一对齐**（``host`` / ``port`` /
+    ``security`` / ``username`` / ``password`` / ``from_name``）：凭据多字段映射面板
+    有个「按名字自动匹配」，同名的话一条 SMTP 凭据能一键铺满这些参数，不用逐个选。
+
+    Args:
+        to: 收件人。凭据规则通常用它当键（``arg:to``）。
+        subject: 邮件主题，普通参数，用来确认「非凭据参数照常由模型填」。
+        host: SMTP 服务器。凭据参数。
+        port: 端口。**声明成 int 而不是 str**：凭据里的 ``port: 465`` 必须原样
+            以数字注入，写成 ``"465"`` 会被真实服务判类型不符。这里能顺带验收
+            类型保留。
+        security: 加密方式（ssl / starttls / none）。凭据参数。
+        username: SMTP 登录账号。注意与 ``to``（收件人）不是一回事。
+        password: 密码 / 授权码。敏感，只回显掩码与指纹。
+        from_name: 发件人显示名。凭据参数。
+        mailkey: 单值凭据的注入验收位。模型侧看不到，由平台注入。
+    """
+    return {
+        "ok": True,
+        "to": to,
+        "subject": subject,
+        "smtp": {
+            "host": _receipt("host", host, sensitive=False),
+            "port": _receipt("port", port, sensitive=False),
+            "security": _receipt("security", security, sensitive=False),
+            "username": _receipt("username", username, sensitive=False),
+            "password": _receipt("password", password, sensitive=True),
+            "from_name": _receipt("from_name", from_name, sensitive=False),
+        },
+        # 单值凭据走的也是这条：整段就是一个值，没有字段可拆
+        "mailkey": _receipt("mailkey", mailkey, sensitive=True),
+        "message": f"已模拟给 {to} 发送邮件",
+    }
+
+
+def send_mail_tool_schema() -> str:
+    """返回 ``send_mail`` 的稳定 JSON Schema，供 MCP 管理页缓存。"""
+    return json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                # 名字与「邮箱 SMTP 发送」模板字段对齐：映射面板的「按名字自动匹配」
+                # 靠的就是同名，改名前先想清楚会不会让一键铺满失效。
+                "to": {"type": "string", "description": "收件人。凭据规则通常用它当键。"},
+                "subject": {"type": "string", "description": "邮件主题"},
+                "host": {"type": "string", "description": "SMTP 服务器。凭据参数。"},
+                "port": {"type": "integer", "description": "端口。凭据参数，按数字注入。"},
+                "security": {
+                    "type": "string",
+                    "description": "加密方式：ssl / starttls / none。凭据参数。",
+                },
+                "username": {"type": "string", "description": "SMTP 登录账号。凭据参数。"},
+                "password": {
+                    "type": "string",
+                    "description": "密码 / 授权码。凭据参数，敏感，只回显指纹。",
+                },
+                "from_name": {"type": "string", "description": "发件人显示名。凭据参数。"},
+                "mailkey": {
+                    "type": "string",
+                    "description": "单值凭据的注入验收位：标成「来自凭据」后由平台注入。",
+                },
+            },
+            "required": ["to"],
+        },
+        ensure_ascii=False,
+    )
 
 
 @echo_mcp.tool(name=ECHO_SLOW_TOOL_NAME, description=ECHO_SLOW_TOOL_DESCRIPTION)
@@ -403,11 +558,28 @@ def echo_slow_tool_schema() -> str:
 
 
 def echo_tool_schema() -> str:
-    """返回内置 echo 工具的稳定 JSON Schema，供 MCP 管理页缓存。"""
+    """返回内置 echo 工具的稳定 JSON Schema，供 MCP 管理页缓存。
+
+    ``api_key`` / ``tenant_token`` 是给凭据注入验收用的：在管理页把它们标成
+    「来自凭据」后，模型侧就看不到这两个参数了。``note`` 是普通参数，留作对比。
+    """
     return json.dumps(
         {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "api_key": {
+                    "type": "string",
+                    "description": "测试用 API Key。标成「来自凭据」后由平台注入。",
+                },
+                "tenant_token": {
+                    "type": "string",
+                    "description": "测试用租户令牌。标成「来自凭据」后由平台注入。",
+                },
+                "note": {
+                    "type": "string",
+                    "description": "普通参数，模型自己填；用来对比凭据参数与模型参数的区别。",
+                },
+            },
             "additionalProperties": False,
         },
         ensure_ascii=False,

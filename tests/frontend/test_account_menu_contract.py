@@ -82,11 +82,13 @@ def test_menu_items_point_at_existing_personal_tabs(menu: str) -> None:
 
 
 def test_mode_switch_is_a_first_class_action(menu: str) -> None:
-    """模式切换放在第一屏，用两枚胶囊表达当前态。"""
+    """模式切换放在第一屏，用两枚胶囊表达当前态；没权限的那枚置灰而不是消失。"""
     assert 'role="menuitemradio"' in menu
     assert ':aria-checked="mode === option.value"' in menu
     assert "emit('switch-mode', option.value)" in menu
-    assert "一步切换" in menu
+    # 两枚胶囊都渲染出来，被角色禁用的那枚是真 disabled
+    assert 'v-for="option in modeOptions"' in menu
+    assert ':disabled="!isModeAllowed(option.value)"' in menu
 
 
 def test_mode_switch_lands_on_mode_home(dashboard: str) -> None:
@@ -102,12 +104,29 @@ def test_theme_can_be_switched_inline(menu: str) -> None:
     assert "themeOptions" in menu
 
 
-def test_about_shows_version_and_reserves_changelog(menu: str, dashboard: str) -> None:
-    """关于先展示版本；更新日志先留占位，后续再补数据源。"""
+def test_about_shows_version_and_links_changelog(menu: str, dashboard: str) -> None:
+    """关于先展示版本；更新日志直链 GitHub Releases，dev 环境下入口也不消失。"""
     assert "{{ version }}" in menu
-    assert "更新日志：后续版本提供。" in menu
     assert ':version="displayVersion"' in dashboard
     assert ':repo-url="repoUrl"' in dashboard
+    # 有仓库地址就给链接：能定位到 tag 就直达，定位不到就落到列表页
+    assert ':href="changelogUrl"' in menu
+    assert "releases/tag/${changelogTag.value}" in menu
+    assert 'rel="noopener noreferrer"' in menu
+
+
+def test_changelog_tag_uses_three_segments(menu: str) -> None:
+    """1.0.22.0 的第 4 段是构建号，Release tag 只到三段。
+
+    取前两段会拼出 /releases/tag/1.0，是必然 404 的地址。dev 与残缺版本号没有
+    对应 tag，回退到 Releases 列表页——入口不该因为「不知道是哪个版本」就消失。
+    """
+    assert "parts.length > 3 ? parts.slice(0, 3) : parts" in menu
+    assert "/^dev/i.test(raw)" in menu
+    assert '"查看全部版本"' in menu
+    assert "`${base}/releases`" in menu
+    # 用 repoUrl 拼而不是硬编码 GitHub 前缀，白标部署换仓库地址时才能跟着走
+    assert 'props.repoUrl.replace(/\\/+$/, "")' in menu
 
 
 def test_menu_closes_on_outside_click_and_escape(menu: str) -> None:

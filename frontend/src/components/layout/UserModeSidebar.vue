@@ -49,14 +49,24 @@
     </div>
 
     <!--
-      菜单区固定、任务区独立滚动。
+      菜单区与会话列表共享剩下的高度（仍是两个独立滚动区）。
 
       之前两者共用一个滚动容器：任务多或窗口矮（分屏 / 13 寸）时菜单会被一起滚走，
-      想换入口得先滚回顶部。菜单内容本身也会随「专家」「更多」展开变长，所以给它
-      自己的 52vh 上限与滚动条。
+      想换入口得先滚回顶部。于是给菜单区加了 52vh 死上限——但「更多」展开后子项比
+      52vh 还高，后面几项落到滚动条外，滚动条之外看着就像菜单只有这么多（作者本人
+      漏看过「系统概览」「系统设置」）。
+
+      现在改成：菜单区按内容自然高度铺开，会话列表 flex-1 让位（先被压缩，压到
+      min-h-[9rem] 就停），空间不够时菜单区才开始自己滚动 + 底部渐隐提示。
+      展开「更多」→ 整组可见、会话列表整体下移；收起 → 会话列表空间自动还回来。
+      全靠 flex 分配，不需要测量像素，窗口缩放 / 分屏也不会算错。
     -->
-    <div class="flex-shrink-0 px-2.5">
-      <div class="max-h-[52vh] overflow-y-auto custom-scrollbar">
+    <div class="relative flex min-h-0 px-2.5">
+      <div
+        ref="menuScrollRef"
+        class="min-h-0 w-full overflow-y-auto custom-scrollbar"
+        @scroll.passive="updateMenuOverflow"
+      >
         <nav class="flex flex-col gap-0.5" aria-label="用户模式导航">
           <template v-for="item in menu" :key="item.key">
             <!-- 一级项（非分组） -->
@@ -110,7 +120,11 @@
                 </svg>
               </button>
 
-              <div v-show="!collapsed && expanded[item.key] !== false" class="flex flex-col gap-0.5 pb-1 pl-[30px]">
+              <div
+                v-show="!collapsed && expanded[item.key] !== false"
+                :data-group-body="item.key"
+                class="flex flex-col gap-0.5 pb-1 pl-[30px]"
+              >
                 <button
                   v-for="child in item.children"
                   :key="child.key"
@@ -127,30 +141,31 @@
                   />
                   <span class="truncate">{{ child.label }}</span>
                 </button>
-                <!-- 「更多」末尾的快捷切换：个人中心是正式入口，这里只是少点一次 -->
-                <button
-                  v-if="item.key === 'more'"
-                  type="button"
-                  class="mt-1 flex h-[34px] w-full items-center gap-2 rounded-[9px] px-2 text-left text-[13px] text-primary transition-colors hover:bg-primary/5"
-                  @click="emit('switch-mode', 'pro')"
-                >
-                  <svg class="h-[15px] w-[15px] flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M8 7h8l-3-3M16 17H8l3 3" />
-                  </svg>
-                  <span class="truncate">切换到专业模式</span>
-                </button>
               </div>
             </template>
           </template>
         </nav>
       </div>
+      <!--
+        展开「更多」后子项会超出 52vh，滚动条之外的那几项看起来就像不存在——
+        加完「系统设置」后自己都找了两遍才发现在下面。压一层渐隐告诉用户
+        「下面还有」，纯视觉、不拦点击。
+      -->
+      <div
+        v-show="menuOverflowBelow"
+        class="pointer-events-none absolute inset-x-2.5 bottom-0 h-8 bg-gradient-to-t"
+        :class="lightTheme ? 'from-white' : 'from-sidebar'"
+        aria-hidden="true"
+      />
     </div>
 
-    <!-- 会话列表（历史会话）：收起侧栏时空间不够，整块隐藏（v-show 保住滚动位置与搜索态） -->
+    <!-- 会话列表（历史会话）：收起侧栏时空间不够，整块隐藏（v-show 保住滚动位置与搜索态）。
+         min-h-[9rem]：菜单展开时要给会话列表留一条活路（标题行 + 两三条会话），
+         不能再往下压，剩下的空间交给菜单区自己滚动。 -->
     <div
       v-show="!collapsed"
       ref="scrollRef"
-      class="min-h-0 flex-1 overflow-y-auto px-2.5 pb-3 custom-scrollbar"
+      class="min-h-[9rem] flex-1 overflow-y-auto px-2.5 pb-3 custom-scrollbar"
       @scroll.passive="onScroll"
     >
       <!-- 标题行：sticky，任务多的时候搜索结果也还能关掉 -->
@@ -177,21 +192,87 @@
             @keydown.esc="closeTaskSearch"
           />
         </label>
+        <div class="flex flex-shrink-0 items-center gap-1">
+          <!-- 手动刷新：列表只在切页 / 流结束 / 收到会话激活时自动拉一次，
+               用户想「看看有没有新会话」时得能自己触发，不能逼他刷新整页 -->
+          <button
+            type="button"
+            class="flex h-5 w-5 items-center justify-center rounded text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-white/[0.06]"
+            :title="refreshingTasks ? '刷新中…' : '刷新会话列表'"
+            aria-label="刷新会话列表"
+            :disabled="refreshingTasks"
+            @click="refreshTasks"
+          >
+            <svg
+              class="h-3.5 w-3.5"
+              :class="refreshingTasks ? 'animate-spin' : ''"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.9"
+            >
+              <path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1" stroke-linecap="round" />
+              <path d="M20.5 4.5V11h-6.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+          <!-- 筛选：条件与聊天页历史面板同一套，浮层贴按钮右下方展开 -->
+          <span ref="filterButtonRef" class="relative flex-shrink-0">
+            <button
+              type="button"
+              class="flex h-5 w-5 items-center justify-center rounded transition-colors hover:bg-gray-100 dark:hover:bg-white/[0.06]"
+              :class="filterPanelOpen || activeFilterCount ? 'bg-primary/10 text-primary' : 'text-gray-400 hover:text-gray-700'"
+              :title="filterPanelOpen ? '收起筛选' : '筛选会话'"
+              aria-label="筛选会话"
+              :aria-expanded="filterPanelOpen"
+              @click.stop="toggleFilterPanel"
+            >
+              <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                <path d="M3 5h18M6.5 12h11M10 19h4" stroke-linecap="round" />
+              </svg>
+            </button>
+            <span
+              v-if="activeFilterCount"
+              class="pointer-events-none absolute -right-1 -top-1 flex h-3 min-w-3 items-center justify-center rounded-full bg-primary px-0.5 text-[9px] font-bold text-white"
+            >{{ activeFilterCount }}</span>
+          </span>
+          <button
+            type="button"
+            class="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-white/[0.06]"
+            :title="taskSearchOpen ? '关闭搜索' : '搜索会话'"
+            :aria-label="taskSearchOpen ? '关闭搜索' : '搜索会话'"
+            @click="toggleTaskSearch"
+          >
+            <svg v-if="!taskSearchOpen" class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
+              <circle cx="11" cy="11" r="7" />
+              <path d="M16.5 16.5L21 21" stroke-linecap="round" />
+            </svg>
+            <svg v-else class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- 激活的筛选条件：不显示的话筛完就忘了自己筛过什么，列表变短会以为是数据丢了 -->
+      <div v-if="activeFilterCount" class="flex flex-wrap items-center gap-1 px-2.5 pb-1">
         <button
+          v-for="chip in activeFilterChips"
+          :key="chip.key"
           type="button"
-          class="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-white/[0.06]"
-          :title="taskSearchOpen ? '关闭搜索' : '搜索会话'"
-          :aria-label="taskSearchOpen ? '关闭搜索' : '搜索会话'"
-          @click="toggleTaskSearch"
+          class="inline-flex items-center gap-1 rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-primary transition-colors hover:bg-primary/20"
+          :title="`移除「${chip.label}」`"
+          @click.stop="removeTaskFilter(chip.key)"
         >
-          <svg v-if="!taskSearchOpen" class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
-            <circle cx="11" cy="11" r="7" />
-            <path d="M16.5 16.5L21 21" stroke-linecap="round" />
-          </svg>
-          <svg v-else class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          {{ chip.label }}
+          <svg class="h-2.5 w-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6">
             <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
           </svg>
         </button>
+        <button
+          type="button"
+          class="text-[10px] text-gray-400 transition-colors hover:text-gray-600"
+          @click.stop="resetTaskFilters"
+        >清除</button>
       </div>
 
       <div
@@ -219,21 +300,26 @@
 
       <template v-else>
         <div v-for="section in taskSections" :key="section.key">
-          <p class="px-2.5 pb-1 pt-2 text-[11px] font-medium text-gray-400">{{ section.title }}</p>
+          <!-- 分组标题当「标签」用：字号更小、字距放开、色值压到分组层级，
+               不和会话标题抢同一档亮度 -->
+          <p
+            class="px-2.5 pb-1 pt-2 text-[10.5px] font-semibold tracking-[0.02em]"
+            :class="lightTheme ? 'text-slate-500' : 'text-[#5b6472]'"
+          >{{ section.title }}</p>
           <ul class="flex flex-col gap-0.5">
             <li v-for="item in section.items" :key="taskKeyOf(item)">
-              <div class="group/item">
+              <div class="group/item relative">
                 <button
                   type="button"
-                  class="flex h-9 w-full items-center gap-1.5 rounded-[9px] px-2.5 text-left text-sm transition-colors"
+                  class="flex h-9 w-full items-center gap-1.5 rounded-[9px] px-2.5 pr-7 text-left text-sm transition-colors sm:pr-2.5"
                   :class="
                     isConversationActive(item)
                       ? lightTheme
-                        ? 'bg-primary/10 font-semibold text-primary'
-                        : 'bg-primary/15 font-semibold text-primary'
+                        ? 'bg-[linear-gradient(90deg,rgba(22,119,255,.12),rgba(22,119,255,.03))] font-semibold text-[#0958d9] shadow-[inset_2px_0_0_0_#1677ff]'
+                        : 'bg-[linear-gradient(90deg,rgba(22,119,255,.22),rgba(22,119,255,.05))] font-semibold text-white shadow-[inset_2px_0_0_0_#1677ff]'
                       : lightTheme
-                        ? 'text-gray-700 hover:bg-gray-100'
-                        : 'text-slate-200 hover:bg-white/[0.06]'
+                        ? 'text-slate-700 hover:bg-[#f4f7fb] hover:text-slate-900'
+                        : 'text-[#8b95a7] hover:bg-white/[0.06] hover:text-[#eef2f7]'
                   "
                   :title="itemTitle(item)"
                   @click="openConversation(item)"
@@ -249,23 +335,32 @@
                     <path d="M14.5 2.5l7 7-2.2 2.2-1.1-1.1-3.2 3.2.4 3.5-2 2-4.7-4.7-4.2 4.2-1.4-1.4 4.2-4.2L2.6 8.5l2-2 3.5.4 3.2-3.2-1.1-1.1z" />
                   </svg>
                   <span class="min-w-0 flex-1 truncate">{{ itemTitle(item) }}</span>
-                  <span class="flex-shrink-0 text-[11px] text-gray-400">{{ formatTaskTime(item.created_at) }}</span>
-                  <button
-                    type="button"
-                    data-task-menu
-                    class="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded text-gray-400 transition-all hover:bg-gray-200/70 hover:text-gray-700 focus:opacity-100 dark:hover:bg-white/10"
-                    :class="isMenuOpen(item) ? 'opacity-100' : 'opacity-100 sm:opacity-0 sm:group-hover/item:opacity-100'"
-                    :title="isMenuOpen(item) ? '收起操作' : '更多操作'"
-                    :aria-label="isMenuOpen(item) ? '收起操作' : '更多操作'"
-                    :aria-expanded="isMenuOpen(item)"
-                    @click.stop="toggleTaskMenu(item)"
-                  >
-                    <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                      <circle cx="5" cy="12" r="1.6" />
-                      <circle cx="12" cy="12" r="1.6" />
-                      <circle cx="19" cy="12" r="1.6" />
-                    </svg>
-                  </button>
+                  <!-- 时间贴右边缘；鼠标移上来时淡出，把位置让给操作按钮。用透明度而不是
+                       条件渲染：占位不变，标题宽度不会跟着跳。 -->
+                  <span
+                    class="flex-shrink-0 text-[11px] transition-opacity duration-150 sm:group-hover/item:opacity-0"
+                    :class="isConversationActive(item)
+                      ? (lightTheme ? 'text-[#4a86df]' : 'text-[#93b8ff]')
+                      : (lightTheme ? 'text-slate-400' : 'text-[#4f5867]')"
+                  >{{ formatTaskTime(item.created_at) }}</span>
+                </button>
+                <!-- 操作按钮不能嵌在行按钮里（HTML 不允许 button 套 button），改成同层绝对定位：
+                     不占宽度，时间才能真正贴到右边缘 -->
+                <button
+                  type="button"
+                  data-task-menu
+                  class="absolute right-1 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-gray-400 transition-opacity hover:bg-gray-200/70 hover:text-gray-700 focus-visible:opacity-100 focus-visible:outline-none dark:hover:bg-white/10"
+                  :class="isMenuOpen(item) ? 'opacity-100' : 'opacity-100 sm:opacity-0 sm:group-hover/item:opacity-100'"
+                  :title="isMenuOpen(item) ? '收起操作' : '更多操作'"
+                  :aria-label="isMenuOpen(item) ? '收起操作' : '更多操作'"
+                  :aria-expanded="isMenuOpen(item)"
+                  @click.stop="toggleTaskMenu(item)"
+                >
+                  <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <circle cx="5" cy="12" r="1.6" />
+                    <circle cx="12" cy="12" r="1.6" />
+                    <circle cx="19" cy="12" r="1.6" />
+                  </svg>
                 </button>
 
                 <!-- 操作行内联展开：不做浮层，窄侧栏里不会被裁剪，移动端也点得到 -->
@@ -312,10 +407,23 @@
         </div>
 
         <p v-if="loadingMore" class="px-2.5 py-2 text-center text-xs text-gray-400">正在加载…</p>
-        <p
+        <!-- 到底提示不再独占一行「结论」，改成一条带渐隐线的分隔：先表达「列表到此为止」，
+             文字只是注脚 -->
+        <div
           v-else-if="tasks.length && !hasMoreTasks && !taskKeyword.trim()"
-          class="px-2.5 py-2 text-center text-xs text-gray-300 dark:text-gray-600"
-        >已加载全部会话</p>
+          class="flex items-center gap-2 px-2.5 py-2 text-[10.5px] tracking-[0.08em]"
+          :class="lightTheme ? 'text-[#a3adb9]' : 'text-[#3f4756]'"
+        >
+          <span
+            class="h-px flex-1"
+            :class="lightTheme ? 'bg-gradient-to-r from-transparent to-[#e3e9f1]' : 'bg-gradient-to-r from-transparent to-white/[0.07]'"
+          ></span>
+          <span class="flex-shrink-0">已加载全部会话</span>
+          <span
+            class="h-px flex-1"
+            :class="lightTheme ? 'bg-gradient-to-l from-transparent to-[#e3e9f1]' : 'bg-gradient-to-l from-transparent to-white/[0.07]'"
+          ></span>
+        </div>
 
         <!-- 已有列表时刷新失败：保留旧数据，只在底部提示并提供重试 -->
         <div
@@ -460,7 +568,38 @@
       @confirm="confirmDelete"
       @cancel="deleteTarget = null"
     />
-  </div>
+    <!-- 会话筛选浮层：fixed + teleport，避免被侧栏的滚动容器裁剪；移动端降级为底部抽屉 -->
+  <Teleport to="body">
+    <!--
+      透明遮罩：光靠 document 上的判定兜不住「点主工作区」。
+      用户模式右侧是全屏 iframe（Chat.vue），点它时指针事件发生在 iframe 自己的
+      文档里，主文档收不到 pointerdown，浮层就一直挂着——这正是「点别处没反应」。
+      遮罩铺满视口、层级压在面板下面，点哪都能收起（第一次点击只关浮层，
+      不会穿透到下面的按钮，这也是浮层的常规行为）。
+    -->
+    <div
+      v-if="filterPanelOpen"
+      data-conversation-filter-backdrop
+      class="fixed inset-0 z-[75]"
+      @pointerdown="closeFilterPanel"
+    ></div>
+    <div
+      v-if="filterPanelOpen"
+      ref="filterPanelRef"
+      data-conversation-filter-panel
+      class="fixed z-[80] rounded-2xl border border-gray-200/80 bg-white p-3 shadow-xl dark:border-gray-700/80 dark:bg-gray-900"
+      :class="mobile ? 'inset-x-0 bottom-0 rounded-b-none' : ''"
+      :style="filterPanelStyle"
+    >
+      <ConversationFilterPanel
+        :filters="taskFilters"
+        :agents="agentOptions"
+        @update:filters="applyTaskFilters"
+        @reset="resetTaskFilters"
+      />
+    </div>
+  </Teleport>
+</div>
 </template>
 
 <script setup lang="ts">
@@ -472,6 +611,13 @@ import PortalNotificationBell from "@/components/PortalNotificationBell.vue"
 import ConfirmModal from "@/components/ConfirmModal.vue"
 import { useBranding } from "@/composables/useBranding"
 import { usePinnedConversations } from "@/composables/chat/usePinnedConversations"
+import {
+  DEFAULT_HISTORY_FILTERS,
+  buildHistoryFilterParams,
+  type ChatHistoryFilters,
+} from "@/composables/chat/useHistoryFilters"
+import { agentApi } from "@/api/agent"
+import ConversationFilterPanel from "@/components/chat/ConversationFilterPanel.vue"
 import {
   USER_MODE_TASK_PAGE_SIZE,
   computeUserModeTaskPageSize,
@@ -540,64 +686,86 @@ const menu = computed<ResolvedUserModeItem[]>(() =>
   }),
 )
 
-/** 展开状态：默认「专家·技能·连接器」和「更多」都收起，只展开当前所在的那组 */
-const EXPANDED_CACHE_PREFIX = "nanzi_user_mode_expanded"
-/** 按 user_id 分键：换号登录不能继承上一个账号展开着哪些组 */
-const expandedCacheKey = (userId: string) =>
-  `${EXPANDED_CACHE_PREFIX}:${userId || "anon"}`
-
-function readExpandedCache(): Record<string, boolean> {
-  try {
-    const raw = localStorage.getItem(expandedCacheKey(props.userId))
-    const parsed = raw ? JSON.parse(raw) : null
-    return parsed && typeof parsed === "object" ? parsed : {}
-  } catch {
-    return {}
-  }
-}
-
-const expanded = reactive<Record<string, boolean>>({
-  experts: false,
-  more: false,
-  ...readExpandedCache(),
-})
-
-const persistExpandedState = () => {
-  try {
-    localStorage.setItem(
-      expandedCacheKey(props.userId),
-      JSON.stringify({ ...expanded }),
-    )
-  } catch {
-    /* 隐私模式等写不进去，忽略：只是少一层「切模式回来还展开着」 */
-  }
+/** 菜单滚动容器：用来判断「下面还有没有内容」 */
+const menuScrollRef = ref<HTMLElement | null>(null)
+/**
+ * 滚动区底部是否还有内容。
+ *
+ * 菜单区不再死锁 52vh，正常窗口下展开「更多」整组都看得见。但窗口矮（分屏 / 13 寸）
+ * 或菜单再多几项时，菜单区会被会话列表的 min-h 顶住、只好自己滚动——这时溢出部分
+ * 没有任何视觉提示，用户会以为菜单就这么多（作者本人就漏看过「系统设置」）。
+ * 留 4px 容差：亚像素缩放时 scrollHeight 常比 clientHeight 大 1 左右，
+ * 不加容差会在本来就没溢出时也闪出渐隐。
+ */
+const menuOverflowBelow = ref(false)
+const updateMenuOverflow = () => {
+  const el = menuScrollRef.value
+  if (!el) return
+  menuOverflowBelow.value = el.scrollHeight - el.scrollTop - el.clientHeight > 4
 }
 
 /**
- * 路由变化时，只让「当前所在的那一组」保持展开，其余收起。
+ * 展开分组后，把这一组的子项挪进可视区。
+ *
+ * 空间够的时候子项本来就在视野里，这一步是空转；空间不够（菜单区已经顶到上限）时
+ * 用户是点了「更多」才展开的，结果新展开的那几项落在他看不见的下面，等于点了个寂寞。
+ */
+const revealGroupBody = (key: string) => {
+  const el = menuScrollRef.value
+  if (!el) return
+  const body = el.querySelector<HTMLElement>(`[data-group-body="${key}"]`)
+  if (!body) return
+  // 用两个 rect 的差值算「这一组相对滚动容器的偏移」。`offsetTop` 依赖 offsetParent
+  // （容器自己没定位，实际挂在带 relative 的父级上），目前恰好因为父级没有纵向内边距
+  // 才对得上——外层样式一调就静默错位，而错位表现为「点了更多却滚到别处」。
+  const bodyTop = el.scrollTop + (body.getBoundingClientRect().top - el.getBoundingClientRect().top)
+  const bodyBottom = bodyTop + body.offsetHeight
+  const visibleTop = el.scrollTop
+  const visibleBottom = visibleTop + el.clientHeight
+  if (bodyBottom > visibleBottom) {
+    // 露不全时至少保证最后一项贴着底边，别让「系统概览」这种末项继续藏起来
+    el.scrollTop = bodyBottom - el.clientHeight + 6
+  } else if (bodyTop < visibleTop) {
+    el.scrollTop = Math.max(0, bodyTop - 6)
+  }
+  updateMenuOverflow()
+}
+
+// 内容变化（展开分组、权限码到位）不会触发 scroll，要用 ResizeObserver 补
+let menuResizeObserver: ResizeObserver | null = null
+
+/**
+ * 分组展开状态：**只由「当前路由是否在该组内」决定**，外加用户点父项时的临时切换。
+ *
+ * 这里曾经把展开状态写进 localStorage、并在首帧优先恢复它（当时的说法是「切模式
+ * 回来还展开着」）。副作用很明确：某个组只要被展开过一次（去过专家页、或点过父项），
+ * 之后在**任何页面**刷新都会把它撑开——用户在聊天页刷新，看到「专家·技能·连接器」
+ * 自动展开，第一反应就是「我没点它」。展开状态本来只回答一个问题：我在哪一组。
+ * 盘里的历史状态回答不了这个问题，所以不再持久化。
+ */
+const expanded = reactive<Record<string, boolean>>({
+  experts: false,
+  more: false,
+})
+
+/**
+ * 路由变化时，只让「当前所在的那一组」展开，其余收起。
  *
  * 之前只写 `expanded[key] = true`、从不置回 false：点开过「更多」之后，
  * 再去点定时任务/知识库，那一组会一直挂在下面，看起来像「点别的菜单把更多也展开了」。
  * 手动点父项展开不受这里影响——那条路径不改路由。
- *
- * 首次同步（含从专业模式切回用户模式、侧栏重新挂载）保留上次手动展开的组：
- * 否则每次切模式回来，用户展开的「更多」都会被收起。
  */
-let firstRouteSync = true
 watch(
   () => route.path,
   (path) => {
     for (const item of menu.value) {
       if (item.kind !== "group" || !item.children) continue
       const containsCurrent = item.children.some((child) => pathMatches(path, child.path))
-      if (firstRouteSync && expanded[item.key]) {
-        expanded[item.key] = true
-        continue
-      }
+      const wasOpen = expanded[item.key] !== false
       expanded[item.key] = containsCurrent
+      // 路由把某一组撑开时，同样要让子项落在可视区（例如从聊天页直接跳到「更多」里的页面）
+      if (containsCurrent && !wasOpen) void nextTick(() => revealGroupBody(item.key))
     }
-    firstRouteSync = false
-    persistExpandedState()
   },
   { immediate: true },
 )
@@ -645,13 +813,15 @@ const toggleGroup = (item: ResolvedUserModeItem) => {
   // 第一个子项（专家），而不是先展开、再让用户点一次子项。
   if (item.expandOpensFirst && !isChildActive(item)) {
     expanded[item.key] = true
-    persistExpandedState()
     const first = (item.children || []).find((child) => !child.locked)
     if (first) emit("navigate", first.path)
     return
   }
   expanded[item.key] = !isOpen
-  persistExpandedState()
+  if (expanded[item.key]) {
+    // 等 DOM 把子项撑开、flex 重新分配完高度，再决定要不要把这一组滚进视野
+    void nextTick(() => revealGroupBody(item.key))
+  }
 }
 
 const navItemClass = (item: ResolvedUserModeItem, active: boolean): string => {
@@ -718,6 +888,15 @@ const pinned = pinnedApi.pinned
 const isPinned = pinnedApi.isPinned
 
 const taskKeyword = ref("")
+/** 会话列表筛选（来源 / 智能体 / 状态 / 时间）：与聊天页历史面板同一套条件 */
+const taskFilters = ref<ChatHistoryFilters>({ ...DEFAULT_HISTORY_FILTERS })
+const filterPanelOpen = ref(false)
+const filterButtonRef = ref<HTMLElement | null>(null)
+const filterPanelRef = ref<HTMLElement | null>(null)
+const filterPanelStyle = ref<Record<string, string>>({})
+const agentOptions = ref<Array<{ id: string; display_name: string; avatar_url?: string }>>([])
+/** 智能体列表只在首次打开面板时拉一次；失败下次还能重试 */
+let agentOptionsLoaded = false
 const taskSearchOpen = ref(false)
 const taskSearchRef = ref<HTMLInputElement | null>(null)
 /** 用户自己点开的那条会话：它不在当前列表里（比如从置顶区点开）时不该触发重新拉取 */
@@ -731,6 +910,7 @@ const fetchTaskPage = async (page: number) => {
   }
   const keyword = taskKeyword.value.trim()
   if (keyword) params.keyword = keyword
+  Object.assign(params, buildHistoryFilterParams(taskFilters.value))
   const res = await axios.get("/api/v1/chat/history", { params })
   return res?.data?.data || {}
 }
@@ -787,6 +967,109 @@ const loadTasks = async () => {
   } finally {
     if (serial === loadSerial) loadingTasks.value = false
   }
+}
+
+/* ---------------- 会话列表筛选 ---------------- */
+const activeFilterChips = computed(() => {
+  const chips: Array<{ key: keyof ChatHistoryFilters; label: string }> = []
+  const f = taskFilters.value
+  if (f.scope === "task") chips.push({ key: "scope", label: "任务会话" })
+  if (f.scope === "chat") chips.push({ key: "scope", label: "普通对话" })
+  if (f.agentId) {
+    const matched = agentOptions.value.find((a) => a.id === f.agentId)
+    chips.push({ key: "agentId", label: matched?.display_name || "指定智能体" })
+  }
+  if (f.status === "success") chips.push({ key: "status", label: "成功" })
+  if (f.status === "failed") chips.push({ key: "status", label: "失败" })
+  if (f.timeRange === "today") chips.push({ key: "timeRange", label: "今天" })
+  if (f.timeRange === "7d") chips.push({ key: "timeRange", label: "近 7 天" })
+  if (f.timeRange === "30d") chips.push({ key: "timeRange", label: "近 30 天" })
+  if (f.timeRange === "custom") chips.push({ key: "timeRange", label: "自定义时间" })
+  return chips
+})
+const activeFilterCount = computed(() => activeFilterChips.value.length)
+
+/** 浮层用 fixed 定位：侧栏根节点在窄屏下会 overflow 裁剪，absolute 会被切掉 */
+const positionFilterPanel = () => {
+  const btn = filterButtonRef.value
+  if (!btn) return
+  const rect = btn.getBoundingClientRect()
+  if (props.mobile) {
+    filterPanelStyle.value = {}
+    return
+  }
+  const width = 300
+  const left = Math.min(rect.right + 8, window.innerWidth - width - 12)
+  filterPanelStyle.value = {
+    left: `${Math.max(12, left)}px`,
+    top: `${Math.max(12, rect.top - 8)}px`,
+    width: `${width}px`,
+  }
+}
+
+const loadAgentOptions = async () => {
+  if (agentOptionsLoaded) return
+  agentOptionsLoaded = true
+  try {
+    const res = await agentApi.listAllowedAgents()
+    const rows = Array.isArray(res?.data) ? (res.data as any[]) : []
+    agentOptions.value = rows.map((agent) => ({
+      id: String(agent.id),
+      display_name: agent.display_name || agent.name || "未命名智能体",
+      avatar_url: agent.avatar_url || "",
+    }))
+  } catch {
+    // 拉不到就只留「全部智能体」，不影响其他筛选条件可用
+    agentOptionsLoaded = false
+  }
+}
+
+const toggleFilterPanel = () => {
+  filterPanelOpen.value = !filterPanelOpen.value
+  if (!filterPanelOpen.value) return
+  positionFilterPanel()
+  void loadAgentOptions()
+}
+
+const applyTaskFilters = (next: ChatHistoryFilters) => {
+  taskFilters.value = next
+  void loadTasks()
+}
+
+const removeTaskFilter = (key: keyof ChatHistoryFilters) => {
+  const next = { ...taskFilters.value }
+  if (key === "scope") next.scope = "all"
+  if (key === "agentId") next.agentId = ""
+  if (key === "status") next.status = ""
+  if (key === "timeRange") {
+    next.timeRange = ""
+    next.startDate = ""
+    next.endDate = ""
+  }
+  applyTaskFilters(next)
+}
+
+const resetTaskFilters = () => {
+  filterPanelOpen.value = false
+  applyTaskFilters({ ...DEFAULT_HISTORY_FILTERS })
+}
+
+/**
+ * 手动刷新会话列表：任务列表与置顶一起拉。
+ * 至少转 500ms —— 内网请求常常 30ms 就回来，按钮闪一下反而像是没点到。
+ */
+const refreshingTasks = ref(false)
+let refreshFlashTimer: number | null = null
+const refreshTasks = async () => {
+  if (refreshingTasks.value) return
+  refreshingTasks.value = true
+  const startedAt = Date.now()
+  await Promise.all([loadTasks(), pinnedApi.load()])
+  const remain = 500 - (Date.now() - startedAt)
+  refreshFlashTimer = window.setTimeout(() => {
+    refreshingTasks.value = false
+    refreshFlashTimer = null
+  }, Math.max(0, remain))
 }
 
 /** 追加下一页 */
@@ -1019,6 +1302,42 @@ const toggleTaskMenu = (item: ChatHistoryItem) => {
   menuTaskKey.value = menuTaskKey.value === key ? "" : key
 }
 
+/** 收起筛选浮层：遮罩、Esc、换页、按钮二次点击都走这里 */
+const closeFilterPanel = () => {
+  if (filterPanelOpen.value) filterPanelOpen.value = false
+}
+
+/** 浮层是 fixed 定位，列表一滚就与按钮脱开：直接关掉，比让它飘着更符合直觉 */
+const onFilterPanelClose = () => {
+  closeFilterPanel()
+}
+
+/**
+ * 点外部收起筛选浮层。
+ *
+ * 判定必须挂在**捕获阶段**：侧栏里的筛选 chips、会话行的「⋯」按钮都带
+ * `@click.stop`（点它们本来就不该触发外层动作），冒泡阶段的 click 到不了
+ * document，浮层就会一直悬在页面上——看起来像「点了外面没反应」。
+ * 捕获阶段先于这些元素的处理器执行，`stopPropagation` 拦不住它。
+ *
+ * 用 pointerdown 而不是 click：按下即收起，不必等抬手。
+ */
+const onFilterPanelOutsidePointerDown = (event: PointerEvent) => {
+  if (!filterPanelOpen.value) return
+  const target = event.target
+  if (!(target instanceof Node)) return
+  const element = target instanceof Element ? target : null
+  const insidePanel = Boolean(element?.closest("[data-conversation-filter-panel]"))
+  const insideButton = Boolean(filterButtonRef.value?.contains(target))
+  if (!insidePanel && !insideButton) filterPanelOpen.value = false
+}
+
+/** Esc 收起浮层：和聊天页历史面板的行为保持一致 */
+const onDocumentKeydown = (event: KeyboardEvent) => {
+  if (event.key !== "Escape") return
+  if (filterPanelOpen.value) filterPanelOpen.value = false
+}
+
 const onDocumentClick = (event: MouseEvent) => {
   if (!menuTaskKey.value) return
   const target = event.target as HTMLElement | null
@@ -1106,15 +1425,30 @@ const roleLabel = computed(() =>
 )
 
 onMounted(() => {
+  window.addEventListener("scroll", onFilterPanelClose, true)
   pageSize.value = computeUserModeTaskPageSize(window.innerHeight)
+  document.addEventListener("pointerdown", onFilterPanelOutsidePointerDown, true)
+  document.addEventListener("keydown", onDocumentKeydown)
   document.addEventListener("click", onDocumentClick)
   window.addEventListener("resize", handleResize)
   window.addEventListener("nanzi:conversation-active", onConversationActive)
+  void nextTick(updateMenuOverflow)
+  if (typeof ResizeObserver !== "undefined" && menuScrollRef.value) {
+    menuResizeObserver = new ResizeObserver(() => updateMenuOverflow())
+    // 观察 nav：分组展开只改内部高度，滚动容器自身尺寸不变
+    const nav = menuScrollRef.value.firstElementChild
+    if (nav) menuResizeObserver.observe(nav)
+    // 同时观察滚动容器：窗口变矮 / 会话列表把空间顶掉时，容器自身高度会变，
+    // 这时候「下面还有内容」的渐隐提示也得跟着重算
+    menuResizeObserver.observe(menuScrollRef.value)
+  }
   void pinnedApi.load()
   void loadTasks()
 })
 
 onUnmounted(() => {
+  document.removeEventListener("pointerdown", onFilterPanelOutsidePointerDown, true)
+  document.removeEventListener("keydown", onDocumentKeydown)
   document.removeEventListener("click", onDocumentClick)
   window.removeEventListener("resize", handleResize)
   window.removeEventListener("nanzi:conversation-active", onConversationActive)
@@ -1122,12 +1456,22 @@ onUnmounted(() => {
     clearTimeout(taskRefreshTimer)
     taskRefreshTimer = null
   }
+  menuResizeObserver?.disconnect()
+  menuResizeObserver = null
   if (resizeTimer) clearTimeout(resizeTimer)
   if (taskSearchTimer) clearTimeout(taskSearchTimer)
+  if (refreshFlashTimer) {
+    clearTimeout(refreshFlashTimer)
+    refreshFlashTimer = null
+  }
+  // 与 addEventListener 的 capture 参数保持一致，否则移除不掉
+  window.removeEventListener("scroll", onFilterPanelClose, true)
 })
 
 // 从聊天页回到列表时刷新一次：刚发起的会话可能才刚写进历史
 watch(() => route.path, (path) => {
+  // 换页时浮层必须收起来：它挂在 body 上，不属于任何路由，留着会飘在新页面上
+  if (filterPanelOpen.value) filterPanelOpen.value = false
   if (path === "/dashboard/chat") void loadTasks()
 })
 </script>

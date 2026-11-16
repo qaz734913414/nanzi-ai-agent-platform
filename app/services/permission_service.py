@@ -1,7 +1,9 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, distinct, or_
+from sqlalchemy import func, select, delete, distinct, or_, text
 from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import IntegrityError
+from collections.abc import Iterable
+from typing import Any, Dict, List, Optional
 from app.models.permission import ResourcePermission, Role, UserRoleRelation
 from app.models.user import User
 from app.models.agent import AIAgent
@@ -10,9 +12,83 @@ from app.models.metadata import MetaDataset
 from app.models.knowledge import KnowledgeBaseMetadata
 from app.models.tool import SysApiTool
 from app.schemas.permission import PermissionUpdate, UserPermissionsResponse, PermissionSet, PermissionSetDetail, ResourceDetail
+
+
+#: 批量清缓存时单条 pipeline 携带的键数上限。太大（如 10 万键一次）会让单条命令
+#: 的响应包与阻塞时间都变长；500 在「往返次数」与「单次体量」之间取值。
+_CACHE_DELETE_CHUNK = 500
+
+_AGENT_SCOPED_PERMISSION_PREFIX = "sys:auth:permissions:v7:user:"
+_NAVIGATION_RECENT_QUESTIONS_PREFIX = "agent:dataset_navigation_recent_questions:"
+
+
+def user_id_from_agent_scoped_permission_key(key: str) -> Optional[int]:
+    """从 ``sys:auth:permissions:v7:user:{uid}:agent:{scope}`` 解出 uid。
+
+    批量清理要用「一次 SCAN + 本地过滤」替代「每用户一次 SCAN」，因此必须能反解键。
+    解析不出（格式变了、非本族键）一律返回 None → 跳过而不是猜，避免误删他人缓存。
+    """
+    if not key.startswith(_AGENT_SCOPED_PERMISSION_PREFIX):
+        return None
+    head, sep, _scope = key[len(_AGENT_SCOPED_PERMISSION_PREFIX):].partition(":agent:")
+    if not sep:
+        return None
+    try:
+        return int(head)
+    except (TypeError, ValueError):
+        return None
+
+
+def user_id_from_navigation_recent_key(key: str) -> Optional[int]:
+    """从 ``agent:dataset_navigation_recent_questions:{user_key}:{purpose}:{hash}`` 解出 uid。
+
+    ``user_key`` 也可能是 ``admin`` / ``anon``（非数字），那类键不属于任何具体用户，
+    返回 None 让它保持原样——它们由 ``invalidate_all_navigation_caches`` 统一处理。
+    """
+    if not key.startswith(_NAVIGATION_RECENT_QUESTIONS_PREFIX):
+        return None
+    head = key[len(_NAVIGATION_RECENT_QUESTIONS_PREFIX):].split(":", 1)[0]
+    try:
+        return int(head)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _delete_keys_in_chunks(redis, keys: Iterable[str]) -> int:
+    """用 pipeline 分批删除，返回下发的键数。
+
+    逐个 ``await delete`` 是 N 次往返；这里每 500 个键一次往返。对 1000 用户 × 8 个
+    精确键来说，往返次数从 8000 降到 16。
+    """
+    batch: list[str] = []
+    sent = 0
+    for key in keys:
+        batch.append(key)
+        if len(batch) >= _CACHE_DELETE_CHUNK:
+            await redis.delete(*batch)
+            sent += len(batch)
+            batch = []
+    if batch:
+        await redis.delete(*batch)
+        sent += len(batch)
+    return sent
+
+
+class PermissionVersionConflict(Exception):
+    """提交的权限版本已过期——保存期间有人改过这家（用户或角色）的授权。
+
+    之所以要拦：``update_user_permissions`` / ``update_role_permissions`` 是
+    「删光该主体全部行 + 按提交清单重建」的全量语义，前端提交的是**打开弹窗那一刻**的
+    快照。这期间别处可能新增过授权（知识库页面分配、访问申请审批通过），照旧保存就是
+    把它们一并删掉，而且审计里只看得到一条 update，查不出删了什么。
+    """
+
+    def __init__(self, current: str):
+        super().__init__("权限已被他人修改，请刷新后重试")
+        self.current = current
 from app.core.redis import get_redis
 from collections.abc import Iterable
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import json
 import logging
 import time
@@ -124,6 +200,113 @@ def normalize_knowledge_visibility(value: object) -> str:
     return VISIBILITY_PUBLIC
 
 
+# ---------------------------------------------------------------------------
+# 知识库「编辑权限范围」（谁能改库里的文档，不含库设置）
+#
+# 现状基线：public 库的授权成员恒只读；team 库的归属部门成员（含下级）本来就能
+# 改文档。策略化之后**默认值必须与现状逐条对齐**，否则上线当天就有库凭空多出或
+# 丢掉写权限：
+#   · public → readonly（授权成员仍只读）
+#   · team   → team_members（部门成员仍可编辑）
+# 策略存在 knowledge_base_metadata.extra_config["edit_policy"]，缺失/非法一律按
+# 上面的默认值兜底，老库不需要数据回填。
+# ---------------------------------------------------------------------------
+EDIT_POLICY_READONLY = "readonly"
+EDIT_POLICY_TEAM_MEMBERS = "team_members"
+EDIT_POLICY_GRANTED = "granted"
+EDIT_POLICY_ALL_VIEWERS = "all_viewers"
+EDIT_POLICY_SELECTED = "selected"
+
+DEFAULT_EDIT_POLICY_MODE = {
+    VISIBILITY_PUBLIC: EDIT_POLICY_READONLY,
+    VISIBILITY_TEAM: EDIT_POLICY_TEAM_MEMBERS,
+}
+
+#: 每种可见范围允许的策略值。TEAM 库刻意不提供 granted/all_viewers：
+#: 部门库的可见人群已经由部门树定义，再加「被额外授权的人也能编辑」会让
+#: 「这个库到底谁能改」变得没人说得清。
+ALLOWED_EDIT_POLICY_MODES = {
+    VISIBILITY_PUBLIC: (
+        EDIT_POLICY_READONLY,
+        EDIT_POLICY_GRANTED,
+        EDIT_POLICY_ALL_VIEWERS,
+        EDIT_POLICY_SELECTED,
+    ),
+    VISIBILITY_TEAM: (
+        EDIT_POLICY_READONLY,
+        EDIT_POLICY_TEAM_MEMBERS,
+        EDIT_POLICY_SELECTED,
+    ),
+}
+
+
+def normalize_edit_policy_mode(raw_mode: object, visibility: object) -> str:
+    """把库上的策略值归一成该可见范围下的合法值；非法/缺失回落默认。"""
+    visibility_token = normalize_knowledge_visibility(visibility)
+    allowed = ALLOWED_EDIT_POLICY_MODES.get(visibility_token, ())
+    token = str(raw_mode or "").strip().lower()
+    if token in allowed:
+        return token
+    return DEFAULT_EDIT_POLICY_MODE.get(visibility_token, EDIT_POLICY_READONLY)
+
+
+def extract_edit_policy_editors(policy: object) -> set[int]:
+    """取出策略里被点名可编辑的用户 ID。
+
+    只认具体的用户：角色不在编辑权链路上，否则角色成员一变，编辑权就悄悄扩散。
+    """
+    if not isinstance(policy, dict):
+        return set()
+    editors = policy.get("editors")
+    if not isinstance(editors, list):
+        return set()
+    result: set[int] = set()
+    for item in editors:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "user").strip().lower() != "user":
+            continue
+        try:
+            result.add(int(item.get("user_id")))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def resolve_edit_policy_from_config(
+    extra_config: object, visibility: object
+) -> Dict[str, Any]:
+    """从 extra_config 里读出归一后的 edit_policy，供接口返回给前端。"""
+    raw = extra_config.get("edit_policy") if isinstance(extra_config, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    mode = normalize_edit_policy_mode(raw.get("mode"), visibility)
+    editors: List[Dict[str, Any]] = []
+    if mode == EDIT_POLICY_SELECTED:
+        for item in raw.get("editors") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "user").strip().lower() != "user":
+                continue
+            try:
+                user_id = int(item.get("user_id"))
+            except (TypeError, ValueError):
+                continue
+            editors.append(
+                {
+                    "type": "user",
+                    "user_id": user_id,
+                    "user_name": str(item.get("user_name") or ""),
+                    "real_name": str(item.get("real_name") or ""),
+                }
+            )
+    return {
+        "mode": mode,
+        "editors": editors,
+        "updated_by": str(raw.get("updated_by") or ""),
+        "updated_at": str(raw.get("updated_at") or ""),
+    }
+
+
 def resolve_knowledge_dataset_access(
     *,
     dataset_rows: Iterable[tuple],
@@ -133,6 +316,7 @@ def resolve_knowledge_dataset_access(
     default_ids: Iterable[str],
     user_name: Optional[str],
     user_id: Optional[int] = None,
+    edit_policies: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> dict:
     """按三档可见范围计算可读/可写集合（纯函数，便于穷举边界）。
 
@@ -163,6 +347,8 @@ def resolve_knowledge_dataset_access(
 
     授权成员（被显式分配给某人/角色）恒为只读，两级都不含他们。
     """
+    policies = edit_policies or {}
+    visibility_by_id: Dict[str, str] = {}
     granted = {str(token).strip() for token in granted_ids or [] if str(token).strip()}
     defaults = {str(token).strip() for token in default_ids or [] if str(token).strip()}
     paths = [str(path) for path in my_dept_paths or [] if str(path or "").strip()]
@@ -200,28 +386,72 @@ def resolve_knowledge_dataset_access(
             continue
 
         visibility = normalize_knowledge_visibility(raw_visibility)
+        visibility_by_id[dataset_id] = visibility
         if visibility == VISIBILITY_PRIVATE:
             # 个人私有：即使历史上有授权记录也不生效；
             # 记下来是因为下面的「系统默认库」合并也必须跳过它
             private_ids.add(dataset_id)
             continue
 
+        policy_mode = normalize_edit_policy_mode((policies.get(dataset_id) or {}).get("mode"), visibility)
+
         if dataset_id in granted:
             accessible.add(dataset_id)
             # 刻意不 continue：同一个人可能既是授权成员又是归属部门成员，
             # 后者应该拿到内容级写权限，不能被「已授权」提前短路掉。
+            #
+            # 编辑策略：public 库把授权成员放行到内容级（granted / all_viewers，
+            # 后者对授权成员的效果相同，差别只体现在「系统默认库」那批人身上）。
+            # team 库的授权成员仍然是只读 —— 部门库的编辑权只认部门成员与本策略的
+            # selected，不认额外授权。
+            if visibility == VISIBILITY_PUBLIC and policy_mode in (
+                EDIT_POLICY_GRANTED,
+                EDIT_POLICY_ALL_VIEWERS,
+            ):
+                content_writable.add(dataset_id)
 
         if visibility == VISIBILITY_TEAM and raw_owner_dept_id:
             owner_path = (owner_dept_paths or {}).get(int(raw_owner_dept_id))
             if owner_path and any(path.startswith(str(owner_path)) for path in paths):
                 accessible.add(dataset_id)
-                # 部门（含下级部门）成员可以维护文档内容，但不能改库的设置
-                content_writable.add(dataset_id)
+                # 部门（含下级部门）成员默认可以维护文档内容（team_members，与策略化
+                # 之前的行为一致），但不能改库的设置；管理者可以按库改成只读。
+                if policy_mode == EDIT_POLICY_TEAM_MEMBERS:
+                    content_writable.add(dataset_id)
 
     # 未同步到元数据表的库：沿用旧口径（有授权即可见），避免刚建/刚同步的库突然不可见
     accessible |= {dataset_id for dataset_id in granted if dataset_id not in known_ids}
     # 默认库对全员可读，但私有库不能借此"被公开"：private 的语义是有且仅有创建人
-    accessible |= {dataset_id for dataset_id in defaults if dataset_id not in private_ids}
+    defaulted_ids = {dataset_id for dataset_id in defaults if dataset_id not in private_ids}
+    accessible |= defaulted_ids
+
+    # 「所有可见者都可编辑」：连「因为进了系统默认库而可见」的人也包含在内。
+    # 这正是它与 granted 的唯一差别 —— 没有这个差别，两档就是同一个东西。
+    for dataset_id in accessible:
+        if dataset_id in private_ids:
+            continue
+        row_visibility = visibility_by_id.get(dataset_id)
+        if row_visibility is None:
+            continue
+        if (
+            row_visibility == VISIBILITY_PUBLIC
+            and normalize_edit_policy_mode((policies.get(dataset_id) or {}).get("mode"), row_visibility)
+            == EDIT_POLICY_ALL_VIEWERS
+        ):
+            content_writable.add(dataset_id)
+
+    # 「指定成员可编辑」：只点名的人能改，且必须是本来就能看见这个库的人
+    # （编辑权不新增可见性，避免把 private 库或未授权库变成可写）。
+    if current_user_id is not None:
+        for dataset_id in accessible:
+            policy = policies.get(dataset_id) or {}
+            row_visibility = visibility_by_id.get(dataset_id)
+            if row_visibility is None:
+                continue
+            if normalize_edit_policy_mode(policy.get("mode"), row_visibility) != EDIT_POLICY_SELECTED:
+                continue
+            if current_user_id in extract_edit_policy_editors(policy):
+                content_writable.add(dataset_id)
 
     return {
         "accessible_ids": accessible,
@@ -353,8 +583,130 @@ class PermissionService:
             ),
         )
 
+    async def _flush_permission_rows(self) -> None:
+        """把新建的授权行 flush 出主键（表级/行级回填要按 id 定位）。
+
+        用 ``getattr`` 探测而不是直接调：部分单元测试用轻量假 session，
+        没有 ``flush``；这里失败只影响回填，不应让整份权限保存 500。
+        """
+        flush = getattr(self.db, "flush", None)
+        if flush is None:
+            return
+        try:
+            await flush()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Permissions] flush 授权行失败，跳过范围回填: %s", exc)
+
+    async def _snapshot_metadata_scopes(
+        self, subject_column: str, subject_id: int
+    ) -> dict[str, dict]:
+        """保存数据集授权行的表级/行级扩展字段，供整份重建后回填。
+
+        用户管理与角色管理里的「数据集勾选」是**整份重建**：先 DELETE 该主体所有
+        ``resource_type='metadata'`` 的行，再按提交的 id 重新插入。可是表范围
+        （``scope``）、行级策略（``row_policy`` / ``row_condition``）、有效期
+        （``expire_at``）都挂在这些行上——重建出来的新行这些列全是 NULL，
+        语义正好是「数据集内全部表」，等于管理员勾一下数据集就把别人配好的
+        表级收窄静默放大成全表。所以先快照，重建后按 ``resource_id`` 回填。
+
+        只快照「确实带扩展配置」的行；纯数据集级授权的行保持 NULL 即可。
+        """
+        from app.services.dataset_scope_service import _parse_scope, supports_table_scope
+
+        try:
+            if not await supports_table_scope(self.db):
+                return {}
+        except Exception as exc:  # noqa: BLE001 - 探测失败按未迁移处理
+            logger.warning("[Permissions] 探测授权扩展列失败: %s", exc)
+            return {}
+
+        sql = (
+            "SELECT resource_id, subject_type, scope, row_policy, row_condition, expire_at "
+            "FROM ai_agent_resource_permissions "
+            f"WHERE {subject_column} = :sid AND resource_type = 'metadata'"
+        )
+        try:
+            if await self._supports_agent_scope():
+                sql += " AND agent_id IS NULL"
+            rows = (await self.db.execute(text(sql), {"sid": int(subject_id)})).all()
+        except Exception as exc:  # noqa: BLE001 - 读不到就不做保全，但不能让保存失败
+            logger.warning("[Permissions] 读取数据集授权扩展字段失败: %s", exc)
+            return {}
+
+        snapshot: dict[str, dict] = {}
+        for resource_id, subject_type, scope, row_policy, row_condition, expire_at in rows:
+            if scope is None and not row_policy and row_condition is None and expire_at is None:
+                continue
+            mode, tables, col_rules = _parse_scope(scope)
+            # 字段级规则也在 scope JSON 里，回填时把 scope 整份覆盖写回——漏掉 columns
+            # 等于管理员在用户管理页勾一次数据集，就把别人配好的「只给这几列」静默放大
+            # 成全列可见。表级收窄当初就是因为同样的重建语义丢过，这里一并保住。
+            saved_scope: dict = {"mode": mode, "tables": sorted(tables)}
+            if col_rules:
+                saved_scope["columns"] = {
+                    str(table_id): {
+                        "mode": rule.mode,
+                        "names": sorted(rule.names),
+                    }
+                    for table_id, rule in col_rules.items()
+                }
+            snapshot[str(resource_id).strip()] = {
+                "subject_type": (str(subject_type).strip() or None) if subject_type is not None else None,
+                "scope": saved_scope,
+                "row_policy": (str(row_policy).strip() or None) if row_policy is not None else None,
+                "row_condition": row_condition,
+                "expire_at": expire_at,
+            }
+        return snapshot
+
+    async def _restore_metadata_scopes(
+        self, subject_column: str, subject_id: int, snapshot: dict[str, dict]
+    ) -> None:
+        """把 ``_snapshot_metadata_scopes`` 的结果写回重建后的行（按 resource_id 对齐）。"""
+        if not snapshot:
+            return
+
+        from app.services.dataset_scope_service import update_grant_scope
+
+        try:
+            sql = (
+                "SELECT id, resource_id FROM ai_agent_resource_permissions "
+                f"WHERE {subject_column} = :sid AND resource_type = 'metadata'"
+            )
+            if await self._supports_agent_scope():
+                sql += " AND agent_id IS NULL"
+            rows = (await self.db.execute(text(sql), {"sid": int(subject_id)})).all()
+        except Exception as exc:  # noqa: BLE001 - 回填失败不能让整份保存失败
+            logger.warning("[Permissions] 读取待回填的数据集授权失败: %s", exc)
+            return
+
+        restored = 0
+        for permission_id, resource_id in rows:
+            saved = snapshot.get(str(resource_id).strip())
+            if not saved:
+                continue
+            written = await update_grant_scope(
+                self.db,
+                int(permission_id),
+                subject_type=saved["subject_type"],
+                scope=saved["scope"],
+                row_policy=saved["row_policy"],
+                row_condition=saved["row_condition"],
+                expire_at=saved["expire_at"],
+            )
+            if written:
+                restored += 1
+        if restored:
+            logger.info(
+                "[Permissions] 已回填 %d 条数据集授权的表级/行级配置", restored
+            )
+
     async def get_user_permissions(
-        self, user_id: int, agent_id: Optional[str] = None
+        self,
+        user_id: int,
+        agent_id: Optional[str] = None,
+        *,
+        with_version: bool = False,
     ) -> UserPermissionsResponse:
         """用户在该作用域下的有效权限。
 
@@ -377,6 +729,14 @@ class PermissionService:
                     cached = UserPermissionsResponse(**data)
                     # 资源 ID 列表走缓存；展示名（尤其知识库）随元数据表更新，每次命中后刷新 details
                     cached.details = await self._fetch_permission_details(cached.permissions)
+                    # 版本只在权限管理页需要（保存时要带回），且必须**现查**：
+                    # 缓存里存的是写入那一刻的指纹，拿它做乐观锁会把每一次正常保存
+                    # 都判成「已被他人修改」，直到缓存过期。登录/刷新这类热点路径
+                    # 走 with_version=False，不为它多付一次聚合查询。
+                    if with_version:
+                        cached.permissions_version = await self.get_permission_version(
+                            user_id=parsed_uid
+                        )
                     return cached
                 except Exception as e:
                     logger.warning(f"Failed to parse permission cache for user {user_id}: {e}")
@@ -420,13 +780,36 @@ class PermissionService:
         role_perms = (await self.db.execute(role_perm_stmt)).scalars().all()
         self._aggregate_permissions(perm_set, role_perms)
 
-        # E. Fetch Details
+        # E. Fetch "all members" baseline grants (subject_type='all')
+        #    全员基线对每个登录成员生效；库结构未迁移时返回空列表，行为与历史完全一致。
+        try:
+            from app.services.dataset_scope_service import all_members_grants
+
+            baseline_grants = [
+                ResourcePermission(
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    enabled=True,
+                )
+                for resource_type, resource_id in await all_members_grants(
+                    self.db, agent_id=agent_id
+                )
+            ]
+            if baseline_grants:
+                self._aggregate_permissions(perm_set, baseline_grants)
+        except Exception as exc:  # noqa: BLE001 - 全员授权读失败不能打挂鉴权
+            logger.warning("[Permission] 合并全员基线授权失败: %s", exc)
+
+        # F. Fetch Details
         details = await self._fetch_permission_details(perm_set)
 
         response = UserPermissionsResponse(
             roles=list(set(user_roles_list)), # Dedup
             permissions=perm_set,
-            details=details
+            details=details,
+            permissions_version=(
+                await self.get_permission_version(user_id=parsed_uid) if with_version else None
+            ),
         )
 
         # 3. Set Cache (TTL 1 hour)
@@ -760,6 +1143,7 @@ class PermissionService:
                     KnowledgeBaseMetadata.owner_dept_id,
                     KnowledgeBaseMetadata.created_by,
                     KnowledgeBaseMetadata.owner_user_id,
+                    KnowledgeBaseMetadata.extra_config,
                 ).where(KnowledgeBaseMetadata.status != "deleted")
             )
         ).all()
@@ -767,7 +1151,7 @@ class PermissionService:
         # 只有存在 team 库时才去查部门，普通用户的常规路径不额外付一次查询
         team_owner_ids = {
             int(owner_dept_id)
-            for _, visibility, owner_dept_id, _, _ in rows
+            for _, visibility, owner_dept_id, _, _, _ in rows
             if owner_dept_id and normalize_knowledge_visibility(visibility) == VISIBILITY_TEAM
         }
         owner_dept_paths: dict[int, str] = {}
@@ -812,14 +1196,23 @@ class PermissionService:
         default_ids_str = await ConfigService.get("knowledge_ragflow_dataset_ids")
         default_ids = [item.strip() for item in (default_ids_str or "").split(",") if item.strip()]
 
+        # 编辑策略随行取出：判定函数保持纯函数，只多收一份 dataset_id → policy 映射
+        edit_policies: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            raw_config = row[5] if len(row) > 5 else None
+            raw_policy = raw_config.get("edit_policy") if isinstance(raw_config, dict) else None
+            if isinstance(raw_policy, dict):
+                edit_policies[str(row[0])] = raw_policy
+
         access = resolve_knowledge_dataset_access(
-            dataset_rows=[tuple(row) for row in rows],
+            dataset_rows=[tuple(row[:5]) for row in rows],
             granted_ids=perms.permissions.datasets or [],
             my_dept_paths=my_dept_paths,
             owner_dept_paths=owner_dept_paths,
             default_ids=default_ids,
             user_name=user_name,
             user_id=user_id,
+            edit_policies=edit_policies,
         )
         return {"is_admin": False, **access}
 
@@ -1397,8 +1790,59 @@ class PermissionService:
             return ids
         return [i for i in ids if i not in private_ids]
 
+    async def get_permission_version(
+        self,
+        *,
+        user_id: Optional[int] = None,
+        role_id: Optional[int] = None,
+    ) -> str:
+        """该用户（或角色）全部授权行的版本指纹。
+
+        取「行数 + 最大 id + 最大 updated_at」三者组合，而不是只用其中一项：
+
+        - 只数行数：删一行加一行，条数不变，检测不到；
+        - 只看 max(id)：纯删除不会让 id 变化；
+        - 只看 max(updated_at)：删除同样不改时间戳。
+
+        三者一起，增、删、改都会让指纹变化。
+
+        作用域必须与 ``update_*_permissions`` 的删除范围**完全对齐**（只统计全局行，
+        即 ``agent_id IS NULL``）：智能体级行不在那两条全量重建的删除范围内，把它们
+        算进指纹只会制造误报——有人在智能体卡片上调整该用户的限制，管理员的用户权限
+        页就会莫名其妙提示"已被他人修改"。宽了是误报，窄了才是漏判，但两者都该避免。
+        """
+        stmt = select(
+            func.count(ResourcePermission.id),
+            func.max(ResourcePermission.id),
+            func.max(ResourcePermission.updated_at),
+        ).where(*await self._agent_scope_filters(None))
+        if user_id is not None:
+            stmt = stmt.where(ResourcePermission.user_id == int(user_id))
+        elif role_id is not None:
+            stmt = stmt.where(ResourcePermission.role_id == int(role_id))
+        else:
+            return ""
+        count, max_id, max_updated = (await self.db.execute(stmt)).one()
+        stamp = max_updated.isoformat() if max_updated else "-"
+        return f"{int(count or 0)}:{int(max_id or 0)}:{stamp}"
+
+    async def _assert_permission_version(
+        self,
+        expected: Optional[str],
+        *,
+        user_id: Optional[int] = None,
+        role_id: Optional[int] = None,
+    ) -> None:
+        """乐观锁校验。``expected`` 为空表示调用方不参与校验（旧前端 / 脚本）。"""
+        if not expected:
+            return
+        current = await self.get_permission_version(user_id=user_id, role_id=role_id)
+        if current != expected:
+            raise PermissionVersionConflict(current)
+
     async def update_user_permissions(self, user_id: int, updates: PermissionUpdate):
         """Update DIRECT user permissions"""
+        await self._assert_permission_version(updates.permissions_version, user_id=user_id)
         try:
             types_to_update = ["agent", "dataset", "api", "metadata", "menu", "element"]
             # 未显式提交的字段一律不触碰对应记录：旧 bundle / 外部脚本整份 PUT 时会缺这些字段，
@@ -1415,6 +1859,7 @@ class PermissionService:
             # 只删**全局**行：ORM 刻意不映射 agent_id（防"代码先于迁移上线"时接口整体 503），
             # 生成的 DELETE 因而没有作用域条件。迁移执行后若不显式加 agent_id IS NULL，
             # 这一句会把该用户在所有智能体上的限制一起删掉——管理员改一次菜单就静默丢失。
+            metadata_scope_snapshot = await self._snapshot_metadata_scopes("user_id", user_id)
             await self.db.execute(
                 delete(ResourcePermission).where(
                     ResourcePermission.user_id == user_id,
@@ -1483,6 +1928,9 @@ class PermissionService:
 
             if new_perms:
                 self.db.add_all(new_perms)
+                await self._flush_permission_rows()
+
+            await self._restore_metadata_scopes("user_id", user_id, metadata_scope_snapshot)
 
             await self.db.commit()
             await self._invalidate_user_cache(user_id)
@@ -1536,11 +1984,13 @@ class PermissionService:
 
         return UserPermissionsResponse(
             roles=role_name,
-            permissions=perm_set
+            permissions=perm_set,
+            permissions_version=await self.get_permission_version(role_id=role_id),
         )
 
     async def update_role_permissions(self, role_id: int, updates: PermissionUpdate):
         """Update Role Permissions"""
+        await self._assert_permission_version(updates.permissions_version, role_id=role_id)
         try:
             types_to_update = ["agent", "dataset", "api", "metadata", "menu", "element"]
             # 未显式提交的字段一律不触碰对应记录：旧 bundle / 外部脚本整份 PUT 时会缺这些字段，
@@ -1555,6 +2005,7 @@ class PermissionService:
             if "models" in updates.model_fields_set:
                 types_to_update = [*types_to_update, "model"]
             # 同上：角色侧同样只能删全局行，否则会连带删掉该角色在各智能体上的限制。
+            metadata_scope_snapshot = await self._snapshot_metadata_scopes("role_id", role_id)
             await self.db.execute(
                 delete(ResourcePermission).where(
                     ResourcePermission.role_id == role_id,
@@ -1607,17 +2058,23 @@ class PermissionService:
 
             if new_perms:
                 self.db.add_all(new_perms)
+                await self._flush_permission_rows()
+
+            await self._restore_metadata_scopes("role_id", role_id, metadata_scope_snapshot)
 
             await self.db.commit()
 
-            # Heavy operation: Invalidate cache for ALL users who have this role
-            # For now, we might just accept 1 hour delay or try to find them.
-            # Efficient way: Select user_ids from UserRoleRelation where role_id = role_id
+            # 清缓存必须放在 commit **之后**：反过来会出现「缓存已清、数据未提交」的
+            # 窗口，并发请求读到旧行又把旧结果写回 Redis（TTL 1 小时），管理员刚保存的
+            # 权限在 1 小时内不生效且不会再有第二次失效来纠正。
+            #
+            # 也**必须走批量**：这个角色可能有上千成员。历史实现是逐用户
+            # `await _invalidate_user_cache(uid)`，每人 2 次全 keyspace SCAN + 1 次
+            # DB 查询，1000 人实测 46.9 秒（本机 Redis），生产 keyspace 更大时会到
+            # 几分钟——前端表现为「点了保存卡死」，而数据其实早就落库了。
             user_ids_stmt = select(UserRoleRelation.user_id).where(UserRoleRelation.role_id == role_id)
             user_ids = (await self.db.execute(user_ids_stmt)).scalars().all()
-
-            for uid in user_ids:
-                await self._invalidate_user_cache(uid)
+            await self.invalidate_cached_permissions_for_users(user_ids)
 
         except Exception as e:
             await self.db.rollback()
@@ -1650,6 +2107,124 @@ class PermissionService:
                 await redis.delete(key)
                 deleted += 1
         return deleted
+
+    async def _fetch_api_key_hashes(self, user_ids: Iterable[int]) -> Dict[int, str]:
+        """批量取 ``api_key_hash``（一条 IN 查询），供批量清 ``auth:api_key:{hash}``。
+
+        单用户路径里这一步藏在 ``AuthService.invalidate_user_auth_cache`` 内部
+        （每人一次 ``session.get``）。批量场景沿用就变成 N 次往返，实测单独就要
+        1 秒以上，所以这里显式批量化。语义保持不变：**有 hash 才删**，没有就跳过。
+        """
+        ids = [int(uid) for uid in user_ids if uid is not None]
+        if not ids:
+            return {}
+        rows = await self.db.execute(
+            select(User.id, User.api_key_hash).where(User.id.in_(ids))
+        )
+        return {
+            int(uid): str(hash_ or "").strip()
+            for uid, hash_ in rows.all()
+            if uid is not None and str(hash_ or "").strip()
+        }
+
+    async def _invalidate_user_caches_bulk(self, user_ids: List[int]) -> None:
+        """按批清权限缓存：SCAN 走固定次数，而不是每个用户各走一遍。
+
+        **为什么不能只把 ``_invalidate_user_cache`` 并发化**：每个用户要付 2 次 SCAN，
+        而 ``SCAN MATCH`` 的成本是 O(keyspace)、与 pattern 命中几个键无关。1000 个用户
+        = 2000 次全库遍历；实测 keyspace 6.7 万时单次 SCAN 138ms，仅这一项就 276 秒。
+        并发只是把等待重叠，Redis 侧的遍历总量一点没少。
+
+        本方法把「遍历次数」从 ``2N`` 压到 ``2``，精确键用 pipeline 一次发完，
+        ``api_key_hash`` 用一条 IN 查询取回。覆盖的键与 ``_invalidate_user_cache``
+        逐条对齐（顺序无关，键集合必须完全一致）：
+
+        - 精确键：v2/v4/v5/v6 历史版本键 + 数据集菜单 + 3 个数据门户导航键；
+        - SCAN 键族：``...:user:{uid}:agent:*``（含全局 ``agent:-``）+ 最近提问键族；
+        - 查到 hash 才有：``auth:api_key:{hash}``。
+
+        任何一步失败都只记日志、不抛出：调用点（保存角色权限）此时授权已经 commit，
+        清缓存失败不该把一次成功的管理操作变成 500。
+        """
+        uid_set = {int(uid) for uid in user_ids if uid is not None}
+        if not uid_set:
+            return
+
+        redis = await self._get_redis()
+        if redis:
+            try:
+                await self._delete_exact_user_cache_keys(redis, uid_set)
+            except Exception as ex:  # noqa: BLE001 - 清缓存失败不能打断已完成的保存
+                logger.warning("批量清除权限精确键失败（%s 个用户）: %s", len(uid_set), ex)
+            try:
+                await self._delete_scanned_user_cache_keys(redis, uid_set)
+            except Exception as ex:  # noqa: BLE001
+                logger.warning("批量清除权限键族失败（%s 个用户）: %s", len(uid_set), ex)
+            try:
+                await self._delete_auth_api_key_caches(redis, uid_set)
+            except Exception as ex:  # noqa: BLE001
+                logger.warning("批量清除认证缓存失败（%s 个用户）: %s", len(uid_set), ex)
+
+        # 技能禁用是**进程内**缓存，整批清一次就够：原来每个用户清一遍，
+        # 1000 人就是 1000 次无意义的空调用。
+        try:
+            from app.services.ai.skills.policy import clear_forbidden_skill_cache
+
+            clear_forbidden_skill_cache()
+        except Exception as ex:
+            logger.warning("Failed to clear forbidden skill cache: %s", ex)
+
+    @staticmethod
+    async def _delete_exact_user_cache_keys(redis, uid_set: set) -> None:
+        """清「键名可由用户 id 直接拼出」的那批缓存。"""
+        from app.services.ai.config import AgentConfigProvider
+        from app.services.dataset_navigation_service import DatasetNavigationService
+
+        keys: list[str] = []
+        for uid in uid_set:
+            # 历史版本键：旧缓存继续命中会让「刚改的权限」在 TTL 内看起来没生效
+            keys.append(f"sys:auth:permissions:v2:user:{uid}")
+            keys.append(f"sys:auth:permissions:v4:user:{uid}")
+            keys.append(f"sys:auth:permissions:v5:user:{uid}")
+            keys.append(f"sys:auth:permissions:v6:user:{uid}")
+            # 数据集菜单 + 数据门户导航：键构造单点维护，避免与单用户路径漂移
+            keys.append(AgentConfigProvider.dataset_menu_cache_key(user_id=uid))
+            user_key = str(uid)
+            keys.append(DatasetNavigationService._navigation_cache_key(user_key))
+            keys.append(DatasetNavigationService._click_rank_key(user_key))
+            keys.append(DatasetNavigationService._click_meta_key(user_key))
+        await _delete_keys_in_chunks(redis, keys)
+
+    @staticmethod
+    async def _delete_scanned_user_cache_keys(redis, uid_set: set) -> None:
+        """清「只能靠 SCAN 发现」的键族：各扫全库**一次**，本地按 uid 过滤。
+
+        ``agent_id`` 与 ``purpose/group_hash`` 都无法穷举（agent 可能已被删除、
+        purpose 由运行时决定），所以这里不能改成精确键；但可以把 N 次遍历
+        合并成 1 次，这正是本次性能修复的核心。
+        """
+        targets: list[str] = []
+        async for key in redis.scan_iter(
+            match=f"{_AGENT_SCOPED_PERMISSION_PREFIX}*:agent:*", count=1000
+        ):
+            if user_id_from_agent_scoped_permission_key(key) in uid_set:
+                targets.append(key)
+        async for key in redis.scan_iter(
+            match=f"{_NAVIGATION_RECENT_QUESTIONS_PREFIX}*", count=1000
+        ):
+            if user_id_from_navigation_recent_key(key) in uid_set:
+                targets.append(key)
+        if targets:
+            await _delete_keys_in_chunks(redis, targets)
+
+    async def _delete_auth_api_key_caches(self, redis, uid_set: set) -> None:
+        """清真实 API Key 的认证缓存（``auth:api_key:{hash}``）。"""
+        hashes = await self._fetch_api_key_hashes(uid_set)
+        if not hashes:
+            return
+        await _delete_keys_in_chunks(
+            redis, (f"auth:api_key:{h}" for h in set(hashes.values()))
+        )
 
     async def _invalidate_user_cache(self, user_id: int):
         redis = await self._get_redis()
@@ -1698,12 +2273,15 @@ class PermissionService:
 
         角色级智能体限制只影响拥有该角色的用户，因此按成员精确失效而不是清全局——
         同时也要覆盖他们的智能体作用域键族（见 ``_invalidate_user_cache``）。
+
+        **必须走批量**：这里曾逐用户 ``await _invalidate_user_cache``，1000+ 成员的
+        角色会让保存请求卡几十秒到几分钟（前端「卡死」，数据其实已落库）。
         """
         user_ids_stmt = select(UserRoleRelation.user_id).where(
             UserRoleRelation.role_id == int(role_id)
         )
-        for uid in (await self.db.execute(user_ids_stmt)).scalars().all():
-            await self._invalidate_user_cache(uid)
+        user_ids = (await self.db.execute(user_ids_stmt)).scalars().all()
+        await self.invalidate_cached_permissions_for_users(user_ids)
 
     async def get_users_with_element_permission(
         self, user_ids: Iterable[int], permission_code: str
@@ -1766,9 +2344,23 @@ class PermissionService:
         return {int(uid) for uid in granted}
 
     async def invalidate_cached_permissions_for_users(self, user_ids: Iterable[int]) -> None:
-        """Clear permission cache for users (e.g. after role membership changes outside update_user_roles)."""
-        for uid in set(user_ids):
-            await self._invalidate_user_cache(uid)
+        """批量清权限缓存（角色成员变化、全员授权变更、保存角色权限等场景）。
+
+        **历史教训**：这里曾用 ``Semaphore(16)`` 的并发版逐用户清理。并发把墙钟时间
+        压到 1/7，但没解决根因——每个用户 2 次 SCAN，总遍历量仍是
+        O(用户数 × keyspace)。1000 人的角色实测仍要 6.5 秒（本机 Redis、无网络 RTT、
+        keyspace 仅 1 万），生产 10 万 key 下就是分钟级，前端表现为「点了保存卡死」
+        （数据其实已经落库）。现在整批只扫两遍 keyspace，耗时与用户数基本无关。
+        """
+        unique = sorted({int(uid) for uid in user_ids if uid is not None})
+        if not unique:
+            return
+        if len(unique) == 1:
+            # 单用户走原路径：副作用（日志、auth 缓存、导航缓存）一字不改，
+            # 避免为「一个人」引入批量分支的行为差异。
+            await self._invalidate_user_cache(unique[0])
+            return
+        await self._invalidate_user_caches_bulk(unique)
 
     async def check_permission(self, user_id: int, resource_type: str, resource_id: str) -> bool:
         """

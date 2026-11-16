@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, watch } from "vue";
+import { ref, onMounted, onUnmounted, computed, watch, nextTick } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { agentApi } from "../api/agent";
+import { agentApi, type DelegationScopeState } from "../api/agent";
 import type {
   AIAgent,
   AIAgentBase,
@@ -11,6 +11,12 @@ import type {
   StaleToolRef,
 } from "../api/agent";
 import { modelApi, type AIModel } from "../api/model";
+import ToolGroupTabs from "@/components/system/ToolGroupTabs.vue";
+import {
+  ALL_GROUP_KEY,
+  computeGroupTabs,
+  type GroupableTool,
+} from "@/utils/toolGroupTabs";
 import { toolApi, scriptToolApi, type SysApiTool } from "../api/tool";
 import Modal from "../components/Modal.vue";
 import ConfirmModal from "../components/ConfirmModal.vue";
@@ -23,6 +29,7 @@ import AgentNameField from "../components/agent/AgentNameField.vue";
 import AgentHistoryModal from "../components/agent/AgentHistoryModal.vue";
 import RagFlowResourceSelector from "../components/RagFlowResourceSelector.vue";
 import ToolRuntimeConfigModal from "../components/agent/ToolRuntimeConfigModal.vue";
+import { toolSupportsInternalLlm } from "../constants/toolCapabilities";
 import MetadataDatasetBindingModal from "../components/agent/MetadataDatasetBindingModal.vue";
 import DelegationScopeModal from "../components/agent/DelegationScopeModal.vue";
 import AgentTeamEditorModal from "../components/agent/AgentTeamEditorModal.vue";
@@ -31,6 +38,7 @@ import DingTalkConfigModal from "../components/agent/DingTalkConfigModal.vue";
 import EmailConfigModal from "../components/agent/EmailConfigModal.vue";
 import WeChatWorkConfigModal from "../components/agent/WeChatWorkConfigModal.vue";
 import FeishuConfigModal from "../components/agent/FeishuConfigModal.vue";
+import AgentCreateButton from "../components/agent/AgentCreateButton.vue";
 import AgentFlowGuideBanner from "../components/agent/AgentFlowGuideBanner.vue";
 import MessageRenderer from "../components/MessageRenderer.vue";
 import type { MarkdownTheme } from "@/types/markdownTheme";
@@ -47,6 +55,7 @@ import {
   ClockIcon,
   CpuChipIcon,
   DocumentDuplicateIcon,
+  FolderIcon,
   PencilSquareIcon,
   TrashIcon,
   UserCircleIcon,
@@ -82,7 +91,11 @@ const currentToolConfig = ref<any>({});
 // Model Management
 const models = ref<AIModel[]>([]);
 const globalModelTemperature = ref(0);
-const globalAgentToolcallTimeout = ref(120);
+// 与后端 DEFAULT_AGENT_MAX_TOOLCALL_TIMEOUT 保持一致：接口没返回时按 180 算上限
+const globalAgentToolcallTimeout = ref(180);
+// 整轮看门狗：工具级超时配得比它大也跑不完（整轮先被取消），弹窗需要据此提示。
+// 0 表示看门狗已关闭，此时没有整轮天花板。
+const producerHardTimeout = ref(600);
 const fetchModels = async () => {
   try {
     const res = await modelApi.list();
@@ -113,6 +126,10 @@ const fetchGlobalAgentToolcallTimeout = async () => {
     if (Number.isInteger(value) && value >= 1 && value <= 3600) {
       globalAgentToolcallTimeout.value = value;
     }
+    const producer = Number(res.data.producer_hard_timeout_seconds);
+    if (Number.isInteger(producer) && producer >= 0) {
+      producerHardTimeout.value = producer;
+    }
   } catch (error) {
     console.warn("Failed to fetch global agent tool-call timeout", error);
   }
@@ -133,7 +150,6 @@ const fetchModelHealth = async () => {
 const showAgentModal = ref(false);
 const showVersionModal = ref(false);
 const showHistoryModal = ref(false);
-const showCreateAgentMenu = ref(false);
 
 const showVersionsDrawer = ref(false); // New Drawer State
 
@@ -261,7 +277,12 @@ const handleAgentNameReset = () => {
 /** 提交前兜底：明确撞名则拦截；无法判定（接口异常）时放行，交由后端权威裁决。 */
 const ensureAgentNameUsable = async (): Promise<string | null> => {
   if (isEditingAgent.value) return null;
-  const { ok, message } = await ensureAgentNameAvailable(agentForm.value.name);
+  // 继续向导改的是已有副本，校验时必须排除它自己，否则原名永远撞自己。
+  const excludeAgentId = isOnboardingFlow.value ? selectedAgent.value?.id : undefined;
+  const { ok, message } = await ensureAgentNameAvailable(
+    agentForm.value.name,
+    excludeAgentId,
+  );
   return ok ? null : message || "物理标识符已被占用，请换一个";
 };
 
@@ -399,6 +420,8 @@ const agentForm = ref<AIAgentBase>({
   team_profile: { name: "", intro: "" },
   engine_type: "LOCAL",
   engine_config: null,
+  // 业务分组：空串 = 未分组（后端归一成 None）
+  group_name: "",
 });
 
 const engineConfigUI = ref({
@@ -646,6 +669,22 @@ const hasElementPerm = (code: string): boolean => {
 
 const canReviewSystem = computed(() => hasElementPerm('element:agent:system_publish'))
 
+/** 菜单权限判断（与 hasElementPerm 同风格，只查 menus）。admin 直通。 */
+const hasMenuPerm = (code: string): boolean => {
+  try {
+    const raw = localStorage.getItem('user_info')
+    if (!raw) return false
+    const info = JSON.parse(raw)
+    if (info.role === 'admin') return true
+    const perms = info.permissions
+    // 扁平数组里菜单与元素权限混存（与 useUser().hasPermission 同口径）
+    const list: string[] = Array.isArray(perms) ? perms : perms?.menus || []
+    return list.includes(code)
+  } catch {
+    return false
+  }
+}
+
 const showSystemPublishModal = ref(false)
 const systemPublishMode = ref<'publish' | 'apply'>('publish')
 const systemPublishTarget = ref<AIAgent | null>(null)
@@ -830,7 +869,7 @@ const handleShareDone = (count: number) => {
 
 // 分享：与技能 / MCP 分享同一套交互——平级视图 + 侧边菜单角标。
 // 不再做成「有待处理才出现的弹窗」：那样对方根本不知道去哪儿找。
-type AgentWorkspaceTab = 'all' | 'mine' | 'received' | 'sent' | 'teams'
+type AgentWorkspaceTab = 'all' | 'mine' | 'assigned' | 'received' | 'sent' | 'teams'
 
 /** 专家团主专家：列表页「专家团」tab 的数据源。主助手不当团主，历史数据即使为
  *  true 也不进这个视图——否则会冒出一个不该被当成专才分派的「团」。 */
@@ -1063,11 +1102,75 @@ const showTeamEditorModal = ref(false)
 const teamEditorAgent = ref<AIAgent | null>(null)
 const teamEditorMembers = ref<any[]>([])
 const teamEditorSaving = ref(false)
+/** 成员名单现状；null = 还没取到（组件按只读处理，不猜） */
+const teamEditorScope = ref<DelegationScopeState | null>(null)
+const teamEditorScopeLoading = ref(false)
 
-const openTeamEditor = (team: AIAgent) => {
+/**
+ * 团设置里的候选智能体。
+ *
+ * 刻意不复用版本抽屉那份 `delegationScopeAgents`：它按 `selectedAgent` 过滤，
+ * 而团设置是从列表页直接打开的，`selectedAgent` 未必是当前这个团。
+ */
+const teamEditorScopeAgents = computed(() =>
+  (agents.value || [])
+    .filter(a => String(a.id) !== String(teamEditorAgent.value?.id ?? ""))
+    // 不过滤 is_enabled：停用的智能体仍在库里、仍可能是成员。这里过滤掉，
+    // 弹窗就会把它算成「已被删除或不可见」的失效项，用户看到的是"成员被删了"
+    // 这种错误结论，反而更难判断该移除还是该启用。
+    .map(a => ({
+      id: String(a.id),
+      name: a.name,
+      display_name: (a as any).display_name,
+      description: (a as any).description,
+      capabilities: (a as any).capabilities || [],
+      is_system: (a as any).is_system,
+      is_enabled: (a as any).is_enabled,
+      created_by: (a as any).created_by,
+      is_expert_team_lead: (a as any).is_expert_team_lead === true,
+      team_name: (a as any).team_name ?? null,
+      team_member_ids: (a as any).team_member_ids ?? null,
+      // 新加的成员不在打开弹窗时的快照里，头像与「未发布/已停用」判断只能从这里拿
+      avatar_url: (a as any).avatar_url ?? null,
+      published_version_number: (a as any).published_version_number ?? null,
+      engine_type: (a as any).engine_type ?? null,
+    })),
+)
+
+/**
+ * 能否编辑这个团。
+ *
+ * 用 `is_editable` 而**不是** `can_edit_versions`：这两者会分叉。
+ * 普通用户自己创建、后来被上架成系统级（`is_system=True`）时，后端允许他
+ * 「建版本 / 改草稿」（`can_edit_versions=True`），但把 `is_editable` 置 False——
+ * 元数据与线上基线归管理员。团设置改的是元数据 + 线上成员名单，属于后者，
+ * 与后端 `_assert_writable` 的判定完全一致。用错字段的结果是按钮看着能点，
+ * 用户改完一屏成员、点保存才被 403 拦住。
+ */
+const isTeamEditable = (team: AIAgent): boolean =>
+  (team as any).is_editable !== false
+
+const openTeamEditor = async (team: AIAgent) => {
   teamEditorAgent.value = team
   teamEditorMembers.value = teamMemberRows(team)
+  teamEditorScope.value = null
   showTeamEditorModal.value = true
+  // 三项前置条件先取回来：不取就分不清「空名单」和「还没加载」，
+  // 用户会看到一个可以点但点了报错的成员区。
+  teamEditorScopeLoading.value = true
+  try {
+    const { data } = await agentApi.getDelegationScope(team.id)
+    // 请求期间用户可能已经切到别的团或关掉弹窗：晚到的响应不能覆盖当前状态，
+    // 否则会把 A 团的成员名单显示在 B 团下面，保存一次就写错了对象。
+    if (!showTeamEditorModal.value || teamEditorAgent.value?.id !== team.id) return
+    teamEditorScope.value = data
+  } catch (error: any) {
+    if (!showTeamEditorModal.value || teamEditorAgent.value?.id !== team.id) return
+    showToast(error?.response?.data?.detail?.message || '读取成员配置失败', 'error')
+    showTeamEditorModal.value = false
+  } finally {
+    if (teamEditorAgent.value?.id === team.id) teamEditorScopeLoading.value = false
+  }
 }
 
 /**
@@ -1078,11 +1181,30 @@ const openTeamEditor = (team: AIAgent) => {
 const saveTeamProfile = async (payload: {
   is_expert_team_lead: boolean
   team_profile: { name: string; intro: string } | null
+  scope_dirty: boolean
+  delegable_agent_ids: string[]
+  enable_delegation_tool: boolean
 }) => {
   const agent = teamEditorAgent.value
   if (!agent || teamEditorSaving.value) return
   teamEditorSaving.value = true
+  // 成员与团信息是两个接口、两个事务，做不到一起成功或一起失败。
+  // 记下第一段是否已经落地，失败时才能说清「哪一半成了」，
+  // 否则用户看到「保存失败」会重试，而重试可能又生成一个版本。
+  let scopeSaved = false
   try {
+    // 成员名单是版本级配置，必须先写：它失败就没必要再改团信息，
+    // 否则会出现「团已经改名了、成员没存上」的半成品状态。
+    if (payload.scope_dirty) {
+      const { data: savedScope } = await agentApi.saveDelegationScope(agent.id, {
+        delegable_agent_ids: payload.delegable_agent_ids,
+        enable_delegation_tool: payload.enable_delegation_tool,
+      })
+      scopeSaved = true
+      // 把新状态写回去：否则第二步失败、用户留在弹窗里再点一次保存，
+      // 名单看着还是「脏」的，会再复制一个内容完全相同的版本。
+      teamEditorScope.value = savedScope
+    }
     await agentApi.updateAgent(agent.id, {
       name: agent.name,
       display_name: agent.display_name,
@@ -1099,10 +1221,37 @@ const saveTeamProfile = async (payload: {
       team_profile: payload.team_profile,
     } as any)
     showTeamEditorModal.value = false
-    showToast(payload.is_expert_team_lead ? '专家团已更新' : '已取消专家团标记', 'success')
+    showToast(
+      payload.scope_dirty
+        ? `专家团已更新，成员 ${payload.delegable_agent_ids.length} 位（已生成新版本）`
+        : payload.is_expert_team_lead
+          ? '专家团已更新'
+          : '已取消专家团标记',
+      'success',
+    )
     await fetchAgents()
   } catch (error: any) {
-    showToast(error?.response?.data?.detail || '保存失败，请重试', 'error')
+    const detail = error?.response?.data?.detail
+    // 后端的领域错误带 code，前端按码给可操作的提示，不透传英文堆栈
+    const code = typeof detail === 'object' ? detail?.code : null
+    const message =
+      code === 'NO_PUBLISHED_VERSION'
+        ? '该智能体还没有已发布的版本，先发布一个版本再配成员'
+        : code === 'DELEGATION_TOOL_DISABLED'
+          ? '当前版本没有启用委派工具，无法保存成员'
+          : code === 'TOO_MANY_MEMBERS'
+            ? detail?.message || '成员数量超出上限'
+            : code === 'AGENT_NOT_READY'
+              ? `配置还不完整：${(detail?.missing || []).join('、') || '见配置与发布'}`
+              : typeof detail === 'object'
+                ? detail?.message
+                : detail
+    showToast(
+      scopeSaved
+        ? `成员已保存（新版本已发布），但团信息没存上：${message || '请重试'}`
+        : message || '保存失败，请重试',
+      'error',
+    )
   } finally {
     teamEditorSaving.value = false
   }
@@ -1180,23 +1329,91 @@ const refreshShareCounts = async () => {
 
 const route = useRoute()
 
+// 「分配给我」独立数据源：刻意不并进 agents.value —— 那是管理台列表，
+// 混入会让 totalAgentCount、业务分组页签、管理筛选器全部算错。
+const assignedAgents = ref<AIAgent[]>([])
+const assignedAgentsLoaded = ref(false)
+const assignedAgentsError = ref(false)
+
+/**
+ * 拉取被分配的智能体。
+ *
+ * 失败不抛：这个视图是附加信息，它 403/500 不该让整个智能体中心白屏。
+ * 但也不能把失败说成「没有分配」——空态要能区分这两种情况，否则用户会拿着
+ * 「还没有智能体被分配给你」去找管理员，而管理员那边看到的却是「明明授权了」。
+ * 管理员不请求——后端对他恒返回空，前端也不显示该 tab。
+ */
+const fetchAssignedAgents = async () => {
+  if (isAdminViewer.value) {
+    assignedAgents.value = []
+    assignedAgentsLoaded.value = true
+    return
+  }
+  try {
+    const res = await agentApi.listAssignedAgents()
+    assignedAgents.value = res.data || []
+    assignedAgentsError.value = false
+  } catch (e) {
+    console.warn('Failed to load assigned agents', e)
+    assignedAgents.value = []
+    assignedAgentsError.value = true
+  } finally {
+    assignedAgentsLoaded.value = true
+  }
+}
+
+/** 「分配给我」的关键词过滤：只按名称/描述，不接管理筛选器 */
+const filteredAssignedAgents = computed<AIAgent[]>(() => {
+  const k = searchKeyword.value.trim().toLowerCase()
+  if (!k) return assignedAgents.value
+  return assignedAgents.value.filter((a) =>
+    [a.name, a.display_name, a.description]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase()
+      .includes(k)
+  )
+})
+
+/**
+ * URL 上的视图 key 是否对该角色有效。
+ *
+ * 两个角色专属视图：`all` 只有管理员有，`assigned` 只有普通用户有。
+ * 若仍按 query 落到不属于自己的视图，会得到「没有任何 tab 高亮 + 内容对不上」的页面
+ * —— 管理员进 `assigned` 是空列表，普通用户进 `all` 是没有选中态的列表。
+ */
+const isTabAvailableForRole = (tab: string) => {
+  if (tab === 'assigned') return !isAdminViewer.value
+  if (tab === 'all') return isAdminViewer.value
+  return true
+}
+
 /** 站内信/外链可以直接带 ?agents_tab=received 落位 */
 const resolveInitialTab = (): AgentWorkspaceTab => {
   const raw = String(route.query.agents_tab || '')
-  if (raw === 'received' || raw === 'sent' || raw === 'mine' || raw === 'all' || raw === 'teams') {
+  if (
+    (raw === 'received' || raw === 'sent' || raw === 'mine' || raw === 'all' || raw === 'assigned' || raw === 'teams') &&
+    isTabAvailableForRole(raw)
+  ) {
     return raw as AgentWorkspaceTab
   }
   // 管理员默认看「全部」：他原本看到的就是平台全量，别因为加了视图就缩小范围
   return isAdminViewer.value ? 'all' : 'mine'
 }
 
-/** 管理员多一个「全部」：他要能看别人名下的智能体；普通用户只有自己的 */
+/** 管理员多一个「全部」：他要能看别人名下的智能体；普通用户多一个「分配给我」 */
 const workspaceTabs = computed<Array<{ key: AgentWorkspaceTab; label: string; badge: number }>>(
   () => [
     // 「全部 / 我的」不带数字：页头已经写着「共 N 个」，同一屏说两遍是冗余，
     // 而 14 − 11 这个差值才是用户想知道的——摆两个绝对值等于把减法留给用户。
     ...(isAdminViewer.value ? [{ key: 'all' as AgentWorkspaceTab, label: '全部智能体', badge: 0 }] : []),
     { key: 'mine', label: '我的智能体', badge: 0 },
+    // 「分配给我」：平台授权我用、不是我创建的。放在「我的」之后、「分享给我」之前——
+    // 顺序即语义：我能管的 → 我被给的 → 等我去接的。
+    // 管理员不显示：他已有「全部智能体」，再来一份是重复视图。
+    ...(isAdminViewer.value
+      ? []
+      : [{ key: 'assigned' as AgentWorkspaceTab, label: '分配给我', badge: assignedAgents.value.length }]),
     // 分享类 tab 只在真有东西时才带数字（0 没有行动价值，还分心），
     // 且数字是「这个视图有多少条」而非「有几个待处理」——后者会被读成收到了 2 个智能体。
     { key: 'received', label: '分享给我', badge: shareCounts.value.received_total },
@@ -1207,6 +1424,49 @@ const workspaceTabs = computed<Array<{ key: AgentWorkspaceTab; label: string; ba
   ],
 )
 
+const workspaceTabsRef = ref<HTMLElement | null>(null);
+const canScrollLeft = ref(false);
+const canScrollRight = ref(false);
+
+/**
+ * 页签条还能不能往左/右滑。
+ *
+ * 滚动条是刻意隐藏的（移动端那根细横条难看也难点），代价是用户看不出
+ * 「右边还有三个视图」。按滚动位置给出可点击的圆形箭头：能滑才出现，
+ * 滑到头立刻消失，不会一直挡着页签。
+ */
+const updateScrollHints = () => {
+  const el = workspaceTabsRef.value;
+  if (!el) return;
+  // 4px 容差：缩放后 scrollWidth 会多算一两像素，不容差会永远显示右箭头
+  const max = el.scrollWidth - el.clientWidth;
+  canScrollLeft.value = el.scrollLeft > 4;
+  canScrollRight.value = max > 4 && el.scrollLeft < max - 4;
+};
+
+/** 点箭头翻一屏（留一点重叠，避免刚好把某个页签切在边界上） */
+const scrollStripBy = (direction: 1 | -1) => {
+  const el = workspaceTabsRef.value;
+  if (!el) return;
+  el.scrollBy({ left: direction * Math.max(120, el.clientWidth * 0.7), behavior: "smooth" });
+};
+
+/**
+ * 把当前选中的页签滚进可视区。
+ *
+ * 移动端这条是横向滚动的，滚动条又刻意隐藏了：切到「专家团」这种靠右的页签后，
+ * 它可能仍停在屏幕外，用户只看到样式变了一下却找不到是哪个被选中。
+ * 用 `inline: 'nearest'` 只在必要时滚动，`block: 'nearest'` 保证不会带着整页上下跳。
+ */
+const ensureActiveTabVisible = () => {
+  void nextTick(() => {
+    workspaceTabsRef.value
+      ?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+      ?.scrollIntoView({ inline: "nearest", block: "nearest" });
+    updateScrollHints();
+  })
+}
+
 const switchWorkspaceTab = (tab: AgentWorkspaceTab) => {
   workspaceTab.value = tab
   // 写回 URL：否则刷新会跳回默认视图，站内信在同路由内 push 时也读不到新 query
@@ -1215,17 +1475,26 @@ const switchWorkspaceTab = (tab: AgentWorkspaceTab) => {
   else query.agents_tab = tab
   void router.replace({ query })
   if (tab !== 'mine') void refreshShareCounts()
+  ensureActiveTabVisible()
 }
+
+// 分享计数、授权列表都是异步拉回来的，页签宽度会变，箭头状态得跟着重算
+watch(
+  () => workspaceTabs.value.length,
+  () => nextTick(updateScrollHints),
+);
 
 // 已经在本页时点站内信只改 query，组件复用不会重新挂载，必须监听
 watch(
   () => route.query.agents_tab,
   (raw) => {
     const next = String(raw || '')
-    const allowed: AgentWorkspaceTab[] = ['received', 'sent', 'mine', 'all', 'teams']
-    if (next && allowed.includes(next as AgentWorkspaceTab)) {
+    const allowed: AgentWorkspaceTab[] = ['received', 'sent', 'mine', 'all', 'assigned', 'teams']
+    if (next && allowed.includes(next as AgentWorkspaceTab) && isTabAvailableForRole(next)) {
       workspaceTab.value = next as AgentWorkspaceTab
       if (next !== 'mine') void refreshShareCounts()
+      // 从站内信/URL 直达靠右的页签时同样要让它可见
+      ensureActiveTabVisible()
     }
   },
 )
@@ -1276,6 +1545,16 @@ const onSystemChanged = () => {
 
 /** 标题旁的总数：原来由「全部 N」那个 tab 承担，tab 取消后放这里 */
 const totalAgentCount = computed(() => agents.value.length)
+
+/**
+ * 头部「共 N 个」跟随当前视图。
+ *
+ * 「分配给我」的数据不在 agents.value 里（那是管理台列表），直接用
+ * totalAgentCount 会出现「共 2 个」却摆着 3 张卡片的错位。
+ */
+const headerAgentCount = computed(() =>
+  workspaceTab.value === 'assigned' ? assignedAgents.value.length : totalAgentCount.value
+)
 
 // 配置异常：已发布版本绑定的模型不可用（model_issue），或引用了已失效的工具/MCP（tool_issue）。
 // 两类判定都在后端完成（LOCAL 引擎的已启用智能体才返回），这里只做汇总展示。
@@ -1439,7 +1718,14 @@ const filteredTeams = computed<AIAgent[]>(() => {
   })
 })
 
-const filteredAgents = computed(() => {
+/**
+ * 当前视图 + 关键词 + 所有筛选条件命中的智能体，**不含业务分组**。
+ *
+ * 页签上的数字直接来自这里，因此天然满足「页签数字 = 点进去看到的条数」——
+ * 这一页有十来个筛选条件，如果页签只算搜索，用户勾了「只看已启用」后会看到
+ * 「页签说 5、点进去 3」。分组过滤放在下游的 filteredAgents 里。
+ */
+const agentsMatchingFilters = computed<AIAgent[]>(() => {
   let result = [...agents.value];
 
   // 0. 工作区视图：「全部」看平台所有智能体（管理员），「我的智能体」只看自己名下。
@@ -1470,9 +1756,7 @@ const filteredAgents = computed(() => {
   // 2. Filter by Status
   if (statusFilter.value !== "all") {
     const isEnabled = statusFilter.value === "enabled";
-    result = result.filter((a) => a.is_enabled === isEnabled); // Handles undefined as false in strict check, but usually true. Check default.
-    // Actually is_enabled defaults to true if missing in some legacy checks, but API returns boolean.
-    // Let's assume boolean.
+    // 只跑一次：先按 `===` 过滤会把 undefined 丢掉，后面再 `?? true` 也救不回来。
     result = result.filter((a) => (a.is_enabled ?? true) === isEnabled);
   }
 
@@ -1523,7 +1807,138 @@ const filteredAgents = computed(() => {
     );
   }
 
-  // 4. Sort: sort_order (descending), then is_system (descending), then Alphabetical
+  return result;
+});
+
+/* ---------------- 业务分组 ---------------- */
+
+/** 分组筛选的哨兵值，与「未分组」页签、下拉共用同一个常量 */
+const UNGROUPED_AGENT_GROUP = '__ungrouped__'
+
+/** 智能体的业务分组名（归一口径：去空白，空白即未分组） */
+const agentGroupName = (agent: AIAgent) => String(agent.group_name || '').trim()
+
+/**
+ * 交给共享分组模块的形状映射。`computeGroupTabs` 与工具注册表、元数据管理、技能工作台
+ * 用的是同一份实现，所以页签顺序、未分组固定末位、同名按中文排序这些规则不会各页一套。
+ */
+const toGroupableAgent = (agent: AIAgent): GroupableTool => ({
+  id: agent.id,
+  name: agent.name,
+  display_name: agent.display_name,
+  description: agent.description,
+  is_active: agent.is_enabled ?? true,
+  group_name: agent.group_name ?? '',
+})
+
+const agentGroupFilter = ref<string>(ALL_GROUP_KEY)
+
+/**
+ * 页签数据：输入是**已经过视图 + 关键词 + 全部筛选**的列表，filters 传空，
+ * 于是每个数字就等于「切到这一组能看到的条数」。
+ */
+const agentGroupTabsData = computed(() =>
+  computeGroupTabs(agentsMatchingFilters.value.map(toGroupableAgent), {}, UNGROUPED_AGENT_GROUP),
+)
+const agentGroupTabs = computed(() => agentGroupTabsData.value.items)
+
+/**
+ * 分组页签是否显示。默认显示，用户手动收起后记住选择。
+ *
+ * 分组页签是「浏览辅助」——不认识业务域的人靠它认路，认识的人只想看列表。
+ * 常驻一行在后者眼里就是白占高度，所以给个开关；收起后按钮仍在原位，
+ * 不会出现「藏起来就再也找不到」。
+ */
+const AGENT_GROUP_TABS_VISIBLE_KEY = 'agent-management:group-tabs-visible'
+
+const readAgentGroupTabsVisible = (): boolean => {
+  try {
+    const raw = localStorage.getItem(AGENT_GROUP_TABS_VISIBLE_KEY)
+    return raw === null ? true : raw !== '0'
+  } catch {
+    return true
+  }
+}
+
+const agentGroupTabsVisible = ref(readAgentGroupTabsVisible())
+
+watch(agentGroupTabsVisible, (visible) => {
+  try {
+    localStorage.setItem(AGENT_GROUP_TABS_VISIBLE_KEY, visible ? '1' : '0')
+  } catch {
+    /* 隐私模式下写不进去：不影响本次会话的显示状态 */
+  }
+})
+
+/**
+ * 只有「全部 + 未分组」两个页签时没有信息量（一个分组都还没建），
+ * 整行连开关一起不出现——否则用户第一次进来会先学会点一个没用的开关。
+ */
+const agentGroupTabsAvailable = computed(() => agentGroupTabs.value.length > 2)
+
+/** 开关只在两个浏览视图、且确实有分组可看时出现 */
+const canToggleAgentGroupTabs = computed(
+  () =>
+    (workspaceTab.value === 'mine' || workspaceTab.value === 'all') &&
+    agentGroupTabsAvailable.value,
+)
+
+const showAgentGroupTabs = computed(
+  () => canToggleAgentGroupTabs.value && agentGroupTabsVisible.value,
+)
+
+/**
+ * 页签整行消失时必须退回「全部」。
+ *
+ * 两种会让它消失：只剩「全部 + 一个分组」（`length > 2` 不成立），或用户手动收起。
+ * 这两种情况下页面上**没有任何切回「全部」的入口**——典型触发路径：在「未分组」页签里
+ * 把最后一个未分组智能体归进了某个分组，页签条随之消失，而 `agentGroupFilter` 还停在
+ * `__ungrouped__`，列表空着、也没有按钮能点回「全部」，用户只能刷新。
+ * （下面那个 watch 特意放行 `UNGROUPED_AGENT_GROUP`，是为了搜索时不被踢出当前页签，
+ * 它解决不了页签条整个消失的情况。）
+ */
+watch(showAgentGroupTabs, (visible) => {
+  if (!visible && agentGroupFilter.value !== ALL_GROUP_KEY) {
+    agentGroupFilter.value = ALL_GROUP_KEY
+  }
+})
+
+/** 全量分组名（不受筛选影响）：给「设置分组」弹窗与「分组」下拉做候选，避免同一业务域两种写法 */
+const agentGroupOptions = computed(() => {
+  const names = new Set<string>()
+  for (const agent of agents.value) {
+    const name = agentGroupName(agent)
+    if (name) names.add(name)
+  }
+  return Array.from(names).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+})
+
+// 切视图 / 切二级菜单回「全部」：停在一个当前视图里不存在的分组上会看到空列表
+watch([workspaceTab], () => {
+  agentGroupFilter.value = ALL_GROUP_KEY
+})
+
+// 选中分组被搜索/筛选清空、或分组名被改掉后回「全部」；
+// 首屏加载期跳过（列表还空着，会把用户刚点的分组清掉）
+watch(agentGroupTabsData, (data) => {
+  if (!agents.value.length) return
+  const exists =
+    agentGroupFilter.value === ALL_GROUP_KEY ||
+    agentGroupFilter.value === UNGROUPED_AGENT_GROUP ||
+    data.items.some((item) => item.key === agentGroupFilter.value)
+  if (!exists) agentGroupFilter.value = ALL_GROUP_KEY
+})
+
+/** 列表实际渲染的智能体：在筛选结果上再套一层业务分组，最后排序 */
+const filteredAgents = computed<AIAgent[]>(() => {
+  let result = [...agentsMatchingFilters.value];
+  if (agentGroupFilter.value === UNGROUPED_AGENT_GROUP) {
+    result = result.filter((a) => !agentGroupName(a));
+  } else if (agentGroupFilter.value !== ALL_GROUP_KEY) {
+    result = result.filter((a) => agentGroupName(a) === agentGroupFilter.value);
+  }
+
+  // 5. Sort: sort_order (descending), then is_system (descending), then Alphabetical
   return result.sort((a, b) => {
     if (isMainAgent(a) !== isMainAgent(b)) return isMainAgent(a) ? -1 : 1;
     if ((a.is_enabled ?? true) !== (b.is_enabled ?? true)) {
@@ -1672,12 +2087,24 @@ const clearAllAgentFilters = () => {
 };
 
 const canDragAgents = computed(
-  () => !hasActiveAgentFilters.value && userInfo.value?.role === "admin" && !loading.value,
+  () =>
+    !hasActiveAgentFilters.value &&
+    agentGroupFilter.value === ALL_GROUP_KEY &&
+    userInfo.value?.role === "admin" &&
+    !loading.value,
 );
 
 // 普通用户只看到自己创建的智能体（系统内置的不再出现），空列表要说明原因，
 // 否则会以为系统坏了或权限丢了。
 const emptyStateMessage = computed(() => {
+  // 选中某个业务分组时的空列表与「一个智能体都没有」是两回事，必须最先区分：
+  // 否则用户点了「未分组」看到「你还没有创建智能体」，会以为数据没了
+  if (agentGroupFilter.value !== ALL_GROUP_KEY) {
+    if (agentGroupFilter.value === UNGROUPED_AGENT_GROUP) {
+      return "当前的搜索与筛选条件下没有未分组的智能体——都已经归好类了。";
+    }
+    return `「${agentGroupFilter.value}」分组在当前的搜索与筛选条件下没有智能体，换个分组或清掉筛选看看。`;
+  }
   if (!hasActiveAgentFilters.value && userInfo.value?.role !== "admin") {
     return "你还没有创建智能体。系统内置智能体由管理员维护，已授权的可以直接在对话里使用。";
   }
@@ -1801,6 +2228,19 @@ const versionForm = ref<Partial<AIAgentVersion>>({
   skills: [],
   comment: "",
 });
+/**
+ * 新建向导里「用户是否亲手动过工具选择」。
+ *
+ * 新建时后端先按模板（main / chat-bi / knowledge-base）把 V1 草稿整份建出来，模板里的
+ * 工具也随之落库。保存时若把「模板工具 + 用户勾选」取并集，用户在向导里取消掉的工具
+ * 会被模板原样塞回来——表现就是「我只选了系统自治工具，保存后多出二十多个」。
+ * 工具是用户显式决定的集合：动过就以用户选择为准；完全没进工具步骤时才沿用模板，
+ * 保留「套模板」的初始可用能力。
+ */
+const toolSelectionTouched = ref(false);
+const markToolSelectionTouched = () => {
+  toolSelectionTouched.value = true;
+};
 type OnboardingStep = "BASIC" | "VERSION" | "RESOURCE";
 const isOnboardingFlow = ref(false);
 const onboardingStep = ref<OnboardingStep>("BASIC");
@@ -1833,6 +2273,16 @@ const availableTools: Array<{ name: string; description: string; isSystem: boole
   {
     name: "search_knowledge_base",
     description: "搜索知识库 (RAGFlow)。dataset_ids 用纯 ID、逗号分隔或单引号列表 ['id1','id2']，勿用 [\"id\"]",
+    isSystem: true,
+  },
+  {
+    name: "create_knowledge_base",
+    description: "创建个人私有知识库（仅创建者可见；工具不支持建 TEAM 级或公开库）",
+    isSystem: true,
+  },
+  {
+    name: "upload_document_to_knowledge_base",
+    description: "把本次对话附件或工作区文件上传到指定知识库，默认随后自动解析",
     isSystem: true,
   },
   {
@@ -2156,7 +2606,9 @@ const versionConfigSteps = computed<{ id: VersionConfigStep; label: string }[]>(
     return [{ id: 'agent', label: '智能体信息' }];
   }
   return [
-    ...(isCreatingAgent.value ? [{ id: 'agent' as const, label: '智能体信息' }] : []),
+    ...(isCreatingAgent.value || isOnboardingFlow.value
+      ? [{ id: 'agent' as const, label: '智能体信息' }]
+      : []),
     { id: 'model', label: '模型策略' },
     { id: 'tools', label: '工具能力' },
     { id: 'prompt', label: '系统提示词' },
@@ -2406,6 +2858,7 @@ const toggleSelectAllStatic = (label: string) => {
   if (!canEditVersion.value) return;
   const tools = getStaticGroupTools(label);
   if (tools.length === 0) return;
+  markToolSelectionTouched();
 
   const currentTools = [...(versionForm.value.tools || [])];
   if (isAllStaticGroupSelected(label)) {
@@ -2561,6 +3014,8 @@ const removeStaleToolRefs = (names: string[]) => {
   });
   const removed = before - (versionForm.value.tools || []).length;
   if (removed > 0) {
+    // 用户主动清理了失效引用，同样算「动过工具选择」：保存时不得再把模板工具带回来。
+    markToolSelectionTouched();
     versionToolHealth.value = versionToolHealth.value.filter((item) => !targets.has(item.name));
     showToast(`已移除 ${removed} 项失效引用，保存版本后生效`, 'success');
   }
@@ -2877,6 +3332,7 @@ const startAgentCreation = () => {
     is_expert_team_lead: false,
     team_profile: { name: "", intro: "" },
     engine_type: "LOCAL",
+    group_name: "",
     engine_config: {
       dataset_ids: [],
       safety_check_enabled: true,
@@ -2888,6 +3344,8 @@ const startAgentCreation = () => {
   };
   selectedMarkdownTheme.value = "default";
   hideMessageBorder.value = true;
+  // 新一轮新建从「没动过工具」开始：只有用户真的勾选/取消过，才按用户选择提交。
+  toolSelectionTouched.value = false;
   versionForm.value = {
     model_name: "",
     temperature: globalModelTemperature.value,
@@ -2907,6 +3365,40 @@ const startAgentCreation = () => {
   showVersionModal.value = true;
   resetAgentNameCheckState();
 };
+
+/**
+ * 「设置分组」小弹窗的状态。
+ *
+ * 只改 `group_name` 一列，走专用端点：整表单 PUT 会连带校验「待审冻结」「引擎不可改」
+ * 「是否系统级不能改」，用户只是归个类，不该因为正在审核被拒。
+ */
+const agentGroupDialog = ref<{ agent: AIAgent; value: string } | null>(null)
+const savingAgentGroup = ref(false)
+
+const openAgentGroupDialog = (agent: AIAgent) => {
+  agentGroupDialog.value = { agent, value: agentGroupName(agent) }
+}
+
+const saveAgentGroup = async () => {
+  const target = agentGroupDialog.value
+  if (!target || savingAgentGroup.value) return
+  savingAgentGroup.value = true
+  try {
+    const updated = await agentApi.updateAgentGroup(
+      target.agent.id,
+      target.value.trim() || null,
+    )
+    // 就地更新：整页重拉会把用户的搜索词、页签滚动位置和卡片拖拽顺序一起抖掉
+    target.agent.group_name = updated.data?.group_name ?? null
+    const name = agentGroupName(target.agent)
+    agentGroupDialog.value = null
+    showToast(name ? `已归入「${name}」分组` : "已设为未分组", "success")
+  } catch (e: any) {
+    showToast(e?.response?.data?.detail || "设置分组失败", "error")
+  } finally {
+    savingAgentGroup.value = false
+  }
+}
 
 const openAgentModal = (agent?: AIAgent) => {
   // 每次打开都清空上一次的重名结论，避免残留提示误伤当前智能体
@@ -2937,9 +3429,13 @@ const openAgentModal = (agent?: AIAgent) => {
         name: agent.team_profile?.name || "",
         intro: agent.team_profile?.intro || "",
       },
+      // 同上：null（未分组）在输入框里要落成空串
+      group_name: agent.group_name || "",
     };
     selectedMarkdownTheme.value = agent.engine_config?.default_markdown_theme || "default";
-    hideMessageBorder.value = agent.engine_config?.hide_message_border === true;
+    // 缺省即开启（与 EmbedChat 的 ?? true 对齐）；只有显式 false 才关闭，
+    // 否则打开历史数据再保存会把「显示外框」悄悄翻成关闭。
+    hideMessageBorder.value = agent.engine_config?.hide_message_border !== false;
     if (isExternalEngine(agentForm.value.engine_type)) {
       agentForm.value.agent_type = "GENERAL";
     }
@@ -3004,6 +3500,7 @@ const openAgentModal = (agent?: AIAgent) => {
       is_enabled: true,
       engine_type: "LOCAL",
       engine_config: null,
+      group_name: "",
     };
     engineConfigUI.value = {
         app_id: "",
@@ -3246,9 +3743,25 @@ const publishOnboarding = async () => {
     showAgentModal.value = false;
     fetchAgents();
   } catch (error: any) {
-    const detail = error.response?.data?.detail;
-    const missing = Array.isArray(detail?.missing) ? detail.missing.join("、") : "";
-    showToast(missing ? `尚未就绪：${missing}` : "发布失败", "error");
+    const payload = error.response?.data;
+    const readiness = payload?.data;
+    const labels: Record<string, string> = {
+      published_version: "发布版本",
+      primary_capability: "主类型能力",
+      dataset_binding: "数据集绑定",
+      data_query_tool: "查数工具",
+      knowledge_base_binding: "知识库绑定",
+      knowledge_base_tool: "知识库检索工具",
+    };
+    const missing = Array.isArray(readiness?.missing)
+      ? readiness.missing.map((item: string) => labels[item] || item).join("、")
+      : "";
+    showToast(
+      readiness?.code === "AGENT_NOT_READY"
+        ? `尚未就绪：${missing}`
+        : (typeof payload?.detail === "string" ? payload.detail : "发布失败"),
+      "error",
+    );
   }
 };
 
@@ -3268,7 +3781,20 @@ const continueAgentOnboarding = async (agent: AIAgent) => {
     onboardingAgent.value = agent;
     onboardingVersion.value = draft;
     selectedAgent.value = agent;
-    agentForm.value = { ...agent };
+    // 深拷贝可变嵌套对象，避免继续向导里改了一半未保存直接关闭时污染列表里的原卡片数据
+    agentForm.value = {
+      ...agent,
+      capabilities: [...(agent.capabilities || [])],
+      engine_config: agent.engine_config
+        ? {
+            ...agent.engine_config,
+            dataset_ids: Array.isArray(agent.engine_config.dataset_ids)
+              ? [...agent.engine_config.dataset_ids]
+              : agent.engine_config.dataset_ids,
+          }
+        : {},
+      team_profile: agent.team_profile ? { ...agent.team_profile } : { name: "", intro: "" },
+    };
     versionForm.value = { ...draft };
     engineConfigUI.value.dataset_ids = Array.isArray(agent.engine_config?.dataset_ids)
       ? agent.engine_config.dataset_ids.join(",")
@@ -3284,7 +3810,9 @@ const continueAgentOnboarding = async (agent: AIAgent) => {
     resetAgentNameCheckState();
     fetchTools();
     toolSearchQuery.value = "";
-    versionConfigStep.value = "model";
+    // BASIC 副本要先改名/换头像，直接落到「智能体信息」；
+    // 已经到 VERSION/RESOURCE 的继续从模型策略往下走。
+    versionConfigStep.value = agent.onboarding_step === "BASIC" ? "agent" : "model";
     showVersionModal.value = true;
   } catch (error) {
     showToast("加载未完成配置失败", "error");
@@ -3303,6 +3831,8 @@ const openVersionModal = (
   isClone: boolean = false
 ) => {
   isCreatingAgent.value = false;
+  // 从「继续向导」退出后再走普通建版本，不能把 onboarding 的步骤条带进来。
+  isOnboardingFlow.value = false;
   fetchTools();
   // This might be called from Drawer emit
   if (version) {
@@ -3375,15 +3905,21 @@ const handleDrawerPublishVersion = (version: AIAgentVersion) => {
         if (selectedAgent.value) {
           await agentApi.publishVersion(selectedAgent.value.id, version.id);
           showToast("版本发布成功", "success");
-          // Refresh drawer list
+          // Drawer 只刷新自己的版本列表；卡片上的已发布版本号/就绪状态
+          // 来自 fetchAgents，不刷新就会一直显示发布前的数据。
+          await fetchAgents();
+          const updatedAgent = agents.value.find((item) => item.id === selectedAgent.value?.id);
+          if (updatedAgent) selectedAgent.value = updatedAgent;
           if (versionsDrawerRef.value && versionsDrawerRef.value.refresh) {
             versionsDrawerRef.value.refresh();
           }
         }
       } catch (e) {
         const error = e as any;
-        const detail = error?.response?.data?.detail;
-        const missing = Array.isArray(detail?.missing) ? detail.missing : [];
+        // 全局异常处理器把结构化 detail 放在 data 里，detail 只剩业务码字符串。
+        const payload = error?.response?.data;
+        const readiness = payload?.data;
+        const missing = Array.isArray(readiness?.missing) ? readiness.missing : [];
         const labels: Record<string, string> = {
           published_version: "发布版本",
           primary_capability: "主类型能力",
@@ -3393,9 +3929,9 @@ const handleDrawerPublishVersion = (version: AIAgentVersion) => {
           knowledge_base_tool: "知识库检索工具",
         };
         showToast(
-          detail?.code === "AGENT_NOT_READY"
+          readiness?.code === "AGENT_NOT_READY"
             ? `尚未就绪：${missing.map((item: string) => labels[item] || item).join("、")}`
-            : "发布失败",
+            : (typeof payload?.detail === "string" ? payload.detail : "发布失败"),
           "error",
         );
         console.error(e);
@@ -3461,6 +3997,47 @@ const openPreview = async (agent: AIAgent) => {
   window.open(`/dashboard/chat?agent_id=${encodeURIComponent(agentKey)}&preview=1`, "_blank");
 };
 
+/**
+ * 「分配给我」的进入对话。
+ *
+ * 落点按权限分流，不是为了复用取票链路而复用：
+ * - 有 `menu:ai_chat` → 平台内 `/dashboard/chat`。它有门户外壳与返回入口，
+ *   也是平台其它「进入对话」的落点（`openTeamChat` 同样跳这里）。
+ * - 没有该菜单（角色只被授了智能体） → 平台内本来就没有对话入口，
+ *   `/dashboard/chat` 的 `meta.perm` 会把他挡在门外，只能走 `/embed/chat`：
+ *   它凭 ticket 校验「能不能执行这个智能体」，不依赖门户菜单。
+ *
+ * 两条路径都不带 `preview=1`：preview 是管理者试跑语义（强制干净临时会话、
+ * 不写续接指针），使用者要的是正常对话，应该续接自己的历史。
+ */
+const openAssignedChat = async (agent: AIAgent) => {
+  const agentKey = agent.name || agent.id
+  if (hasMenuPerm('menu:ai_chat')) {
+    // 平台内对话页按 id 解析（与 openTeamChat 一致），不走 name
+    window.open(`/dashboard/chat?agent_id=${encodeURIComponent(agent.id || agentKey)}`, '_blank')
+    return
+  }
+  try {
+    const res = await axios.post('/api/v1/embed/tickets', {
+      agent_id: agentKey,
+      expires_in: 300,
+    })
+    if (res.data?.code === 200 && res.data.data?.ticket) {
+      const ticket = res.data.data.ticket
+      window.open(
+        `/embed/chat?ticket=${encodeURIComponent(ticket)}&agent_id=${encodeURIComponent(agentKey)}&theme=light`,
+        '_blank'
+      )
+      return
+    }
+  } catch (e) {
+    console.warn('Failed to generate embed ticket for assigned agent', e)
+  }
+  // 没有对话菜单权限时没有可靠的平台内落点：明确告知失败，
+  // 而不是把用户弹到会被路由守卫拦住的页面
+  showToast('打开对话失败，请稍后重试', 'error')
+}
+
 const createExternalEngineAgent = async () => {
   agentForm.value.agent_type = 'GENERAL';
   agentForm.value.capabilities = normalizeAgentCapabilities(
@@ -3513,15 +4090,31 @@ const persistNewAgentDraft = async (closeAfterSave: boolean) => {
   }
 
   const desiredVersion = { ...versionForm.value };
-  const rawDatasetIds = agentForm.value.engine_config?.dataset_ids ?? engineConfigUI.value.dataset_ids;
+  const rawDatasetIds =
+    agentForm.value.engine_config?.dataset_ids !== undefined
+      ? agentForm.value.engine_config.dataset_ids
+      : engineConfigUI.value.dataset_ids;
   const datasetIds = (Array.isArray(rawDatasetIds) ? rawDatasetIds : String(rawDatasetIds || '').split(','))
     .map((value) => String(value).trim()).filter(Boolean);
+  // 新向导第 1 步直接改的是 agentForm.engine_config；父组件这两个 ref 只是
+  // 编辑弹窗的镜像。保存时必须让用户在新向导里选的值优先，否则会被初始
+  // 的 default/true 覆盖，表现就是「选了主题，保存后全丢」。
+  const currentEngineConfig = agentForm.value.engine_config || {};
+  const resolvedTheme = typeof currentEngineConfig.default_markdown_theme === 'string'
+    && currentEngineConfig.default_markdown_theme
+    ? currentEngineConfig.default_markdown_theme
+    : selectedMarkdownTheme.value;
+  const resolvedHideBorder = typeof currentEngineConfig.hide_message_border === 'boolean'
+    ? currentEngineConfig.hide_message_border
+    : hideMessageBorder.value;
   agentForm.value.engine_config = {
     ...(agentForm.value.engine_config || {}),
     dataset_ids: datasetIds,
-    default_markdown_theme: selectedMarkdownTheme.value,
-    hide_message_border: hideMessageBorder.value,
+    default_markdown_theme: resolvedTheme,
+    hide_message_border: resolvedHideBorder,
   };
+  selectedMarkdownTheme.value = resolvedTheme;
+  hideMessageBorder.value = resolvedHideBorder;
   isPersistingNewAgent.value = true;
   try {
     if (!isLocalCreationEngine.value) {
@@ -3537,11 +4130,25 @@ const persistNewAgentDraft = async (closeAfterSave: boolean) => {
     selectedAgent.value = created.data.agent;
 
     const toolName = (item: any) => typeof item === 'string' ? item : item?.name;
-    const mergedToolMap = new Map<string, any>();
-    for (const item of [...(created.data.version.tools || []), ...(desiredVersion.tools || [])]) {
-      const name = toolName(item);
-      if (name) mergedToolMap.set(name, item);
-    }
+    const normalizeToolList = (items: any[]) => {
+      // 按工具名去重、保序：模板里的对象配置与用户的选择可能同名，后者覆盖前者。
+      const map = new Map<string, any>();
+      for (const item of items || []) {
+        const name = toolName(item);
+        if (name) map.set(name, item);
+      }
+      return [...map.values()];
+    };
+    /**
+     * 工具按「用户选择即权威」提交。
+     *
+     * 动过工具选择就只提交用户勾中的那一份——与模板取并集会让模板里的工具永远删不掉，
+     * 用户明明只选了系统自治工具，保存后却带回模板的整份工具列表。
+     * 完全没进工具步骤时才并入模板工具，保留新建时「开箱可用」的初始能力。
+     */
+    const submittedTools = toolSelectionTouched.value
+      ? normalizeToolList(desiredVersion.tools || [])
+      : normalizeToolList([...(created.data.version.tools || []), ...(desiredVersion.tools || [])]);
     const updated = await agentApi.updateVersion(
       created.data.agent.id,
       created.data.version.id,
@@ -3549,7 +4156,7 @@ const persistNewAgentDraft = async (closeAfterSave: boolean) => {
         ...created.data.version,
         ...desiredVersion,
         model_name: desiredVersion.model_name || created.data.version.model_name,
-        tools: [...mergedToolMap.values()],
+        tools: submittedTools,
         system_prompt: desiredVersion.system_prompt?.trim() || created.data.version.system_prompt,
         skills_custom: !!desiredVersion.skills_custom,
         skills: desiredVersion.skills_custom ? (desiredVersion.skills || []) : [],
@@ -3577,6 +4184,9 @@ const handleVersionEditorClose = async () => {
     return;
   }
   showVersionModal.value = false;
+  if (isOnboardingFlow.value) {
+    await fetchAgents();
+  }
 };
 
 /**
@@ -3616,6 +4226,68 @@ const syncAgentEngineConfigFromForm = async () => {
   }
 };
 
+/**
+ * 「继续向导」时第 1 步改的是 agentForm，但版本保存接口只提交 versionForm。
+ * 不在这里把元数据同步回 ai_agents，用户改的名字、头像、描述会在保存后全部丢失。
+ */
+const syncOnboardingAgentMeta = async (): Promise<boolean> => {
+  if (!isOnboardingFlow.value || isCreatingAgent.value) return true;
+  const agent = selectedAgent.value;
+  if (!agent) return true;
+  if (!agentForm.value.name || !agentForm.value.display_name) {
+    showToast("请完善智能体标识和名称", "warning");
+    versionConfigStep.value = "agent";
+    return false;
+  }
+  const nameConflict = await ensureAgentNameUsable();
+  if (nameConflict) {
+    showToast(nameConflict, "warning");
+    versionConfigStep.value = "agent";
+    return false;
+  }
+  // 继续向导第 3 步绑定知识库写的是 engineConfigUI.dataset_ids（或手动输入逗号串），
+  // 必须与 persistNewAgentDraft 一样归一成 string[] 写进 engine_config.dataset_ids。
+  const rawDatasetIds =
+    agentForm.value.engine_config?.dataset_ids !== undefined
+      ? agentForm.value.engine_config.dataset_ids
+      : engineConfigUI.value.dataset_ids;
+  const datasetIds = (
+    Array.isArray(rawDatasetIds) ? rawDatasetIds : String(rawDatasetIds || "").split(",")
+  )
+    .map((value) => String(value).trim())
+    .filter(Boolean);
+  const nextEngineConfig = {
+    ...(agentForm.value.engine_config || {}),
+    dataset_ids: datasetIds,
+  };
+  agentForm.value.engine_config = nextEngineConfig;
+  try {
+    const response = await agentApi.updateAgent(agent.id, {
+      ...agent,
+      name: agentForm.value.name,
+      display_name: agentForm.value.display_name,
+      description: agentForm.value.description,
+      avatar_url: agentForm.value.avatar_url,
+      capabilities: agentForm.value.capabilities,
+      agent_type: agentForm.value.agent_type,
+      sort_order: agentForm.value.sort_order,
+      is_enabled: agentForm.value.is_enabled,
+      is_expert_team_lead: agentForm.value.is_expert_team_lead,
+      team_profile: agentForm.value.team_profile,
+      engine_type: agentForm.value.engine_type,
+      engine_config: nextEngineConfig,
+      is_system: agent.is_system,
+    } as any);
+    selectedAgent.value = response.data;
+    onboardingAgent.value = response.data;
+    return true;
+  } catch (error: any) {
+    showToast(error.response?.data?.detail || "智能体信息保存失败", "error");
+    versionConfigStep.value = "agent";
+    return false;
+  }
+};
+
 const saveVersion = async () => {
   if (isCreatingAgent.value) {
     await persistNewAgentDraft(isLocalCreationEngine.value);
@@ -3634,6 +4306,8 @@ const saveVersion = async () => {
     toolTab.value = 'skills';
     return;
   }
+
+  if (!(await syncOnboardingAgentMeta())) return;
 
   const payload = {
     ...versionForm.value,
@@ -3657,14 +4331,8 @@ const saveVersion = async () => {
     }
     await syncAgentEngineConfigFromForm();
     showVersionModal.value = false;
-    showVersionModal.value = false;
-    // Notify Drawer to update if open?
-    // We can rely on refetching versions in drawer if we pass a signal or just refetch agent list?
-    // Actually the drawer handles its own data loading. We can just force it to reload via a ref or key.
-    // For now, let's just show toast. The drawer needs a refresh method. Or we can just close modal.
-    // Ideally use event bus or provide/inject.
-    // Let's assume we re-open drawer logic or use a ref on the component.
-    // For simplicity:
+    // 卡片上的版本号/就绪状态来自 fetchAgents；只刷新抽屉的话列表会停在旧数据。
+    await fetchAgents();
     if (versionsDrawerRef.value) {
       versionsDrawerRef.value.refresh();
     }
@@ -3699,6 +4367,7 @@ const publishVersionFromEditor = async () => {
       if (!saved) return;
     } else {
       if (!selectedAgent.value) return;
+      if (!(await syncOnboardingAgentMeta())) return;
       const payload = {
         ...versionForm.value,
         tools: normalizeDelegationToolsForSubmit(versionForm.value.tools || []),
@@ -3731,18 +4400,26 @@ const publishVersionFromEditor = async () => {
     await fetchAgents();
     if (versionsDrawerRef.value) versionsDrawerRef.value.refresh();
   } catch (error: any) {
-    const detail = error.response?.data?.detail;
+    const payload = error.response?.data;
+    const readiness = payload?.data;
     const labels: Record<string, string> = {
       published_version: "可发布版本",
+      primary_capability: "主类型能力",
+      dataset_binding: "数据集绑定",
       data_query_tool: "查数工具",
       knowledge_base_tool: "知识库检索工具",
       knowledge_base_binding: "知识库绑定",
       knowledge_base: "知识库",
     };
-    const missing = Array.isArray(detail?.missing)
-      ? detail.missing.map((item: string) => labels[item] || item).join("、")
+    const missing = Array.isArray(readiness?.missing)
+      ? readiness.missing.map((item: string) => labels[item] || item).join("、")
       : "";
-    showToast(missing ? `尚未就绪：缺少${missing}` : (detail?.message || detail || "发布失败"), "error");
+    showToast(
+      readiness?.code === "AGENT_NOT_READY"
+        ? `尚未就绪：缺少${missing}`
+        : (typeof payload?.detail === "string" ? payload.detail : "发布失败"),
+      "error",
+    );
   }
 };
 
@@ -3864,6 +4541,7 @@ const normalizeDelegationToolsForSubmit = (tools: any[]): any[] => {
 
 const toggleTool = (toolName: string) => {
   if (!canEditVersion.value) return;
+  markToolSelectionTouched();
   const tools = [...(versionForm.value.tools || [])];
 
   // 两个委派工具共用一个开关：开启时成对写入（否则模型没有并行委派入口），
@@ -3958,6 +4636,7 @@ const isAllMcpSelected = (_serverName: string, tools: any[]) => {
 
 const toggleSelectAllMcp = (serverName: string, tools: any[]) => {
   if (!canEditVersion.value) return;
+  markToolSelectionTouched();
   const currentTools = [...(versionForm.value.tools || [])];
   const allSelected = isAllMcpSelected(serverName, tools);
 
@@ -3983,22 +4662,76 @@ const toggleSelectAllMcp = (serverName: string, tools: any[]) => {
   versionForm.value.tools = currentTools;
 };
 
-const getToolCustomConfig = (toolName: string) => {
-  const found = versionForm.value.tools?.find(t =>
-    (typeof t !== 'string' && (t as any).name === toolName)
+/**
+ * 工具级高级配置摘要：决定版本配置页里齿轮是否点亮、角标几项、摘要写什么。
+ *
+ * 只计入本工具自己的高级参数（执行超时 / 温度 / 描述覆盖）；
+ * 数据集绑定、调度范围各有独立按钮点亮，重复计入会让「齿轮亮了」说不清亮的是什么。
+ * 判定用「值 ≠ 默认」而不是「键存在」：历史版本保存时总会写 temperature: 0，
+ * 按键判定会让所有老工具全亮，提示就失效了。
+ */
+const getToolAdvancedConfigSummary = (
+  toolName: string,
+): { count: number; parts: string[] } => {
+  const found = versionForm.value.tools?.find(
+    (t: any) => typeof t !== 'string' && t.name === toolName,
   );
-  if (found && typeof found === 'object') {
-    const cfg = found as any;
-    if (
-      cfg.model_name ||
-      (cfg.temperature !== undefined && cfg.temperature !== 0) ||
-      cfg.description_override
-    ) {
-      return cfg;
-    }
+  if (!found || typeof found === 'string') return { count: 0, parts: [] };
+  const cfg = found as any;
+  const parts: string[] = [];
+
+  const rawTimeout = cfg.timeout_seconds;
+  const timeout = Number(rawTimeout);
+  if (
+    rawTimeout !== null &&
+    rawTimeout !== undefined &&
+    rawTimeout !== '' &&
+    Number.isFinite(timeout) &&
+    timeout > 0
+  ) {
+    // 工具级是「覆盖」不是「收紧」：填多少就生效多少，摘要照抄配置值即为真实值。
+    // 超过上层默认值时补一个标记，让人一眼看出这个工具比同版本其它工具跑得久。
+    const ceiling = Number(toolTimeoutCeiling.value);
+    const aboveUpper = Number.isFinite(ceiling) && ceiling > 0 && timeout > ceiling;
+    parts.push(`超时 ${Math.round(timeout)}s${aboveUpper ? '·超上层' : ''}`);
   }
-  return null;
+
+  const rawTemperature = cfg.temperature;
+  const temperature = Number(rawTemperature);
+  if (
+    rawTemperature !== null &&
+    rawTemperature !== undefined &&
+    Number.isFinite(temperature) &&
+    temperature > 0
+  ) {
+    parts.push(`温度 ${temperature.toFixed(1)}`);
+  }
+
+  if (String(cfg.description_override ?? '').trim()) {
+    parts.push('描述覆盖');
+  }
+
+  return { count: parts.length, parts };
 };
+
+/**
+ * 上层的超时默认值（版本级优先，否则全局）：工具级留空时继承它。
+ * 注意它**不是**工具级的天花板——工具级可以超过它，界面只做提示。
+ */
+const toolTimeoutCeiling = computed<number>(() => {
+  const agentTimeout = Number(versionForm.value.toolcall_timeout_seconds);
+  if (Number.isFinite(agentTimeout) && agentTimeout > 0) return Math.round(agentTimeout);
+  const globalTimeout = Number(globalAgentToolcallTimeout.value);
+  if (Number.isFinite(globalTimeout) && globalTimeout > 0) return Math.round(globalTimeout);
+  return 180;
+});
+
+const toolTimeoutCeilingSource = computed<string>(() => {
+  const agentTimeout = Number(versionForm.value.toolcall_timeout_seconds);
+  return Number.isFinite(agentTimeout) && agentTimeout > 0
+    ? '智能体版本配置'
+    : '系统全局配置';
+});
 
 const hasToolMetadataDatasetBinding = (toolName: string) => {
   const found = versionForm.value.tools?.find(t =>
@@ -4110,6 +4843,9 @@ const delegationScopeAgents = computed(() =>
     // 列出来只会让人误以为勾上就生效。
     .filter(a => String(a.id) !== String((selectedAgent.value as any)?.id ?? ""))
     .filter(a => (a as any).is_enabled !== false)
+    // 主助手（main）不在这里过滤：它由弹窗置灰并给出「不可委派」提示，
+    // 同时用于识别存量名单里的 main 并引导清理。若在这层剔掉，老配置里的 main
+    // 会既看不见也删不掉，只能手改数据库。
     .map(a => ({
       id: String(a.id),
       name: a.name,
@@ -4445,7 +5181,6 @@ const closeReadinessPopover = () => {
 const closeCardMenus = () => {
   openCardMenuId.value = null
   activeReadinessPopoverAgentId.value = null
-  showCreateAgentMenu.value = false
   // 列表视图的「更多」菜单也归这里统一关，避免滚动/点别处后残留
   openRowMenuId.value = null
 }
@@ -4461,6 +5196,7 @@ onMounted(() => {
   if (cached) userInfo.value = JSON.parse(cached);
   void fetchPendingSystemCount();
   void refreshShareCounts();
+  void fetchAssignedAgents();
   workspaceTab.value = resolveInitialTab();
   document.addEventListener('click', closeCardMenus);
 });
@@ -4473,10 +5209,13 @@ const handleResize = () => { windowWidth.value = window.innerWidth; };
 
 onMounted(() => {
   window.addEventListener('resize', handleResize);
+  window.addEventListener('resize', updateScrollHints);
+  void nextTick(updateScrollHints);
 });
 
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize);
+  window.removeEventListener('resize', updateScrollHints);
   document.removeEventListener('click', closeCardMenus);
   clearDuplicateNameTimer();
 });
@@ -4516,11 +5255,14 @@ const formatSkillCountLabel = (agent: AIAgent) => {
          所以宽度再窄「新建智能体」也不会被单独挤到第二行。
          方案 A：标题下补一行状态摘要（待完善 / 审核中 / 已停用），
          「?」与「显示指引」收进右侧动作区，不再和主操作一起摊在标题旁。 -->
-    <div class="flex items-start justify-between gap-4">
+    <!-- 窄屏纵向堆叠：标题 + 右侧两个按钮并排时，375px 宽度下按钮区抢走
+         大半，标题被压断、状态摘要被挤成一个字一行。移动端改成标题在上、
+         按钮另起一行。 -->
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
       <div class="min-w-0">
         <div class="flex flex-wrap items-center gap-x-2.5 gap-y-1">
           <h1 class="shrink-0 whitespace-nowrap text-xl font-bold text-gray-900 sm:text-2xl">智能体中心</h1>
-          <span class="shrink-0 text-xs font-medium text-gray-500">共 {{ totalAgentCount }} 个</span>
+          <span class="shrink-0 text-xs font-medium text-gray-500">共 {{ headerAgentCount }} 个</span>
           <!-- 说明入口只作为附注：无边框、灰色小图标 -->
           <button
             type="button"
@@ -4543,7 +5285,11 @@ const formatSkillCountLabel = (agent: AIAgent) => {
         </p>
       </div>
 
-      <div class="flex shrink-0 items-center gap-2">
+      <!-- 桌面一行：显示指引 / 发布审核 / 新建。
+           窄屏只留低频入口，新建与发布审核都下移到第 2 行（与搜索框同一行）。
+           这里不能加 overflow-x-auto：新建组与筛选面板都是 absolute 定位，
+           滚动容器会把它们裁掉，看起来像点不动。放不下时用 flex-wrap 兜底。 -->
+      <div class="flex flex-wrap items-center gap-1.5 sm:shrink-0 sm:flex-nowrap sm:gap-2">
         <button
           v-if="!showAgentFlowGuide"
           type="button"
@@ -4566,8 +5312,9 @@ const formatSkillCountLabel = (agent: AIAgent) => {
           收起指引
         </button>
 
+        <!-- 窄屏让位到第 2 行（文案收成「审核」），见下方搜索行末尾 -->
         <button
-          v-if="canReviewSystem"
+          v-if="canReviewSystem && !isMobile"
           type="button"
           class="relative flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm transition-colors hover:border-primary/40 hover:text-primary"
           title="查看待审核的「发布为系统级」申请"
@@ -4590,65 +5337,25 @@ const formatSkillCountLabel = (agent: AIAgent) => {
           </span>
         </button>
 
-        <div v-has-perm="'element:agent:create'" class="relative" @click.stop>
-          <div class="flex items-stretch overflow-hidden rounded-lg shadow-sm">
-            <button
-              type="button"
-              class="flex items-center gap-1.5 whitespace-nowrap bg-primary px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-primary-dark cursor-pointer"
-              @click="startAgentCreation"
-            >
-              <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-              </svg>
-              新建智能体
-            </button>
-            <button
-              type="button"
-              class="border-l border-white/25 bg-primary px-2 text-white transition-colors hover:bg-primary-dark cursor-pointer"
-              title="更多创建方式"
-              @click="showCreateAgentMenu = !showCreateAgentMenu"
-            >
-              <svg class="h-4 w-4 transition-transform" :class="{ 'rotate-180': showCreateAgentMenu }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-              </svg>
-            </button>
-          </div>
-          <div
-            v-if="showCreateAgentMenu"
-            class="absolute right-0 top-full z-40 mt-1 w-52 overflow-hidden rounded-lg border border-gray-100 bg-white py-1 shadow-xl"
-          >
-            <button
-              type="button"
-              class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-50"
-              @click="showCreateAgentMenu = false; startAgentCreation()"
-            >
-              <svg class="h-4 w-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-              </svg>
-              空白新建
-            </button>
-            <button
-              type="button"
-              class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-50"
-              @click="showCreateAgentMenu = false; router.push('/dashboard/scenario-templates')"
-            >
-              <svg class="h-4 w-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7h16M4 12h10M4 17h7" />
-              </svg>
-              从场景模板交付
-            </button>
-          </div>
-        </div>
+        <!-- 窄屏下这颗让位给搜索行末尾（与「搜索框 + 筛选」同一行），见第 2 行 -->
+        <AgentCreateButton
+          v-if="!isMobile"
+          @create="startAgentCreation"
+          @template="router.push('/dashboard/scenario-templates')"
+        />
       </div>
     </div>
 
     <!-- 搜索、筛选与两个横幅只服务于「智能体列表」；分享视图有自己的列表，
          留着它们会让「找到 N 个智能体」这种文案指向一个完全不相关的清单 -->
     <!-- 搜索框对所有视图都保留：两个分享面板自己没有搜索，藏掉就等于没法搜。
-         批量 / 网格列表切换 / 筛选 只服务于智能体列表，仍只在一屏内显示。 -->
-    <!-- 第 2 行：搜索独占一栏，视图切换与「筛选」跟在后面 -->
+         批量 / 网格列表切换与「筛选」只服务于智能体列表，仍只在一屏内显示。
+         筛选跟在它们之后——放页头第一行会把「显示指引 / 发布审核 / 新建」挤到换行。 -->
+    <!-- 第 2 行：搜索独占一栏，批量 / 视图切换跟在后面 -->
     <div class="flex flex-wrap items-center gap-2.5">
-      <div class="relative min-w-[220px] flex-1">
+      <!-- 窄屏也常显：这一行就是「搜索 + 筛选 + 新建」的主操作条，
+           再折叠一次就只剩两颗图标，反而更难用 -->
+      <div id="agent-search-row" class="relative min-w-0 flex-1">
         <span class="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
           <svg class="h-4 w-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
@@ -4660,9 +5367,11 @@ const formatSkillCountLabel = (agent: AIAgent) => {
           :placeholder="
             workspaceTab === 'teams'
               ? '搜索专家团…'
-              : workspaceTab === 'mine' || workspaceTab === 'all'
-                ? '搜索名称或标识符…'
-                : '搜索智能体或分享人…'
+              : workspaceTab === 'assigned'
+                ? '搜索分配给我的智能体…'
+                : workspaceTab === 'mine' || workspaceTab === 'all'
+                  ? '搜索名称或标识符…'
+                  : '搜索智能体或分享人…'
           "
           class="w-full rounded-lg border border-gray-300 bg-white py-2 pl-9 pr-3 text-sm shadow-sm outline-none transition-all focus:border-primary focus:ring-2 focus:ring-primary/20"
         />
@@ -4703,155 +5412,200 @@ const formatSkillCountLabel = (agent: AIAgent) => {
             </svg>
           </button>
         </div>
+      </div>
 
-        <!-- 高级筛选：状态/类型/引擎/就绪度/来源原先散在工具栏与 7 个 tab 里，
-             现在收进一个面板，避免同一维度两处入口 -->
-        <div class="relative" @click.stop>
-          <button
-            type="button"
-            class="flex items-center gap-1.5 rounded-lg border bg-white px-3 py-2 text-sm shadow-sm transition-colors cursor-pointer"
-            :class="activeFilterCount > 0 ? 'border-primary text-primary' : 'border-gray-300 text-gray-700 hover:border-primary/40 hover:text-primary'"
-            title="按状态、类型、引擎、就绪度、来源筛选"
-            @click="filterPanelOpen = !filterPanelOpen"
+      <!-- 高级筛选：状态/类型/引擎/就绪度/来源原先散在工具栏与 7 个 tab 里，
+           现在收进一个面板，避免同一维度两处入口。
+           跟在批量 / 视图切换之后（页头第一行只留高频动作）。
+           这一行同样绝对不能加 overflow-x-auto——滚动容器会把 absolute
+           定位的面板裁掉，点筛选会看起来「打不开」。 -->
+      <!-- 窄屏不放筛选：这一行要装「搜索 + 审核 + 新建」三颗，
+           筛选是低频动作且条件有 9 项，留到桌面用 -->
+      <div
+        v-if="!isMobile && (workspaceTab === 'mine' || workspaceTab === 'all')"
+        class="relative shrink-0"
+        @click.stop
+      >
+        <button
+          type="button"
+          class="flex items-center gap-1.5 rounded-lg border bg-white px-3 py-2 text-sm shadow-sm transition-colors cursor-pointer"
+          :class="activeFilterCount > 0 ? 'border-primary text-primary' : 'border-gray-300 text-gray-700 hover:border-primary/40 hover:text-primary'"
+          title="按状态、类型、引擎、就绪度、来源筛选"
+          aria-label="筛选"
+          @click="filterPanelOpen = !filterPanelOpen"
+        >
+          <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
+          </svg>
+          <span class="hidden sm:inline">筛选</span>
+          <span
+            v-if="activeFilterCount > 0"
+            class="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-white"
           >
-            <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
-            </svg>
-            筛选
-            <span
-              v-if="activeFilterCount > 0"
-              class="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-white"
-            >
-              {{ activeFilterCount }}
-            </span>
-          </button>
+            {{ activeFilterCount }}
+          </span>
+        </button>
 
-          <div v-if="filterPanelOpen" class="fixed inset-0 z-30" @click="filterPanelOpen = false"></div>
-          <div
-            v-if="filterPanelOpen"
-            class="absolute right-0 top-full z-40 mt-1.5 max-h-[calc(100vh-9rem)] w-[560px] max-w-[calc(100vw-2rem)] overflow-y-auto rounded-xl border border-gray-100 bg-white p-4 shadow-2xl"
-          >
-            <div class="mb-3 flex items-center justify-between">
-              <span class="text-sm font-bold text-gray-800">高级筛选</span>
-              <button type="button" class="cursor-pointer rounded p-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-600" @click="filterPanelOpen = false">
-                <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
+        <div v-if="filterPanelOpen" class="fixed inset-0 z-30" @click="filterPanelOpen = false"></div>
+        <div
+          v-if="filterPanelOpen"
+          class="absolute right-0 top-full z-40 mt-1.5 max-h-[calc(100vh-9rem)] w-[560px] max-w-[calc(100vw-2rem)] overflow-y-auto rounded-xl border border-gray-100 bg-white p-4 shadow-2xl"
+        >
+          <div class="mb-3 flex items-center justify-between">
+            <span class="text-sm font-bold text-gray-800">高级筛选</span>
+            <button type="button" class="cursor-pointer rounded p-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-600" @click="filterPanelOpen = false">
+              <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <label class="block">
+              <span class="mb-1 block text-[11px] font-semibold text-gray-500">状态</span>
+              <select v-model="statusFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
+                <option value="all">全部</option>
+                <option value="enabled">已启用</option>
+                <option value="disabled">已禁用</option>
+              </select>
+            </label>
+            <label class="block">
+              <span class="mb-1 block text-[11px] font-semibold text-gray-500">类型</span>
+              <select v-model="typeFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
+                <option value="all">全部</option>
+                <option value="GENERAL">通用助手</option>
+                <option value="CHATBI">ChatBI</option>
+                <option value="KNOWLEDGE_BASE">知识库助手</option>
+              </select>
+            </label>
+            <label class="block">
+              <span class="mb-1 block text-[11px] font-semibold text-gray-500">引擎</span>
+              <select v-model="engineFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
+                <option value="all">全部</option>
+                <option value="LOCAL">LOCAL</option>
+                <option value="RAGFLOW">RAGFlow</option>
+                <option value="OPENCLAW">OpenClaw</option>
+              </select>
+            </label>
+            <label class="block">
+              <span class="mb-1 block text-[11px] font-semibold text-gray-500">就绪度</span>
+              <select v-model="readinessFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
+                <option value="all">全部</option>
+                <option value="ready">已就绪</option>
+                <option value="unready">待完善</option>
+              </select>
+            </label>
+            <label class="block">
+              <span class="mb-1 block text-[11px] font-semibold text-gray-500">来源</span>
+              <select v-model="sourceFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
+                <option value="all">全部</option>
+                <option value="system">系统级</option>
+                <option value="custom">自定义</option>
+              </select>
+            </label>
+            <label class="block">
+              <span class="mb-1 block text-[11px] font-semibold text-gray-500">权属人</span>
+              <select v-model="ownerFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
+                <option value="all">全部</option>
+                <option value="orphan">权属人已停用</option>
+              </select>
+            </label>
+          </div>
+
+          <!-- 团队：前两个是「是/否」，第三个按团主 id 过滤。
+               并排三个正好一行，与上面 6 个条件同一套视觉，不新开一层折叠。 -->
+          <div class="mt-3 border-t border-gray-100 pt-3">
+            <div class="mb-2 flex items-center gap-2 text-[11px] font-bold text-teal-700">
+              <span class="h-px flex-1 bg-teal-100"></span>
+              <span>团队</span>
+              <span class="h-px flex-1 bg-teal-100"></span>
             </div>
-
             <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
               <label class="block">
-                <span class="mb-1 block text-[11px] font-semibold text-gray-500">状态</span>
-                <select v-model="statusFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
+                <span class="mb-1 block text-[11px] font-semibold text-gray-500">专家团主专家</span>
+                <select v-model="teamLeadFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
                   <option value="all">全部</option>
-                  <option value="enabled">已启用</option>
-                  <option value="disabled">已禁用</option>
+                  <option value="yes">只看团主专家</option>
+                  <option value="no">排除团主专家</option>
                 </select>
               </label>
               <label class="block">
-                <span class="mb-1 block text-[11px] font-semibold text-gray-500">类型</span>
-                <select v-model="typeFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
+                <span class="mb-1 block text-[11px] font-semibold text-gray-500">子专家</span>
+                <select v-model="subAgentFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
                   <option value="all">全部</option>
-                  <option value="GENERAL">通用助手</option>
-                  <option value="CHATBI">ChatBI</option>
-                  <option value="KNOWLEDGE_BASE">知识库助手</option>
+                  <option value="yes">只看子专家</option>
+                  <option value="no">排除子专家</option>
                 </select>
               </label>
               <label class="block">
-                <span class="mb-1 block text-[11px] font-semibold text-gray-500">引擎</span>
-                <select v-model="engineFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
+                <span class="mb-1 block text-[11px] font-semibold text-gray-500">所属团</span>
+                <select v-model="teamFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
                   <option value="all">全部</option>
-                  <option value="LOCAL">LOCAL</option>
-                  <option value="RAGFLOW">RAGFlow</option>
-                  <option value="OPENCLAW">OpenClaw</option>
-                </select>
-              </label>
-              <label class="block">
-                <span class="mb-1 block text-[11px] font-semibold text-gray-500">就绪度</span>
-                <select v-model="readinessFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
-                  <option value="all">全部</option>
-                  <option value="ready">已就绪</option>
-                  <option value="unready">待完善</option>
-                </select>
-              </label>
-              <label class="block">
-                <span class="mb-1 block text-[11px] font-semibold text-gray-500">来源</span>
-                <select v-model="sourceFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
-                  <option value="all">全部</option>
-                  <option value="system">系统级</option>
-                  <option value="custom">自定义</option>
-                </select>
-              </label>
-              <label class="block">
-                <span class="mb-1 block text-[11px] font-semibold text-gray-500">权属人</span>
-                <select v-model="ownerFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
-                  <option value="all">全部</option>
-                  <option value="orphan">权属人已停用</option>
+                  <option v-for="team in teamFilterOptions" :key="team.id" :value="team.id">{{ team.name }}</option>
                 </select>
               </label>
             </div>
+            <p class="mt-2 text-[11px] leading-5 text-gray-400">
+              子专家＝被某个专家团的调度范围纳入的智能体。两个条件都选「是」时结果为空：团主与子专家在当前版本里不重叠。
+            </p>
+          </div>
 
-            <!-- 团队：前两个是「是/否」，第三个按团主 id 过滤。
-                 并排三个正好一行，与上面 6 个条件同一套视觉，不新开一层折叠。 -->
-            <div class="mt-3 border-t border-gray-100 pt-3">
-              <div class="mb-2 flex items-center gap-2 text-[11px] font-bold text-teal-700">
-                <span class="h-px flex-1 bg-teal-100"></span>
-                <span>团队</span>
-                <span class="h-px flex-1 bg-teal-100"></span>
-              </div>
-              <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
-                <label class="block">
-                  <span class="mb-1 block text-[11px] font-semibold text-gray-500">专家团主专家</span>
-                  <select v-model="teamLeadFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
-                    <option value="all">全部</option>
-                    <option value="yes">只看团主专家</option>
-                    <option value="no">排除团主专家</option>
-                  </select>
-                </label>
-                <label class="block">
-                  <span class="mb-1 block text-[11px] font-semibold text-gray-500">子专家</span>
-                  <select v-model="subAgentFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
-                    <option value="all">全部</option>
-                    <option value="yes">只看子专家</option>
-                    <option value="no">排除子专家</option>
-                  </select>
-                </label>
-                <label class="block">
-                  <span class="mb-1 block text-[11px] font-semibold text-gray-500">所属团</span>
-                  <select v-model="teamFilter" class="w-full rounded-lg border border-gray-300 bg-white px-2.5 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
-                    <option value="all">全部</option>
-                    <option v-for="team in teamFilterOptions" :key="team.id" :value="team.id">{{ team.name }}</option>
-                  </select>
-                </label>
-              </div>
-              <p class="mt-2 text-[11px] leading-5 text-gray-400">
-                子专家＝被某个专家团的调度范围纳入的智能体。两个条件都选「是」时结果为空：团主与子专家在当前版本里不重叠。
-              </p>
-            </div>
-
-            <!-- 条件已经 9 个，面板在小屏上会超一屏：底部操作条贴住容器底部，
-                 否则「应用」要滚到底才点得到 -->
-            <div class="sticky -bottom-4 -mx-4 mt-4 flex items-center justify-between border-t border-gray-100 bg-white px-4 pb-4 pt-3">
-              <div class="flex items-center gap-3">
-                <button type="button" class="cursor-pointer text-xs text-gray-500 hover:text-gray-700" @click="clearAllAgentFilters">
-                  重置
-                </button>
-                <!-- 应用前就能看到会剩几个：选完三个条件点应用才发现是空的最挫 -->
-                <span class="text-[11px] text-gray-400">匹配 {{ filteredAgents.length }} 个</span>
-              </div>
-              <button
-                type="button"
-                class="cursor-pointer rounded-lg bg-primary px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-primary-dark"
-                @click="filterPanelOpen = false"
-              >
-                应用
+          <!-- 条件已经 9 个，面板在小屏上会超一屏：底部操作条贴住容器底部，
+               否则「应用」要滚到底才点得到 -->
+          <div class="sticky -bottom-4 -mx-4 mt-4 flex items-center justify-between border-t border-gray-100 bg-white px-4 pb-4 pt-3">
+            <div class="flex items-center gap-3">
+              <button type="button" class="cursor-pointer text-xs text-gray-500 hover:text-gray-700" @click="clearAllAgentFilters">
+                重置
               </button>
+              <!-- 应用前就能看到会剩几个：选完三个条件点应用才发现是空的最挫 -->
+              <span class="text-[11px] text-gray-400">匹配 {{ filteredAgents.length }} 个</span>
             </div>
+            <button
+              type="button"
+              class="cursor-pointer rounded-lg bg-primary px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-primary-dark"
+              @click="filterPanelOpen = false"
+            >
+              应用
+            </button>
           </div>
         </div>
       </div>
       </template>
+
+      <!-- 窄屏：审核占原来筛选的位置，只留图标不显示文字——这一行要装
+           「搜索 + 审核 + 新建」，多两个字就把搜索框压窄一截。
+           纯图标必须有可读名称（aria-label），待审数量改成角标，否则会把按钮撑宽。 -->
+      <button
+        v-if="canReviewSystem && isMobile"
+        type="button"
+        class="relative flex shrink-0 items-center justify-center rounded-lg border border-gray-200 bg-white px-2.5 py-2 text-gray-700 shadow-sm transition-colors hover:border-primary/40 hover:text-primary"
+        title="查看待审核的「发布为系统级」申请"
+        aria-label="审核"
+        @click="openSystemReview"
+      >
+        <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"
+          />
+        </svg>
+        <span
+          v-if="pendingSystemCount > 0"
+          class="absolute -right-1 -top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-bold text-white"
+        >
+          {{ pendingSystemCount > 99 ? '99+' : pendingSystemCount }}
+        </span>
+      </button>
+
+      <!-- 窄屏：与「搜索框 + 审核」同一行，页头那颗此时不渲染 -->
+      <AgentCreateButton
+        v-if="isMobile"
+        class="shrink-0"
+        @create="startAgentCreation"
+        @template="router.push('/dashboard/scenario-templates')"
+      />
     </div>
     <!-- 智能体 5 步全流程指引：方案 A 起改为按需展开，不再常驻首屏。
          放在视图条件之外——「显示指引」按钮现在所有 tab 都出现，面板必须跟着按钮，
@@ -4981,49 +5735,212 @@ const formatSkillCountLabel = (agent: AIAgent) => {
          分享做成页面级视图而不是弹窗，否则「对方在哪看到」只能靠站内信猜。
          注意：这一段必须在上面那个 v-if 之外，否则切到分享视图时切换条自己
          也被隐藏，用户就再也点不回「我的智能体」了。 -->
-    <div
-      class="flex flex-wrap items-center gap-1.5 border-b border-gray-200 pb-2"
-      role="tablist"
-      aria-label="智能体视图"
-    >
+    <!-- 移动端一行横向滚动，不换行：换行会把「专家团」挤到第二行，
+         而这一条本身就是并列视图，分两行读起来像两组不同的东西。
+         滚动条隐藏，但保留触摸滑动与键盘 Tab 可达。 -->
+    <div class="flex items-center gap-1.5 border-b border-gray-200 pb-2">
+      <!-- 只有页签本身滚动，「隐藏分组」留在滚动区外面：
+           放进同一个滚动容器的话，它既会被挤到屏幕外，`ml-auto` 也失效
+           （滚动容器没有剩余空间可分配），窄屏下会被压成一个字一行。 -->
+      <div class="relative min-w-0 flex-1">
+        <div
+          ref="workspaceTabsRef"
+          class="flex items-center gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          role="tablist"
+          aria-label="智能体视图"
+          @scroll.passive="updateScrollHints"
+        >
+          <button
+            v-for="tab in workspaceTabs"
+            :key="tab.key"
+            type="button"
+            role="tab"
+            :aria-selected="workspaceTab === tab.key"
+            class="relative shrink-0 whitespace-nowrap rounded-lg px-3 py-1.5 text-sm font-medium transition-colors"
+            :class="workspaceTab === tab.key ? 'bg-primary/10 text-primary' : 'text-gray-600 hover:bg-gray-50'"
+            @click="switchWorkspaceTab(tab.key)"
+          >
+            <svg
+              v-if="tab.key === 'teams'"
+              class="mr-1 inline-block h-3.5 w-3.5 shrink-0 align-text-bottom"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              aria-hidden="true"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"
+              />
+            </svg>
+            {{ tab.label }}
+            <span
+              v-if="tab.key === 'teams' || tab.badge > 0"
+              class="ml-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-bold"
+              :class="
+                workspaceTab === tab.key || tab.badge > 0
+                  ? 'bg-primary text-white'
+                  : 'bg-gray-200 text-gray-600'
+              "
+            >
+              {{ tab.badge > 99 ? '99+' : tab.badge }}
+            </span>
+          </button>
+        </div>
+
+        <!-- 能滑才出现的翻页箭头：滚动条藏起来了，不给个可点的提示，
+             用户只会看到「分享给我」被切一半，以为页面坏了 -->
+        <button
+          v-if="canScrollLeft"
+          type="button"
+          class="absolute left-0 top-1/2 z-10 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full border border-gray-200 bg-white/95 text-gray-500 shadow-sm backdrop-blur transition-colors hover:text-gray-800"
+          aria-label="向左查看更多视图"
+          @click="scrollStripBy(-1)"
+        >
+          <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7" />
+          </svg>
+        </button>
+        <button
+          v-if="canScrollRight"
+          type="button"
+          class="absolute right-0 top-1/2 z-10 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full border border-gray-200 bg-white/95 text-gray-500 shadow-sm backdrop-blur transition-colors hover:text-gray-800"
+          aria-label="向右查看更多视图"
+          @click="scrollStripBy(1)"
+        >
+          <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+          </svg>
+        </button>
+      </div>
+
+      <!-- 分组页签开关：整理型用户不需要这一行，收起后列表能多显示一行。
+           固定在页签行右端，收起时按钮仍在，随时可以再展开。 -->
       <button
-        v-for="tab in workspaceTabs"
-        :key="tab.key"
+        v-if="canToggleAgentGroupTabs"
         type="button"
-        role="tab"
-        :aria-selected="workspaceTab === tab.key"
-        class="relative rounded-lg px-3 py-1.5 text-sm font-medium transition-colors"
-        :class="workspaceTab === tab.key ? 'bg-primary/10 text-primary' : 'text-gray-600 hover:bg-gray-50'"
-        @click="switchWorkspaceTab(tab.key)"
+        class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg px-2 py-1 text-xs transition-colors"
+        :class="
+          agentGroupTabsVisible
+            ? 'text-gray-500 hover:bg-gray-100'
+            : 'text-primary hover:bg-primary/5'
+        "
+        :aria-pressed="agentGroupTabsVisible"
+        :title="
+          agentGroupTabsVisible
+            ? '收起分组页签，给列表让出一行'
+            : '展开分组页签，按业务域浏览'
+        "
+        @click="agentGroupTabsVisible = !agentGroupTabsVisible"
       >
         <svg
-          v-if="tab.key === 'teams'"
-          class="mr-1 inline-block h-3.5 w-3.5 shrink-0 align-text-bottom"
-          fill="none"
+          class="h-3.5 w-3.5 shrink-0"
           viewBox="0 0 24 24"
+          fill="none"
           stroke="currentColor"
+          stroke-width="2"
           aria-hidden="true"
         >
           <path
             stroke-linecap="round"
             stroke-linejoin="round"
-            stroke-width="2"
-            d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"
+            :d="agentGroupTabsVisible ? 'M4.5 15.75l7.5-7.5 7.5 7.5' : 'M19.5 8.25l-7.5 7.5-7.5-7.5'"
           />
         </svg>
-        {{ tab.label }}
-        <span
-          v-if="tab.key === 'teams' || tab.badge > 0"
-          class="ml-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-bold"
-          :class="
-            workspaceTab === tab.key || tab.badge > 0
-              ? 'bg-primary text-white'
-              : 'bg-gray-200 text-gray-600'
-          "
-        >
-          {{ tab.badge > 99 ? '99+' : tab.badge }}
-        </span>
+        {{ agentGroupTabsVisible ? '隐藏分组' : '显示分组' }}
       </button>
+    </div>
+
+    <!-- 「分配给我」：平台授权我使用、但不是我创建的智能体，只读。
+         独立面板而不复用下面的管理列表：列表区挂着批量操作、分组页签、
+         管理筛选器，那些对使用者既无意义也会算错口径。 -->
+    <div v-if="workspaceTab === 'assigned'" class="space-y-3">
+      <div class="flex items-start gap-2 rounded-xl border border-blue-100 bg-blue-50 px-3 py-2 text-xs leading-relaxed text-blue-800">
+        <svg class="mt-0.5 h-4 w-4 shrink-0 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+        </svg>
+        <span>
+          这些智能体由平台分配给你，<b class="font-semibold">可以直接对话，但不能修改配置</b>。想定制请新建自己的智能体。
+        </span>
+      </div>
+
+      <!-- 加载中要有占位：否则面板只剩上方提示条，请求回来后突然长出卡片或空态，高度跳一下 -->
+      <div
+        v-if="!assignedAgentsLoaded"
+        class="rounded-xl border border-gray-200 bg-white py-12 text-center text-xs text-gray-400"
+      >
+        正在加载分配给你的智能体…
+      </div>
+
+      <!-- 空态要说清「为什么是空的」：只写「暂无数据」会让用户拿着空页面去找管理员，
+           而管理员那边看到的却是「明明授权了」 -->
+      <div
+        v-else-if="!filteredAssignedAgents.length"
+        class="rounded-xl border border-dashed border-gray-300 bg-white py-12 text-center"
+      >
+        <p class="text-sm font-semibold text-gray-700">
+          {{
+            assignedAgentsError
+              ? '分配列表加载失败'
+              : assignedAgents.length
+                ? '没有匹配的智能体'
+                : '还没有智能体被分配给你'
+          }}
+        </p>
+        <p class="mx-auto mt-1.5 max-w-md text-xs leading-relaxed text-gray-400">
+          <template v-if="assignedAgentsError">
+            请刷新页面重试；若一直失败，请联系管理员确认授权状态。
+          </template>
+          <template v-else-if="assignedAgents.length">换个关键词试试。</template>
+          <template v-else>
+            分配来的智能体可以直接对话，但不能修改配置。<br />
+            如果你确认已被授权却看不到，可能是该智能体已被停用。
+          </template>
+        </p>
+      </div>
+
+      <div v-else class="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
+        <article
+          v-for="agent in filteredAssignedAgents"
+          :key="agent.id"
+          class="flex flex-col rounded-xl border border-gray-200 bg-white shadow-sm transition-colors hover:border-primary/40"
+        >
+          <div class="flex items-start gap-3 px-4 pt-4">
+            <div class="grid h-9 w-9 shrink-0 place-items-center overflow-hidden rounded-lg border border-blue-100 bg-blue-50 text-sm font-semibold text-blue-700">
+              <img v-if="agent.avatar_url" :src="agent.avatar_url" :alt="agent.display_name" class="h-full w-full object-cover" />
+              <span v-else>{{ (agent.display_name || agent.name || '?').slice(0, 1) }}</span>
+            </div>
+            <div class="min-w-0 flex-1">
+              <p class="truncate text-sm font-bold text-gray-900" :title="agent.display_name">
+                {{ agent.display_name || agent.name }}
+              </p>
+              <div class="mt-1 flex flex-wrap items-center gap-1.5">
+                <span class="rounded-full bg-indigo-50 px-2 py-px text-[10px] font-semibold text-indigo-700">平台提供</span>
+                <span class="rounded-full bg-amber-50 px-2 py-px text-[10px] font-semibold text-amber-700">只读</span>
+              </div>
+            </div>
+          </div>
+
+          <p class="mt-2 line-clamp-2 min-h-[2.75rem] px-4 text-xs leading-relaxed text-gray-500">
+            {{ agent.description || '暂无描述' }}
+          </p>
+
+          <!-- 动作区只有一个入口：编辑/复制/删除/版本发布整块不渲染，
+               不是置灰——置灰会暗示「你可能有权」，反而引投诉。 -->
+          <div class="mt-auto flex items-center justify-between gap-2 border-t border-gray-100 px-4 py-2.5">
+            <span class="truncate text-[11px] text-gray-400">只读 · 不可修改配置</span>
+            <button
+              type="button"
+              class="shrink-0 rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-primary/90"
+              @click="openAssignedChat(agent)"
+            >
+              进入对话
+            </button>
+          </div>
+        </article>
+      </div>
     </div>
 
     <AgentShareReceivedPanel
@@ -5163,8 +6080,19 @@ const formatSkillCountLabel = (agent: AIAgent) => {
             <div class="flex gap-2">
               <button
                 type="button"
-                class="rounded-lg border border-gray-300 px-3 py-1.5 text-xs text-gray-600 transition hover:bg-gray-50"
-                @click="openTeamEditor(team)"
+                class="rounded-lg border px-3 py-1.5 text-xs transition"
+                :class="
+                  isTeamEditable(team)
+                    ? 'border-gray-300 text-gray-600 hover:bg-gray-50'
+                    : 'cursor-not-allowed border-gray-200 text-gray-300'
+                "
+                :disabled="!isTeamEditable(team)"
+                :title="
+                  isTeamEditable(team)
+                    ? '改团名称、介绍与成员'
+                    : '只有所有者或管理员可以修改专家团'
+                "
+                @click="isTeamEditable(team) && openTeamEditor(team)"
               >
                 编辑专家团
               </button>
@@ -5179,6 +6107,17 @@ const formatSkillCountLabel = (agent: AIAgent) => {
           </div>
         </article>
       </div>
+    </div>
+
+    <!-- 业务分组页签：只服务「全部 / 我的智能体」两个浏览视图。
+         「分享给我 / 我分享的 / 专家团」是待办与协作队列，按业务域切分没有意义。
+         与工具注册表、元数据管理、技能工作台共用同一个组件与同一套计数口径。 -->
+    <div v-if="showAgentGroupTabs" class="mt-3">
+      <ToolGroupTabs
+        v-model="agentGroupFilter"
+        :items="agentGroupTabs"
+        aria-label="按业务分组浏览智能体"
+      />
     </div>
 
     <!-- 列表区：管理员在「全部 / 我的智能体」两个视图共用，
@@ -5449,6 +6388,30 @@ const formatSkillCountLabel = (agent: AIAgent) => {
               </span>
             </div>
 
+            <div class="flex items-center justify-between gap-2 text-gray-700">
+              <div class="flex items-center gap-1.5">
+                <span :class="agent.readiness_missing?.includes('primary_capability') ? 'text-amber-500 font-bold' : 'text-emerald-500 font-bold'">
+                  {{ agent.readiness_missing?.includes('primary_capability') ? '⚠️' : '✓' }}
+                </span>
+                <span class="font-medium text-gray-900">核心能力</span>
+              </div>
+              <span :class="agent.readiness_missing?.includes('primary_capability') ? 'text-amber-700 font-medium' : 'text-emerald-600'">
+                {{ agent.readiness_missing?.includes('primary_capability') ? '缺少主类型能力' : '已就绪' }}
+              </span>
+            </div>
+
+            <div v-if="agent.agent_type === 'CHATBI'" class="flex items-center justify-between gap-2 text-gray-700">
+              <div class="flex items-center gap-1.5">
+                <span :class="agent.readiness_missing?.includes('data_query_tool') ? 'text-amber-500 font-bold' : 'text-emerald-500 font-bold'">
+                  {{ agent.readiness_missing?.includes('data_query_tool') ? '⚠️' : '✓' }}
+                </span>
+                <span class="font-medium text-gray-900">查数工具</span>
+              </div>
+              <span :class="agent.readiness_missing?.includes('data_query_tool') ? 'text-amber-700 font-medium' : 'text-emerald-600'">
+                {{ agent.readiness_missing?.includes('data_query_tool') ? '缺少查数工具' : '已就绪' }}
+              </span>
+            </div>
+
             <div v-if="agent.agent_type === 'KNOWLEDGE_BASE'" class="flex items-center justify-between gap-2 text-gray-700">
               <div class="flex items-center gap-1.5">
                 <span :class="agent.readiness_missing?.includes('knowledge_base_binding') ? 'text-amber-500 font-bold' : 'text-emerald-500 font-bold'">
@@ -5461,15 +6424,27 @@ const formatSkillCountLabel = (agent: AIAgent) => {
               </span>
             </div>
 
+            <div v-if="agent.agent_type === 'KNOWLEDGE_BASE'" class="flex items-center justify-between gap-2 text-gray-700">
+              <div class="flex items-center gap-1.5">
+                <span :class="agent.readiness_missing?.includes('knowledge_base_tool') ? 'text-amber-500 font-bold' : 'text-emerald-500 font-bold'">
+                  {{ agent.readiness_missing?.includes('knowledge_base_tool') ? '⚠️' : '✓' }}
+                </span>
+                <span class="font-medium text-gray-900">知识库检索工具</span>
+              </div>
+              <span :class="agent.readiness_missing?.includes('knowledge_base_tool') ? 'text-amber-700 font-medium' : 'text-emerald-600'">
+                {{ agent.readiness_missing?.includes('knowledge_base_tool') ? '缺少检索工具' : '已就绪' }}
+              </span>
+            </div>
+
             <div class="flex items-center justify-between gap-2 text-gray-700">
               <div class="flex items-center gap-1.5">
-                <span :class="agent.readiness_missing?.includes('published_version_missing') ? 'text-amber-500 font-bold' : 'text-emerald-500 font-bold'">
-                  {{ agent.readiness_missing?.includes('published_version_missing') ? '⚠️' : '✓' }}
+                <span :class="agent.readiness_missing?.includes('published_version') ? 'text-amber-500 font-bold' : 'text-emerald-500 font-bold'">
+                  {{ agent.readiness_missing?.includes('published_version') ? '⚠️' : '✓' }}
                 </span>
                 <span class="font-medium text-gray-900">版本发布状态</span>
               </div>
-              <span :class="agent.readiness_missing?.includes('published_version_missing') ? 'text-amber-700 font-medium' : 'text-emerald-600'">
-                {{ agent.readiness_missing?.includes('published_version_missing') ? '尚未发布版本' : '已发布激活' }}
+              <span :class="agent.readiness_missing?.includes('published_version') ? 'text-amber-700 font-medium' : 'text-emerald-600'">
+                {{ agent.readiness_missing?.includes('published_version') ? '尚未发布版本' : '已发布激活' }}
               </span>
             </div>
           </div>
@@ -5493,6 +6468,24 @@ const formatSkillCountLabel = (agent: AIAgent) => {
           >
             {{ agent.description }}
           </p>
+
+          <!-- 业务分组：锁定某个分组浏览时不再逐条显示（每条都一样，纯噪音）；
+               未分组的显示虚线徽标，让漏网的看得见。点它 = 只看这个分组。 -->
+          <div v-if="agentGroupFilter === ALL_GROUP_KEY" class="mt-2">
+            <button
+              v-if="agentGroupName(agent)"
+              type="button"
+              class="inline-flex max-w-full items-center gap-1 rounded-full border border-indigo-100 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700 transition-colors hover:bg-indigo-100"
+              :title="`只看「${agentGroupName(agent)}」分组`"
+              @click.stop="agentGroupFilter = agentGroupName(agent)"
+            >
+              <span class="truncate">{{ agentGroupName(agent) }}</span>
+            </button>
+            <span
+              v-else
+              class="inline-flex items-center rounded-full border border-dashed border-gray-300 px-2 py-0.5 text-[10px] text-gray-400"
+            >未分组</span>
+          </div>
 
           <!-- 待完善：从「就绪度 chip + 独立黄条 + 橙色主按钮」三处重复，合并成卡内唯一一条可点入口 -->
           <button
@@ -5644,6 +6637,16 @@ const formatSkillCountLabel = (agent: AIAgent) => {
                 >
                   <PencilSquareIcon class="h-4 w-4 text-gray-400" />
                   编辑智能体
+                </button>
+                <!-- 设置分组单独一个入口：只改这一列，不受「审核中冻结」影响，也不用打开整个编辑弹窗 -->
+                <button
+                  v-if="agent.is_editable !== false"
+                  v-has-perm="'element:agent:edit'"
+                  @click="closeCardMenus(); openAgentGroupDialog(agent)"
+                  class="flex w-full items-center gap-2.5 px-3 py-2 text-left text-xs text-gray-700 transition-colors hover:bg-gray-50 cursor-pointer"
+                >
+                  <FolderIcon class="h-4 w-4 text-gray-400" />
+                  设置分组
                 </button>
                 <!-- 复制不修改源智能体，因此在可编辑性之外单独判定：列表对普通用户只含自建智能体，
                      后端对「别人创建的系统智能体」另有 403 兜底 -->
@@ -5861,6 +6864,11 @@ const formatSkillCountLabel = (agent: AIAgent) => {
                   <div class="flex flex-col">
                     <span class="text-sm font-bold text-gray-900 group-hover:text-primary transition-colors">
                       {{ agent.display_name }}
+                      <span
+                        v-if="agent.is_expert_team_lead && !isMainAgent(agent)"
+                        class="ml-1.5 inline-flex shrink-0 rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-px text-[10px] font-semibold text-emerald-700"
+                        :title="`专家团主专家：${resolveTeamName(agent)} · ${resolveTeamMembersLabel(agent)}`"
+                      >👥 专家团</span>
                       <button
                         v-if="subAgentBadge(agent)"
                         type="button"
@@ -6652,6 +7660,26 @@ const formatSkillCountLabel = (agent: AIAgent) => {
               ></textarea>
             </div>
 
+            <!-- 业务分组：只服务智能体中心的页签与筛选，与「能力标签」（capabilities，进路由）
+                 是两件事。允许直接输入新名字，候选来自全平台已有分组。 -->
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1"
+                >业务分组</label
+              >
+              <input
+                v-model="agentForm.group_name"
+                type="text"
+                list="agent-group-options"
+                maxlength="64"
+                placeholder="如 法务合规（留空 = 未分组）"
+                class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent outline-none"
+              />
+              <p class="mt-1 text-[11px] leading-relaxed text-gray-400">
+                单选，只用于智能体中心的页签与筛选；不参与权限、不进 AI 提示词，也不影响路由
+                —— 那是「能力标签」的职责。
+              </p>
+            </div>
+
             <div v-if="agentForm.engine_type === 'LOCAL'">
               <!-- 编辑时类型不可改，三张卡只是占位；蓝色提示仍保留，用来说明当前类型的运行行为 -->
               <template v-if="!isEditingAgent">
@@ -6987,6 +8015,7 @@ const formatSkillCountLabel = (agent: AIAgent) => {
       :agent-form="agentForm"
       :version-form="versionForm"
       :global-agent-toolcall-timeout="globalAgentToolcallTimeout"
+      :producer-hard-timeout-seconds="producerHardTimeout"
       :selected-agent="selectedAgent"
       :models="models"
       :global-model-temperature="globalModelTemperature"
@@ -7016,7 +8045,7 @@ const formatSkillCountLabel = (agent: AIAgent) => {
       :stale-tool-refs-error="versionToolHealthError"
       :is-tool-selected="isToolSelected"
       :is-skill-selected="isSkillSelected"
-      :get-tool-custom-config="getToolCustomConfig"
+      :get-tool-advanced-config-summary="getToolAdvancedConfigSummary"
       :has-tool-metadata-dataset-binding="hasToolMetadataDatasetBinding"
       :has-delegation-allowlist="hasDelegationAllowlist"
       :delegation-scope-count="delegationScopeCount"
@@ -7293,6 +8322,62 @@ const formatSkillCountLabel = (agent: AIAgent) => {
       :agent="systemHistoryTarget"
       @close="showSystemHistoryDrawer = false"
     />
+    <!-- 设置业务分组：只改 group_name 一列，不打开整个编辑弹窗。
+         Teleport 到 body —— 卡片 hover 带 transform，否则 fixed 遮罩只盖住卡片。 -->
+    <Teleport to="body">
+      <div
+        v-if="agentGroupDialog"
+        class="fixed inset-0 z-[9990] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm"
+        @click.self="agentGroupDialog = null"
+      >
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="agent-group-title"
+          class="w-full max-w-sm rounded-2xl border border-gray-200 bg-white p-5 shadow-2xl"
+        >
+          <h2 id="agent-group-title" class="mb-1 text-base font-bold text-gray-800">
+            设置业务分组
+          </h2>
+          <p class="mb-4 text-xs text-gray-500">
+            {{ agentGroupDialog.agent.display_name }}
+            <span class="font-mono text-[10px] text-gray-400">（{{ agentGroupDialog.agent.name }}）</span>
+          </p>
+          <input
+            v-model="agentGroupDialog.value"
+            type="text"
+            list="agent-group-options"
+            maxlength="64"
+            placeholder="如 法务合规（留空 = 未分组）"
+            class="w-full rounded-xl border border-gray-300 px-3 py-2 text-sm outline-none transition-all focus:border-primary focus:ring-2 focus:ring-primary/20"
+            @keydown.enter.prevent="saveAgentGroup"
+          />
+          <p class="mt-1.5 text-[10px] leading-relaxed text-gray-400">
+            单选，只影响智能体中心的页签与筛选；不参与权限、不进 AI 提示词，
+            也不影响路由（那是「能力标签」的职责）。
+          </p>
+          <div class="mt-5 flex justify-end gap-2 border-t border-gray-100 pt-4">
+            <button
+              type="button"
+              class="rounded-xl border border-gray-300 px-4 py-2 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-50"
+              @click="agentGroupDialog = null"
+            >取消</button>
+            <button
+              type="button"
+              class="rounded-xl bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary-dark disabled:opacity-50"
+              :disabled="savingAgentGroup"
+              @click="saveAgentGroup"
+            >{{ savingAgentGroup ? "保存中…" : "保存" }}</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- 分组候选：编辑弹窗与「设置分组」弹窗共用，避免同一业务域被写成两个名字 -->
+    <datalist id="agent-group-options">
+      <option v-for="name in agentGroupOptions" :key="name" :value="name"></option>
+    </datalist>
+
     <AgentTransferOwnerModal
       :show="showTransferOwnerModal"
       :agent="transferOwnerTarget"
@@ -7342,8 +8427,11 @@ const formatSkillCountLabel = (agent: AIAgent) => {
       v-model:model="showToolRuntimeModal"
       :tool-name="currentConfiguringTool"
       :config="currentToolConfig"
-      :available-models="models.filter(m => m.is_active && (m.type === 'llm' || m.type === 'multimodal'))"
       :readonly="!canEditVersion"
+      :supports-internal-llm="toolSupportsInternalLlm(currentConfiguringTool)"
+      :upper-timeout-seconds="toolTimeoutCeiling"
+      :upper-timeout-source="toolTimeoutCeilingSource"
+      :producer-hard-timeout-seconds="producerHardTimeout"
       @save="handleToolConfigSave"
     />
 
@@ -7359,6 +8447,10 @@ const formatSkillCountLabel = (agent: AIAgent) => {
       :agent="teamEditorAgent"
       :members="teamEditorMembers"
       :saving="teamEditorSaving"
+      :scope-state="teamEditorScope"
+      :scope-agents="teamEditorScopeAgents"
+      :authorized-agent-ids="delegationAuthorizedAgentIds"
+      :scope-loading="teamEditorScopeLoading"
       @save="saveTeamProfile"
       @configure-scope="openTeamConfigureScope"
     />

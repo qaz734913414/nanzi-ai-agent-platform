@@ -24,6 +24,15 @@ from app.services.quota_service import QuotaService
 logger = logging.getLogger(__name__)
 
 
+def _current_turn_metadata_scope(context: PipelineContext) -> list[str]:
+    """本轮请求 / 会话固定已经生效的数据集范围（空表示没有任何约束）。"""
+    return [
+        str(item).strip()
+        for item in (context.metadata_dataset_ids or [])
+        if str(item).strip()
+    ]
+
+
 class PreflightStep(BasePipelineStep):
     """Executes preflight validations before agent orchestration."""
 
@@ -67,6 +76,7 @@ class PreflightStep(BasePipelineStep):
         if context.conversation_id and await conversation_run_lane.is_locked(
             user_id=context.lane_user_id, conversation_id=context.conversation_id
         ):
+            context.shared_state["queue_wait_pending"] = True
             yield {
                 "type": "log",
                 "id": "session:queue_wait",
@@ -108,11 +118,17 @@ class PreflightStep(BasePipelineStep):
         )
         from app.services.ai.user_question import (
             is_user_question_receipt_message,
+            looks_like_receipt_body,
             metadata_dataset_ids_from_user_question_record,
             parse_user_question_receipt,
         )
 
-        if is_user_question_receipt_message(incoming_content):
+        # 前缀在行首、且带 interaction_type 结构，才是一条真回执。只是开头提到这个
+        # 前缀的普通提问（「【用户回答】这个前缀是干嘛的」）必须当普通消息处理——
+        # 否则会 yield error 并短路整轮，ContextStep 被跳过，这条发言连库都不落。
+        if is_user_question_receipt_message(
+            incoming_content
+        ) and looks_like_receipt_body(incoming_content):
             receipt = parse_user_question_receipt(incoming_content)
             if not receipt or not context.conversation_id:
                 yield {
@@ -164,11 +180,15 @@ class PreflightStep(BasePipelineStep):
                 restored_dataset_ids = metadata_dataset_ids_from_user_question_record(
                     submitted_question
                 )
-                if restored_dataset_ids:
+                # 本轮请求 / 会话固定已经带了范围时，以它们为准；两者都空才按提问记录
+                # 恢复——否则「答完追问」这一轮会退回用户可访问的全部数据集，
+                # 委派出去的子代理拿到的也是空范围（本轮手选只在提问那一轮有效）。
+                if restored_dataset_ids and not _current_turn_metadata_scope(context):
                     context.metadata_dataset_ids = restored_dataset_ids
                     context.execution_options["metadata_dataset_scope"] = {
                         "source": "user_question",
                         "request_ids": restored_dataset_ids,
+                        "session": [],
                     }
             except (PermissionError, ValueError) as exc:
                 yield {

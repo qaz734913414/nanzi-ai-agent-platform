@@ -9,6 +9,18 @@ export type AgentType = 'GENERAL' | 'CHATBI' | 'KNOWLEDGE_BASE'
  *
  * 两个端点签名一致：`username` 只在审计端点上有意义（自隔离端点会忽略它）。
  */
+export interface DelegationScopeState {
+  exists_published: boolean;
+  version_id?: string | null;
+  version_no?: number | null;
+  sub_agent_call_enabled: boolean;
+  /** 名单是否被显式配置过。false = 未限制（全量可委派），不是「一个都不许」。 */
+  scope_configured: boolean;
+  delegable_agent_ids: string[];
+  lead_agent_id?: string | null;
+  max_members: number;
+}
+
 export interface ChatHistoryQueryParams {
   page?: number
   page_size?: number
@@ -61,6 +73,12 @@ export interface AIAgent {
   /** 创建者显示名（real_name 优先），管理员辨认归属用 */
   created_by_name?: string
   owner_group?: string
+  /**
+   * 业务分组（单值，可空 = 未分组）：只服务智能体中心的页签与筛选。
+   * 与 `owner_group`（所属用户组 / 组织权限维度）、`capabilities`（多值路由标签）是三件事，
+   * 详见 db-prod/V214 的说明。
+   */
+  group_name?: string | null
   is_editable?: boolean
   engine_type?: 'LOCAL' | 'RAGFLOW' | 'OPENCLAW'
   engine_config?: any
@@ -110,7 +128,7 @@ export interface AIAgent {
    * 或该智能体还没有已发布版本（由 readiness 覆盖）。
    */
   tool_issue?: AgentToolIssue | null
-  onboarding_step?: 'VERSION' | 'RESOURCE' | 'COMPLETE'
+  onboarding_step?: 'BASIC' | 'VERSION' | 'RESOURCE' | 'COMPLETE'
   /** 已发布版本是否允许在输入框手动切换模型；null/undefined 表示无发布版或未配置，前端按允许处理 */
   allow_model_switch?: boolean | null
 }
@@ -131,13 +149,19 @@ export interface AIAgentBase {
   is_expert_team_lead?: boolean
   /** 专家团展示信息；两项都空时后端归一成 null */
   team_profile?: { name?: string; intro?: string } | null
+  /** 业务分组（单值）；空串/null = 未分组 */
+  group_name?: string | null
 }
 
 export interface ToolConfigItem {
   name: string
   enabled?: boolean | null
+  /** @deprecated 历史字段：AgentScope 只有一个 agent 级模型，工具级模型没有下发点 */
   model_name?: string | null
+  /** 仅对内部自调 LLM 的工具（如 read_image）生效 */
   temperature?: number | null
+  /** 工具级执行超时（秒，1–86400）；空 = 跟随工具定义/智能体版本/全局配置，可覆盖放宽 */
+  timeout_seconds?: number | null
   description_override?: string | null
   engine_config_override?: Record<string, unknown> | null
   metadata_dataset_ids?: string[] | null
@@ -203,8 +227,16 @@ export const agentApi = {
       params: params?.includeDisabled ? { include_disabled: true } : undefined,
     }),
 
+  /**
+   * 「分配给我」：管理员授权我使用、但不是我创建的智能体（服务端保证只读）。
+   *
+   * 与 `listAllowedAgents` 不是一回事：那个是「我能执行的」，包含我自己创建的，
+   * 也不带只读语义；这个专供智能体中心的只读视图。
+   */
+  listAssignedAgents: () => axios.get<AIAgent[]>('/api/portal/agents/assigned'),
+
   // Read-only global tool-call timeout shown in the version editor
-  getGlobalToolcallTimeout: () => axios.get<{ seconds: number }>('/api/portal/agents/toolcall-timeout'),
+  getGlobalToolcallTimeout: () => axios.get<{ seconds: number; producer_hard_timeout_seconds?: number }>('/api/portal/agents/toolcall-timeout'),
 
   /** 系统默认 LLM 模型的健康状态；default_model_issue 为 null 表示正常 */
   getModelHealth: () =>
@@ -217,12 +249,22 @@ export const agentApi = {
     axios.post<{
       agent: AIAgent
       version: AIAgentVersion
-      onboarding_step: 'VERSION' | 'RESOURCE' | 'COMPLETE'
+      onboarding_step: 'BASIC' | 'VERSION' | 'RESOURCE' | 'COMPLETE'
       template_fallback: boolean
+      dropped_tool_refs: Array<{ name: string; reason_label?: string }>
     }>('/api/portal/agents/onboarding', data),
   
   // Update agent
   updateAgent: (id: string, data: Partial<AIAgent>) => axios.put<AIAgent>(`/api/portal/agents/${id}`, data),
+
+  /**
+   * 只改「业务分组」。
+   *
+   * 不复用 `updateAgent`：那条路是整表单保存，后端会连带校验待审冻结 / 是否系统级 / 引擎
+   * 是否可改，用户只是归个类，不该因为「正在审核中」被拒；也不会顺手覆盖别的字段。
+   */
+  updateAgentGroup: (id: string, groupName: string | null) =>
+    axios.put<AIAgent>(`/api/portal/agents/${id}/group`, { group_name: groupName }),
 
   // Batch reorder agents (sort_order)
   reorderAgents: (items: { id: string; sort_order: number }[]) =>
@@ -249,6 +291,23 @@ export const agentApi = {
   
   // Delete version (DRAFT/ARCHIVED only)
   deleteVersion: (agentId: string, versionId: string) => axios.delete(`/api/portal/agents/${agentId}/versions/${versionId}`),
+
+  /** 专家团成员现状：版本号、是否有已发布版本、委派工具是否启用、当前名单。 */
+  getDelegationScope: (agentId: string) =>
+    axios.get<DelegationScopeState>(`/api/portal/agents/${agentId}/delegation-scope`),
+
+  /**
+   * 保存成员名单。后端会复制一份已发布版本、只替换名单并立即发布，
+   * 其余配置原样保留——所以这里不需要先建草稿再发布。
+   */
+  saveDelegationScope: (
+    agentId: string,
+    data: { delegable_agent_ids: string[]; enable_delegation_tool?: boolean },
+  ) =>
+    axios.put<DelegationScopeState>(
+      `/api/portal/agents/${agentId}/delegation-scope`,
+      data,
+    ),
 
   /** 版本配置里已失效的工具引用（只读诊断，用于编辑器内解绑） */
   getVersionToolHealth: (agentId: string, versionId: string) =>
@@ -525,7 +584,12 @@ export const agentSystemApi = {
 
   /** 侧边菜单角标：待接受 / 待对方处理 / 我发出的总数。 */
   shareCounts: () =>
-    axios.get<{ received_pending: number; sent_pending: number; sent_total: number }>(
+    axios.get<{
+      received_pending: number
+      received_total: number
+      sent_pending: number
+      sent_total: number
+    }>(
       '/api/portal/agents/shares/counts',
     ),
 
@@ -534,7 +598,7 @@ export const agentSystemApi = {
     axios.get<AgentShareRecord[]>('/api/portal/agents/shares/received', { params }),
 
   /** 接受分享：按快照生成一份属于我的副本，停在向导第一步。 */
-  acceptShare: (shareId: string, data: { name: string; display_name?: string }) =>
+  acceptShare: (shareId: string, data: { name?: string; display_name?: string }) =>
     axios.post<AIAgent>(`/api/portal/agents/shares/${shareId}/accept`, data),
 
   rejectShare: (shareId: string) =>

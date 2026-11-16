@@ -6,15 +6,16 @@ import { useRoute, useRouter } from 'vue-router'
 import axios from '../utils/axios'
 import Modal from '../components/Modal.vue'
 import ConfirmModal from '../components/ConfirmModal.vue'
+import KnowledgeEditPolicyDialog from '../components/knowledge/KnowledgeEditPolicyDialog.vue'
 import KnowledgeFlowGuideBanner from '../components/knowledge/KnowledgeFlowGuideBanner.vue'
 import DocWorkspace from '../components/knowledge/DocWorkspace.vue'
 import ImageToMarkdownUploader from '../components/knowledge/ImageToMarkdownUploader.vue'
 import HeroSilhouette from '../components/common/HeroSilhouette.vue'
+import PaginationBar from '../components/common/PaginationBar.vue'
 import { useToast } from '../composables/useToast'
 import { ragflowApi } from '../api/ragflow'
 import { useUser } from '../composables/useUser'
 import { formatDate } from '../utils/date'
-import { copyToClipboard as copyText } from '../utils/clipboard'
 import DocumentViewer from '@/components/embed/DocumentViewer.vue'
 import {
   canPreviewWithDocumentViewer,
@@ -316,8 +317,7 @@ const form = ref({
   ownerText: '',
   visibility: 'private',
   tags: [] as string[],
-  notes: '',
-  extraConfigText: '{}'
+  notes: ''
 })
 
 const canCreate = computed(() => hasPermission('element:knowledge:create'))
@@ -343,11 +343,6 @@ const detailTab = ref<'settings' | 'audit' | 'references'>('settings')
 // 右侧抽屉：文档详情与库信息共用一个容器，避免主区被挤来挤去
 const drawerOpen = ref(false)
 const drawerMode = ref<'doc' | 'lib'>('doc')
-// 「高级设置」默认收起：绝大多数人不需要碰 JSON，展开就先把代价讲清楚
-const advancedConfigOpen = ref(false)
-const createAdvancedConfigOpen = ref(false)
-// 详情页底部那块只读 JSON 同理，默认收起
-const detailConfigOpen = ref(false)
 const auditLogs = ref<any[]>([])
 const auditTotal = ref(0)
 const auditPage = ref(1)
@@ -550,7 +545,6 @@ watch(
     auditTotal.value = 0
     auditPage.value = 1
     auditAction.value = ''
-    detailConfigOpen.value = false
     agentRefs.value = []
     void loadDatasetQuota()
     if (detailTab.value === 'audit') loadAuditLogs(true)
@@ -704,22 +698,28 @@ const canManagePermissions = computed(() => {
 })
 const isKnowledgeEnabled = computed(() => ragflowConfig.value?.knowledge_base_enabled !== false)
 const isEngineReady = computed(() => isKnowledgeEnabled.value && engineStatus.value === 'connected' && !loading.value)
-const engineStatusText = computed(() => {
-  if (!isKnowledgeEnabled.value) return '功能已关闭'
-  if (engineStatus.value === 'checking') return '知识库引擎连接中 ...'
-  if (engineStatus.value === 'connected') return '已连接'
-  return '未连接'
+/**
+ * 引擎连接状态的短文案：挂在标题行的小圆点旁边。
+ *
+ * 已连接时返回空串 —— 正常状态只留一个绿点，不跟主标题抢注意力；
+ * 检测中 / 断连 / 功能关闭才补回两三个字，否则「一个黄点」信息量为零。
+ */
+const engineStatusHint = computed(() => {
+  if (!isKnowledgeEnabled.value) return '功能未开启'
+  if (engineStatus.value === 'checking') return '引擎连接中'
+  if (engineStatus.value === 'connected') return ''
+  return '引擎未连接'
 })
 
 /**
- * 窄屏状态条只放圆点 + 两三个字，完整文案（「知识库引擎连接中 ...」）留给桌面。
- * 直接复用 engineStatusText 会把标题区撑宽，图标按钮那一行又回到换行老问题。
+ * 圆点本身没有文字，屏幕阅读器与 tooltip 需要一句带主语的完整描述，
+ * 不能直接复用上面的短文案（「未连接」单独播报会让人不知道连的是什么）。
  */
-const engineStatusShort = computed(() => {
-  if (!isKnowledgeEnabled.value) return '未开启'
-  if (engineStatus.value === 'checking') return '连接中'
-  if (engineStatus.value === 'connected') return '已连接'
-  return '未连接'
+const engineStatusAriaLabel = computed(() => {
+  if (!isKnowledgeEnabled.value) return '知识库功能未开启'
+  if (engineStatus.value === 'checking') return '知识库引擎连接中'
+  if (engineStatus.value === 'connected') return '知识库引擎已连接'
+  return '知识库引擎未连接'
 })
 
 const selectedDatasetId = computed(() => selectedDataset.value?.ragflow_dataset_id || selectedDataset.value?.id || '')
@@ -823,15 +823,6 @@ const apiData = (response: any) => response?.data?.data ?? response?.data ?? []
 const normalizeTags = (text: string) =>
   text.split(/[,，\n]/).map(t => t.trim()).filter(Boolean)
 
-const parseExtraConfig = () => {
-  if (!form.value.extraConfigText.trim()) return {}
-  try {
-    return JSON.parse(form.value.extraConfigText)
-  } catch {
-    throw new Error('扩展配置必须是合法 JSON')
-  }
-}
-
 const resetForm = () => {
   form.value = {
     name: '',
@@ -841,8 +832,7 @@ const resetForm = () => {
     ownerText: '',
     visibility: 'private',
     tags: [] as string[],
-    notes: '',
-    extraConfigText: '{}'
+    notes: ''
   }
 }
 
@@ -886,11 +876,8 @@ const openEdit = (dataset: KnowledgeBase) => {
     // 名称保存就把它静默改成 private，其他被授权的人瞬间失去访问。
     visibility: visibilityOf(dataset),
     tags: [...(dataset.tags || [])],
-    notes: dataset.notes || '',
-    extraConfigText: JSON.stringify(dataset.local_metadata?.extra_config || {}, null, 2)
+    notes: dataset.notes || ''
   }
-
-  advancedConfigOpen.value = false
 
   customQuestions.value = []
   const localExtra = dataset.local_metadata?.extra_config || {}
@@ -978,6 +965,9 @@ const fetchDatasets = async (force = false) => {
     engineStatus.value = 'connected'
     void loadOwnedDatasetQuota()
     void loadRecentVisits()
+    // 列表页的数据源与 datasets 分开（服务端分页）：刷新数据后同步当前页，
+    // 否则刚改完可见范围/删完库，列表还停在旧数据上
+    if (listScope.value) void fetchLibraryList()
     
     // 进页面落在「概览」，不再默认选中第一个库。原先的默认选中必须顺手改
     // activeVisibility 去对齐 tab，否则左侧「授权可见 0 个」右侧却显示一个
@@ -1024,8 +1014,9 @@ const toggleDatasetExpand = async (dataset: KnowledgeBase, forceExpand = false) 
     expandedDatasetIds.value[dsId] = !expandedDatasetIds.value[dsId]
   }
 
-  // 展开且未加载过文档时，懒加载
-  if (expandedDatasetIds.value[dsId] && !documentsMap.value[dsId] && !dataset.is_missing_in_ragflow) {
+  // 展开即拉当前页：文档列表现在只有一页数据，缓存整份没有意义，
+  // 而沿用旧页会导致「页码回到 1、内容还是上次翻到的那页」
+  if (expandedDatasetIds.value[dsId] && !dataset.is_missing_in_ragflow) {
     await fetchDocumentsForDataset(dsId)
   }
 }
@@ -1048,25 +1039,94 @@ const onUploaderNotify = (payload: { message: string; type: 'success' | 'error' 
 /** 上传入口分两档：文档走 RAGFlow 直接解析，图片先转 md 再入库 */
 const uploadTab = ref<'doc' | 'img'>('doc')
 
-const fetchDocumentsForDataset = async (dsId: string, options: { silent?: boolean } = {}) => {
+/**
+ * 文档列表的浏览状态（分页 + 筛选 + 排序）。
+ *
+ * 为什么全部交给服务端：一个库可能有几千份文档，原来前端一次拉 1000 条、
+ * 再在本地过滤/排序，超过 1000 份会**静默截断**（列表和文档数一起少算），
+ * 而且「共 N 份」与实际条数对不上。现在只拉当前页，过滤/排序/总数都由后端算。
+ */
+const docPage = ref(1)
+const docPageSize = ref(50)
+const docKeyword = ref('')
+const docStatus = ref('')
+const docSort = ref('updated')
+const docFolder = ref('')
+const docTotal = ref(0)
+const docAllTotal = ref(0)
+const docStatusCounts = ref<Record<string, number>>({})
+const docFolderCounts = ref<Record<string, number>>({})
+const DOC_PAGE_SIZES = [20, 50, 100]
+let docSearchTimer: ReturnType<typeof setTimeout> | null = null
+
+const resetDocBrowsing = () => {
+  docPage.value = 1
+  docKeyword.value = ''
+  docStatus.value = ''
+  docSort.value = 'updated'
+  docFolder.value = ''
+  docTotal.value = 0
+  docAllTotal.value = 0
+  docStatusCounts.value = {}
+  docFolderCounts.value = {}
+  if (docSearchTimer) {
+    clearTimeout(docSearchTimer)
+    docSearchTimer = null
+  }
+}
+
+const fetchDocumentsForDataset = async (
+  dsId: string,
+  options: { silent?: boolean; refresh?: boolean } = {},
+) => {
   const seq = (documentsReqSeq[dsId] = (documentsReqSeq[dsId] || 0) + 1)
   documentsLoadingMap.value[dsId] = true
   try {
-    // 后端默认 page_size=100，且客户端仅在 page_size>100 时才自动翻页，
-    // 不显式放大时文档超过 100 个会被静默截断，列表与文档数都会少算
-    const response = await axios.get(`/api/portal/ragflow/datasets/${dsId}/documents`, {
-      params: { page_size: 1000 }
-    })
+    // 页码/关键字/状态/排序/文件夹全部下发给后端：本地只剩当前页，
+    // 再过滤一次会漏掉其他页的命中，也会让分页总数与实际条数打架。
+    const params: Record<string, string | number> = {
+      page: docPage.value,
+      page_size: docPageSize.value,
+      sort: docSort.value,
+    }
+    const keyword = docKeyword.value.trim()
+    if (keyword) params.name = keyword
+    if (docStatus.value) params.status = docStatus.value
+    if (docFolder.value) params.folder = docFolder.value
+    // 解析中的状态只能靠回源看到：后端对文档全量做了 60s 缓存，
+    // 轮询不带 refresh 的话进度条会卡一分钟不动
+    if (options.refresh) params.refresh = 1
+
+    const response = await axios.get(`/api/portal/ragflow/datasets/${dsId}/documents`, { params })
     if (seq !== documentsReqSeq[dsId]) return
-    const docs = apiData(response)
+    const docs = apiData(response) as KnowledgeDocument[]
     documentsMap.value[dsId] = docs
     documentsErrorMap.value[dsId] = false
 
-    // 更新对应知识库的文档数量计数
+    // 真实总数与全库总数分开记：「共 N 份」用过滤后的 total，
+    // 空态判断（这个库到底有没有文档）用 all_total
+    const total = Number(response.data?.total)
+    const allTotal = Number(response.data?.all_total)
+    docTotal.value = Number.isFinite(total) ? total : docs.length
+    docAllTotal.value = Number.isFinite(allTotal) ? allTotal : docs.length
+    docStatusCounts.value = (response.data?.status_counts || {}) as Record<string, number>
+    docFolderCounts.value = (response.data?.folders || {}) as Record<string, number>
+
+    // 页码越界（删除/筛选变化后）回退到最后一页，别让界面停在空白页
+    const maxPage = Math.max(1, Math.ceil(docTotal.value / docPageSize.value))
+    if (docPage.value > maxPage) {
+      docPage.value = maxPage
+      if (seq === documentsReqSeq[dsId]) {
+        void fetchDocumentsForDataset(dsId, options)
+      }
+      return
+    }
+
+    // 更新对应知识库的文档数量计数：用全库总数，不是当前页条数
     const dataset = datasets.value.find(d => (d.ragflow_dataset_id || d.id) === dsId)
     if (dataset) {
-      dataset.doc_count = docs.length
-      dataset.document_count = docs.length
+      dataset.doc_count = docAllTotal.value
+      dataset.document_count = docAllTotal.value
     }
 
     // 自动更新并同步清理 parsingDocIds
@@ -1334,34 +1394,109 @@ const libraryScope = ref<'all' | 'missing' | VisibilityScope>('all')
 
 const libraryRowId = (dataset: KnowledgeBase) => dataset.ragflow_dataset_id || dataset.id || ''
 
-/** 库列表行：只有「全部」有数据源，收藏/最近等后端接口 */
-const libraryListRows = computed<KnowledgeBase[]>(() => {
-  let list = datasets.value
-  if (listScope.value === 'recent') {
-    // 顺序由后端 ZSET 决定：按 id 映射回库对象，找不到的（已失权/已删）自然跳过
-    const byId = new Map(datasets.value.map(item => [libraryRowId(item), item]))
-    list = recentIds.value.map(id => byId.get(id)).filter((item): item is KnowledgeBase => Boolean(item))
+/**
+ * 库列表改成**服务端分页**。
+ *
+ * 左树仍然需要完整的部门结构（datasets 全量），但列表页是「浏览 + 批量操作」：
+ * 上千个库一次全渲染既拖首屏也拖滚动；更关键的是搜索/可见范围过滤必须和分页
+ * 落在同一个数据源上，否则「第 2 页」只是本地过滤后的切片，页码与总数对不上。
+ */
+const libraryRows = ref<KnowledgeBase[]>([])
+const libraryTotal = ref(0)
+const libraryPage = ref(1)
+const libraryPageSize = ref(20)
+const libraryLoading = ref(false)
+const librarySort = ref<'updated' | 'name' | 'docs'>('updated')
+let libraryRequestSeq = 0
+let librarySearchTimer: ReturnType<typeof setTimeout> | null = null
+
+const LIBRARY_PAGE_SIZES = [20, 50, 100]
+const LIBRARY_SORT_OPTIONS = [
+  { key: 'updated' as const, label: '最近更新' },
+  { key: 'name' as const, label: '名称' },
+  { key: 'docs' as const, label: '文档数' },
+] as const
+
+const fetchLibraryList = async () => {
+  if (!listScope.value) return
+  const seq = (libraryRequestSeq += 1)
+  libraryLoading.value = true
+  try {
+    const params: Record<string, string | number> = {
+      page: libraryPage.value,
+      page_size: libraryPageSize.value,
+      sort: librarySort.value,
+    }
+    const keyword = libraryQuery.value.trim()
+    if (keyword) params.keyword = keyword
+    if (libraryScope.value === 'missing') params.missing = 1
+    else if (libraryScope.value !== 'all') params.visibility = libraryScope.value
+    if (listScope.value === 'favorite') params.favorite = 1
+    if (listScope.value === 'recent') {
+      // 最近访问按 ZSET 顺序取；没有记录就不要发请求（空 ids 会被后端当成「不过滤」）
+      if (!recentIds.value.length) {
+        libraryRows.value = []
+        libraryTotal.value = 0
+        return
+      }
+      params.ids = recentIds.value.join(',')
+    }
+
+    const response = await axios.get('/api/portal/ragflow/datasets', { params })
+    if (seq !== libraryRequestSeq) return
+    libraryRows.value = apiData(response) as KnowledgeBase[]
+    const total = Number(response.data?.total)
+    libraryTotal.value = Number.isFinite(total) ? total : libraryRows.value.length
+
+    // 删库/筛选变化后当前页可能越界：退到最后一页，别让界面停在一张空白页上
+    const maxPage = Math.max(1, Math.ceil(libraryTotal.value / libraryPageSize.value))
+    if (libraryPage.value > maxPage) {
+      libraryPage.value = maxPage
+      if (seq === libraryRequestSeq) void fetchLibraryList()
+    }
+  } catch (err) {
+    if (seq !== libraryRequestSeq) return
+    libraryRows.value = []
+    libraryTotal.value = 0
+    showToast(extractError(err) || '知识库列表加载失败', 'error')
+  } finally {
+    if (seq === libraryRequestSeq) libraryLoading.value = false
   }
-  if (listScope.value === 'favorite') {
-    list = list.filter(dataset => dataset.is_favorited)
-  }
-  if (libraryScope.value === 'missing') {
-    list = list.filter(dataset => dataset.is_missing_in_ragflow)
-  } else if (libraryScope.value !== 'all') {
-    list = list.filter(dataset => visibilityOf(dataset) === libraryScope.value)
-  }
-  const keyword = libraryQuery.value.trim().toLowerCase()
-  if (keyword) {
-    list = list.filter(dataset =>
-      [dataset.platform_name, dataset.name, libraryRowId(dataset), libraryOwnerOf(dataset)]
-        .some(value => String(value || '').toLowerCase().includes(keyword))
-    )
-  }
-  return list
-})
+}
+
+/** 搜索框：300ms 防抖后回第 1 页再请求（每敲一个字就打一次引擎会把列表拖到没法用） */
+const onLibraryQueryInput = (value: string) => {
+  libraryQuery.value = value
+  libraryPage.value = 1
+  if (librarySearchTimer) clearTimeout(librarySearchTimer)
+  librarySearchTimer = setTimeout(() => { void fetchLibraryList() }, 300)
+}
+
+const onLibraryScopeChange = (event: Event) => {
+  libraryScope.value = (event.target as HTMLSelectElement).value as 'all' | 'missing' | VisibilityScope
+  libraryPage.value = 1
+  void fetchLibraryList()
+}
+
+const onLibrarySortChange = (event: Event) => {
+  librarySort.value = (event.target as HTMLSelectElement).value as 'updated' | 'name' | 'docs'
+  libraryPage.value = 1
+  void fetchLibraryList()
+}
+
+const onLibraryPageChange = (page: number) => {
+  libraryPage.value = page
+  void fetchLibraryList()
+}
+
+const onLibraryPageSizeChange = (size: number) => {
+  libraryPageSize.value = size
+  libraryPage.value = 1
+  void fetchLibraryList()
+}
 
 /** 能勾选的只有能管理的库：没权限的勾上也删不掉，不如直接置灰 */
-const librarySelectableRows = computed(() => libraryListRows.value.filter(canManageDataset))
+const librarySelectableRows = computed(() => libraryRows.value.filter(canManageDataset))
 
 const librarySelectedCount = computed(() =>
   librarySelectableRows.value.filter(dataset => selectedDatasetIds.value.includes(libraryRowId(dataset))).length
@@ -1374,6 +1509,8 @@ const libraryAllSelected = computed(() =>
 
 const toggleLibrarySelectAll = () => {
   const ids = librarySelectableRows.value.map(libraryRowId)
+  // 全选只作用于当前页：跨页全选等于「一键勾上 860 个库」，配合批量删除是灾难。
+  // 已勾选的跨页保留，并在分页条上写明数量。
   selectedDatasetIds.value = libraryAllSelected.value
     ? selectedDatasetIds.value.filter(id => !ids.includes(id))
     : Array.from(new Set([...selectedDatasetIds.value, ...ids]))
@@ -1386,9 +1523,9 @@ const libraryListTitle = computed(() => {
 })
 
 const libraryListSubtitle = computed(() => {
-  if (listScope.value === 'favorite') return `${favoriteCount.value} 个已收藏的知识库`
+  if (listScope.value === 'favorite') return `${libraryTotal.value} 个已收藏的知识库`
   if (listScope.value === 'recent') return `${recentIds.value.length} 个最近打开过的知识库（保留 30 天）`
-  return `${datasets.value.length} 个知识库`
+  return `${libraryTotal.value} 个知识库`
 })
 
 const libraryListEmpty = computed(() => {
@@ -1441,7 +1578,13 @@ const libraryUpdatedAtOf = (dataset: KnowledgeBase) => {
 }
 
 /** 切到库列表：不选具体库，抽屉也收起，避免列表被详情挤走 */
-const openLibraryList = (scope: 'all' | 'favorite' | 'recent') => {
+/**
+ * 切到库列表：不选具体库，抽屉也收起，避免列表被详情挤走。
+ *
+ * 列表数据独立于左树的 datasets（服务端分页），所以要显式请求一次；
+ * 「最近访问」的顺序来自 Redis，得先把它取回来，否则 ids 为空会退化成空列表。
+ */
+const openLibraryList = async (scope: 'all' | 'favorite' | 'recent') => {
   listScope.value = scope
   selectedDatasetIds.value = []
   selectedType.value = null
@@ -1449,6 +1592,11 @@ const openLibraryList = (scope: 'all' | 'favorite' | 'recent') => {
   selectedDataset.value = null
   selectedDocument.value = null
   drawerOpen.value = false
+  libraryPage.value = 1
+  libraryRows.value = []
+  libraryTotal.value = 0
+  if (scope === 'recent') await loadRecentVisits()
+  await fetchLibraryList()
 }
 
 const showOverview = () => {
@@ -1497,6 +1645,9 @@ const selectDatasetNode = (dataset: KnowledgeBase) => {
   selectedDataset.value = dataset
   selectedDocument.value = null
   drawerOpen.value = false
+  // 换库复位浏览状态：文件夹、搜索、状态筛选、页码都属于上一个库，
+  // 不清掉会出现「在 A 库筛了失败状态，切到 B 库还是失败状态」
+  resetDocBrowsing()
   toggleDatasetExpand(dataset, true)
   // 换库要清空上一批勾选：批量解析/删除以 bulkDocDatasetId 为准，
   // 把 A 库的 docId 发到 B 库会删错东西
@@ -1842,6 +1993,12 @@ const emptyVisibilityText = computed(() => {
   return '还没有可访问的公共知识库'
 })
 
+/**
+ * 「这个库里有名字命中的文档」的探测结果，键是 dataset id。
+ * 搜索文档名走它，不再把每个库的文档列表整包拉下来比对。
+ */
+const docNameHits = ref<Record<string, boolean>>({})
+
 const filteredDatasets = computed(() => {
   const query = searchQuery.value.trim().toLowerCase()
   if (!query) return visibilityScopeDatasets.value
@@ -1863,40 +2020,59 @@ const filteredDatasets = computed(() => {
     // 用 includes 而不是精确比较，方便只粘前缀（排障时拿到的往往是被截断的 ID）。
     const idMatch = !!dsId && dsId.toLowerCase().includes(query)
 
-    const subDocs = documentsMap.value[dsId] || []
-    const docMatch = subDocs.some(doc => (doc.name || '').toLowerCase().includes(query))
+    // 文档名命中由后端探测（见 ensureDocumentsForSearch）：本地只有当前页，
+    // 拿它来搜等于只搜「已经翻到的那一页」。
+    const docMatch = docNameHits.value[dsId] === true
 
     return nameMatch || descMatch || ownerMatch || tagsMatch || idMatch || docMatch
   })
 })
 
 /**
- * 搜索文档名时按需加载文档列表。
+ * 搜索文档名时按需探测命中。
  *
- * 文档是「展开才懒加载」的，但搜索框承诺能搜文档名：不补这一步，
- * 没展开过的库里的文档永远搜不到，用户会以为文档不存在。
- * 并发上限 4，避免一次打爆 RAGFlow；300ms 防抖避免连续输入触发请求风暴。
+ * 原来的做法是把每个库的文档列表整包拉下来再比对（并发 4）：库一多就是几百次
+ * RAGFlow 请求，而且每次都拉上千条。现在只问「这个库里有没有名字匹配的文档」，
+ * 请求降到 page_size=1 —— 传输量与耗时都小了几个数量级。
+ *
+ * 并发上限 4 避免打爆引擎；300ms 防抖避免连续输入触发请求风暴。
  */
 const SEARCH_DOC_CONCURRENCY = 4
 const SEARCH_DOC_DEBOUNCE_MS = 300
 const searchDocLoading = ref(false)
 let searchDocTimer: ReturnType<typeof setTimeout> | null = null
 
+const probeDocNameMatch = async (dsId: string, keyword: string): Promise<boolean> => {
+  try {
+    const response = await axios.get(`/api/portal/ragflow/datasets/${dsId}/documents`, {
+      params: { page: 1, page_size: 1, name: keyword },
+    })
+    return Number(response.data?.total) > 0
+  } catch {
+    // 探测失败按「没命中」处理：搜索只是辅助，不能因为某个库抖动就整页报错
+    return false
+  }
+}
+
 const ensureDocumentsForSearch = async () => {
+  const keyword = searchQuery.value.trim()
+  if (!keyword) return
   const targets = visibilityScopeDatasets.value
     .filter((dataset) => !dataset.is_missing_in_ragflow)
     .map((dataset) => dataset.ragflow_dataset_id || dataset.id)
-    .filter((id) => id && !documentsMap.value[id] && !documentsLoadingMap.value[id])
+    .filter((id): id is string => Boolean(id))
   if (!targets.length) return
   searchDocLoading.value = true
+  const next: Record<string, boolean> = {}
   try {
     for (let i = 0; i < targets.length; i += SEARCH_DOC_CONCURRENCY) {
-      await Promise.all(
-        targets
-          .slice(i, i + SEARCH_DOC_CONCURRENCY)
-          .map((id) => fetchDocumentsForDataset(id, { silent: true })),
-      )
+      const chunk = targets.slice(i, i + SEARCH_DOC_CONCURRENCY)
+      const results = await Promise.all(chunk.map((id) => probeDocNameMatch(id, keyword)))
+      chunk.forEach((id, idx) => { next[id] = results[idx] === true })
+      // 用户已经改了关键词：这批结果作废，别把旧命中写回去
+      if (searchQuery.value.trim() !== keyword) return
     }
+    docNameHits.value = next
   } finally {
     searchDocLoading.value = false
   }
@@ -1905,7 +2081,11 @@ const ensureDocumentsForSearch = async () => {
 watch(searchQuery, (value) => {
   if (searchDocTimer) clearTimeout(searchDocTimer)
   const query = value.trim().toLowerCase()
-  if (!query) return
+  if (!query) {
+    docNameHits.value = {}
+    searchDocLoading.value = false
+    return
+  }
   // 只在「搜到的是 ID」这件事上短路文档预加载：粘贴 32 位 Dataset ID 时用户显然在找库，
   // 没必要为此把所有库的文档列表都拉一遍（库一多就是一串串行 RAGFlow 请求）。
   // 加 8 位长度阈值，避免 "test" 这类短词恰好是某个 ID 的子串就把文档搜索整段跳过。
@@ -1917,6 +2097,7 @@ watch(searchQuery, (value) => {
   ) {
     return
   }
+  docNameHits.value = {}
   searchDocTimer = setTimeout(() => {
     void ensureDocumentsForSearch()
   }, SEARCH_DOC_DEBOUNCE_MS)
@@ -2013,6 +2194,33 @@ const deptDatasetGroups = computed<DeptDatasetGroup[]>(() => {
 const isDeptGroupCollapsed = (group: DeptDatasetGroup): boolean =>
   !!collapsedDeptGroups.value[group.key]
 
+/**
+ * 树里每个部门分组默认先渲染 6 个，点「再显示」每次加 10 个。
+ *
+ * 树不做页码：页码 + 部门层级 + 折叠态三者叠加，用户根本记不住自己在第几页。
+ * 增量渲染只解决「DOM 太多」，排序与分组仍是一次算好的完整结果。
+ */
+const TREE_GROUP_PAGE = 6
+const TREE_GROUP_STEP = 10
+const treeGroupShown = ref<Record<string, number>>({})
+
+const visibleGroupDatasets = (group: DeptDatasetGroup): KnowledgeBase[] => {
+  // 搜索时不再截断：命中结果已经是用户主动缩小的集合，再藏起来只会像「搜不到」
+  if (searchQuery.value.trim()) return group.datasets
+  const limit = treeGroupShown.value[group.key] ?? TREE_GROUP_PAGE
+  return group.datasets.slice(0, limit)
+}
+
+const treeGroupRemaining = (group: DeptDatasetGroup): number => {
+  if (searchQuery.value.trim()) return 0
+  return Math.max(0, group.datasets.length - visibleGroupDatasets(group).length)
+}
+
+const expandTreeGroup = (group: DeptDatasetGroup) => {
+  const current = treeGroupShown.value[group.key] ?? TREE_GROUP_PAGE
+  treeGroupShown.value = { ...treeGroupShown.value, [group.key]: current + TREE_GROUP_STEP }
+}
+
 const toggleDeptGroup = (group: DeptDatasetGroup) => {
   collapsedDeptGroups.value = {
     ...collapsedDeptGroups.value,
@@ -2089,8 +2297,7 @@ const createDataset = async () => {
       owner_dept_id: form.value.ownerDeptId || null,
       visibility: form.value.visibility,
       tags: form.value.tags,
-      notes: form.value.notes,
-      extra_config: parseExtraConfig()
+      notes: form.value.notes
     })
     showToast('知识库创建成功', 'success')
     showCreateModal.value = false
@@ -2127,8 +2334,11 @@ const updateMetadata = async () => {
   if (savingMetadata.value) return
   savingMetadata.value = true
   try {
-    const extraConfig = parseExtraConfig()
-    extraConfig.custom_questions = customQuestions.value.filter(q => q.label.trim() && q.query.trim())
+    // 只提交 custom_questions 这一个键。extra_config 里还躺着 folder_structure，
+    // 而这里手里只有打开弹窗时的快照 —— 整份回写会把别人（或自己另一个标签页）
+    // 刚做的目录调整一起回滚，就是典型的 lost update。
+    const customQuestionsPayload = customQuestions.value
+      .filter(q => q.label.trim() && q.query.trim())
 
     const payload: Record<string, unknown> = {
       name: form.value.name,
@@ -2138,7 +2348,7 @@ const updateMetadata = async () => {
       visibility: form.value.visibility,
       tags: form.value.tags,
       notes: form.value.notes,
-      extra_config: extraConfig
+      custom_questions: customQuestionsPayload
     }
     // 未关联部门时，历史自由文本由前端决定保留还是清除；选了部门则由后端按部门名回填
     if (!form.value.ownerDeptId) {
@@ -2255,6 +2465,8 @@ const saveFolderStructure = async (
     ...(dataset.local_metadata.extra_config || {}),
     folder_structure: saved,
   }
+  // 当前视图可能正按文件夹过滤：结构一变，计数与命中集合都变了，必须重取当前页
+  if (datasetId === workspaceDatasetId.value) refreshWorkspaceDocs()
 }
 
 /** 文档被删除后清理目录里的悬空引用，避免树里出现点不开的条目。 */
@@ -2429,12 +2641,16 @@ const onFileChange = (event: Event) => {
 const uploadConflicts = ref<{ file: File; oldDocumentId: string; oldName: string }[]>([])
 const pendingUploadClean = ref<File[]>([])
 
-/** 查重用：优先用已加载的列表，避免每个文件都打一次接口 */
+/**
+ * 查重用：单独取一页足够大的列表。
+ *
+ * 不能复用工作区缓存——那份只有当前页（默认 50 条），拿它查重会漏掉后面几页的
+ * 同名文档，用户点了「保留两者」才发现库里早就有一份。后端对全量文档做了
+ * 60s 缓存，这里多要 1000 条只是一次切片，成本可以接受。
+ */
 const fetchDatasetDocumentsForUpload = async (dsId: string): Promise<KnowledgeDocument[]> => {
-  const cached = documentsMap.value[dsId]
-  if (cached?.length) return cached
   const response = await axios.get(`/api/portal/ragflow/datasets/${dsId}/documents`, {
-    params: { page_size: 1000 },
+    params: { page: 1, page_size: 1000 },
   })
   return (apiData(response) || []) as KnowledgeDocument[]
 }
@@ -2662,7 +2878,7 @@ const startDatasetStatusPolling = (dsId: string) => {
     datasetPollCounts.set(dsId, count)
     
     try {
-      await fetchDocumentsForDataset(dsId)
+      await fetchDocumentsForDataset(dsId, { silent: true, refresh: true })
       if (isUnmounted) return
       
       // 同步当前选中的文档详情信息
@@ -2753,15 +2969,6 @@ const parseSingleDocument = async (docId: string) => {
     delete nextParsing[docId]
     parsingDocIds.value = nextParsing
     showToast(extractError(err), 'error')
-  }
-}
-
-const copyToClipboard = async (text: string) => {
-  const ok = await copyText(text)
-  if (ok) {
-    showToast('已复制到剪贴板', 'success')
-  } else {
-    showToast('复制失败，请手动复制', 'error')
   }
 }
 
@@ -2954,6 +3161,88 @@ const bulkDeleteDocuments = async () => {
 /** 当前详情页的库是否可写：只读成员只能看内容，不能改元数据/上传/授权 */
 const selectedDatasetWritable = computed(() => canManageDataset(selectedDataset.value))
 
+/** 我能不能改这个库的文档（数据层）：与「编辑权限范围」策略无关，是策略算到我头上的结果 */
+const selectedDatasetContentWritable = computed(
+  () => Boolean(selectedDataset.value) && !isReadOnlyDataset(selectedDataset.value),
+)
+
+/**
+ * 头部「可编辑 / 只读」标签的悬浮说明。
+ *
+ * 只读有两种完全不同的原因，混成一句「无权限」会让人排查错方向：
+ * ① 数据层没给我写权限（编辑策略/授权没覆盖到我）；
+ * ② 数据层给了，但我的角色没有上传/删除/解析这些功能权限。
+ */
+const contentWritableHint = computed(() => {
+  if (!selectedDataset.value) return ''
+  if (selectedDatasetContentWritable.value) {
+    return `你可以编辑「${selectedDataset.value.platform_name || selectedDataset.value.name || ''}」的文档（上传 / 删除 / 解析）`
+  }
+  if (!canUpload.value && !canDeleteDocument.value && !canParse.value) {
+    return '只读：当前角色没有知识库的上传/删除/解析功能权限，即使库允许编辑也无法操作'
+  }
+  return '只读：本库的编辑权限范围没有覆盖到你，请联系库的归属人或管理员'
+})
+
+/* ---------------- 编辑权限范围（谁能改库里的文档） ---------------- */
+const showEditPolicyDialog = ref(false)
+const editPolicyTarget = ref<any>(null)
+
+/**
+ * 入口可见性：全局 element:knowledge:edit 是前置，再叠加管理级权限
+ * （管理员或归属人）。两者缺一，入口整个不渲染 —— 置灰会让人以为「再找找就能点」。
+ */
+const canConfigureEditPolicy = (dataset: any) => canEdit.value && canManageDataset(dataset)
+
+const EDIT_POLICY_LABELS: Record<string, string> = {
+  readonly: '只读',
+  granted: '被授权者可编辑',
+  all_viewers: '所有可见者可编辑',
+  team_members: '部门成员可编辑',
+  selected: '指定成员可编辑',
+}
+
+/** 当前库的编辑策略；老库没有这个字段时按可见范围的默认值显示 */
+const editPolicyOf = (dataset: any) => {
+  const policy = dataset?.edit_policy || {}
+  const visibility = visibilityOf(dataset)
+  if (visibility === 'private') return { mode: '', editors: [] as any[] }
+  const fallback = visibility === 'team' ? 'team_members' : 'readonly'
+  return {
+    mode: String(policy.mode || fallback),
+    editors: Array.isArray(policy.editors) ? policy.editors : [],
+  }
+}
+
+const editPolicyLabel = (dataset: any) => {
+  const mode = editPolicyOf(dataset).mode
+  return mode ? EDIT_POLICY_LABELS[mode] || mode : '—'
+}
+
+const editPolicyHint = (dataset: any) => {
+  const policy = editPolicyOf(dataset)
+  if (!policy.mode) return '个人私有库不支持设置编辑权限范围'
+  if (policy.mode === 'selected') {
+    const names = policy.editors.map((item: any) => item.real_name || item.user_name).filter(Boolean)
+    return names.length ? `可编辑：${names.join('、')}` : '可编辑：指定成员'
+  }
+  return `编辑权限：${EDIT_POLICY_LABELS[policy.mode] || policy.mode}（管理权不受影响）`
+}
+
+const openEditPolicyDialog = (dataset: any) => {
+  if (!canConfigureEditPolicy(dataset)) return
+  editPolicyTarget.value = dataset
+  showEditPolicyDialog.value = true
+  // 候选用户由弹窗自己按「知识库编辑权限」口径拉取，不依赖元数据管理的接口
+}
+
+/** 保存后先就地更新，再拉一次列表：徽标要立刻变，不能等下次进详情 */
+const onEditPolicySaved = (policy: any) => {
+  const target = editPolicyTarget.value
+  if (target) target.edit_policy = policy
+  void fetchDatasets(true)
+}
+
 // ==================== 引用与授权（影响面） ====================
 // 两件事必须分开看：
 // - 智能体引用 = 智能体 engine_config.dataset_ids 里选中了本库，删库会让它检索不到内容；
@@ -2990,6 +3279,17 @@ const loadDatasetReferences = async () => {
 /** 「更多」菜单里的「引用与授权」：直接打开库信息抽屉并落到授权页 */
 const openDatasetReferences = () => {
   if (!selectedDataset.value) return
+  openLibDrawer('references')
+  void loadDatasetReferences()
+}
+
+/**
+ * 列表里点「授权」列：选中该库并直接打开抽屉的「引用与授权」页。
+ * 原来要先点进详情、再切 Tab 才能分配授权，列表上多这一步没有意义。
+ */
+const openDatasetReferencesFor = (dataset: any) => {
+  if (!canManageDataset(dataset)) return
+  selectDatasetNode(dataset)
   openLibDrawer('references')
   void loadDatasetReferences()
 }
@@ -3489,6 +3789,61 @@ const openLibDrawer = (tab: 'settings' | 'audit' | 'references' = 'settings') =>
   drawerOpen.value = true
 }
 
+/**
+ * 工作区的翻页/筛选/排序都回到这里发请求。
+ *
+ * 每个 handler 先判「值真的变了没」：DocWorkspace 在切库时会主动把
+ * keyword/status/folder/page 复位并 emit 一遍，不复判就会在切库瞬间多打一次
+ * 完全相同的请求。
+ */
+const refreshWorkspaceDocs = () => {
+  const dsId = workspaceDatasetId.value
+  if (!dsId) return
+  void fetchDocumentsForDataset(dsId, { silent: true })
+}
+
+const onDocPageChange = (page: number) => {
+  if (page === docPage.value) return
+  docPage.value = page
+  refreshWorkspaceDocs()
+}
+
+const onDocPageSizeChange = (size: number) => {
+  if (size === docPageSize.value) return
+  docPageSize.value = size
+  docPage.value = 1
+  refreshWorkspaceDocs()
+}
+
+const onDocKeywordInput = (keyword: string) => {
+  if (keyword === docKeyword.value) return
+  docKeyword.value = keyword
+  docPage.value = 1
+  if (docSearchTimer) clearTimeout(docSearchTimer)
+  docSearchTimer = setTimeout(refreshWorkspaceDocs, 300)
+}
+
+const onDocStatusChange = (status: string) => {
+  if (status === docStatus.value) return
+  docStatus.value = status
+  docPage.value = 1
+  refreshWorkspaceDocs()
+}
+
+const onDocSortChange = (sort: string) => {
+  if (sort === docSort.value) return
+  docSort.value = sort
+  docPage.value = 1
+  refreshWorkspaceDocs()
+}
+
+const onDocFolderChange = (folder: string) => {
+  if (folder === docFolder.value) return
+  docFolder.value = folder
+  docPage.value = 1
+  refreshWorkspaceDocs()
+}
+
 const workspaceUpdateSelection = (ids: string[]) => {
   selectedDocIds.value = ids
   // 批量接口读的是 bulkDocDatasetId，不同步就会「点了删除但什么都没发生」
@@ -3570,7 +3925,9 @@ const handleManualRefreshDocs = async () => {
   if (!dsId) return
   refreshingDocs.value = true
   try {
-    await fetchDocumentsForDataset(dsId)
+    // 必须回源：文档全量列表在后端有 60s 缓存，不带 refresh 时点「同步」
+    // 拿到的还是同一份旧快照，用户会以为按钮没反应
+    await fetchDocumentsForDataset(dsId, { refresh: true })
     showToast('已刷新当前文档列表及状态', 'success')
   } catch (err) {
     showToast(extractError(err), 'error')
@@ -3724,6 +4081,44 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
           >
             <span class="whitespace-nowrap">显示指引</span>
           </button>
+
+          <!-- 引擎连接状态：正常态只留一个小圆点（hover 出地址 / Key），
+               检测中、断连、功能关闭才补短文案——纯黄点没人知道出了什么事。
+               它属于页面级运行前提，锚在标题行，不再占操作区那一行。 -->
+          <div
+            class="group relative ml-1 flex shrink-0 cursor-help items-center gap-1.5"
+            tabindex="0"
+            role="status"
+            :aria-label="engineStatusAriaLabel"
+          >
+            <span
+              class="inline-block h-2 w-2 shrink-0 rounded-full transition-colors"
+              :class="{
+                'animate-pulse bg-blue-500': isKnowledgeEnabled && engineStatus === 'checking',
+                'bg-emerald-500': isKnowledgeEnabled && engineStatus === 'connected',
+                'bg-amber-500': !isKnowledgeEnabled || engineStatus === 'disconnected'
+              }"
+            />
+            <span
+              v-if="engineStatusHint"
+              class="whitespace-nowrap text-xs font-medium"
+              :class="isKnowledgeEnabled && engineStatus === 'checking' ? 'text-blue-600' : 'text-amber-600'"
+            >
+              {{ engineStatusHint }}
+            </span>
+
+            <!-- 悬浮 Tooltip 提示引擎详细配置：正常态标题行只留点，完整信息放这里。
+                 窄屏居中对齐，否则从标题右侧向右铺 224px 会顶出屏幕。 -->
+            <span class="pointer-events-none absolute left-1/2 top-full z-50 mt-2 hidden w-56 -translate-x-1/2 rounded-lg bg-slate-900 p-2.5 text-left font-sans text-xs font-normal text-white shadow-xl group-hover:block group-focus-within:block sm:left-0 sm:translate-x-0">
+              <div class="mb-1 border-b border-white/10 pb-1 font-medium">知识库引擎信息</div>
+              <div class="break-all opacity-80">地址: {{ ragflowApiUrl }}</div>
+              <div class="mt-1 opacity-80">
+                API Key:
+                <span v-if="ragflowConfig?.api_key_configured" class="text-emerald-400">已配置</span>
+                <span v-else class="text-amber-400">未配置</span>
+              </div>
+            </span>
+          </div>
           <!-- 折叠按钮独立于整卡点击：卡里有四个可点控件，整卡可点会互相抢事件 -->
           <button
             type="button"
@@ -3745,42 +4140,12 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
       </div>
       <!--
         操作区：窄屏一行图标，lg 起恢复文字按钮。
-        三个文字按钮并排会把中文挤成两三行，两行又占竖向空间，所以窄屏只留图标；
-        顺序是 引擎状态 → 刷新 → 新建，图标按钮用 aria-label 保留语义。
-        同步按钮不在这里：概览面板右上角已有同一个入口，两处并排纯属重复。
+        文字按钮并排会把中文挤成两三行，两行又占竖向空间，所以窄屏只留图标；
+        图标按钮用 aria-label 保留语义。
+        引擎状态已经移到标题行（正常态只留一个圆点），不在这里占位；
+        同步按钮也不在这里：概览面板右上角已有同一个入口，两处并排纯属重复。
       -->
       <div class="relative z-10 flex shrink-0 items-center gap-2 lg:gap-3">
-        <!-- 引擎连接指示器 -->
-        <div
-          class="flex h-10 min-w-0 items-center gap-2 rounded-xl border px-2.5 text-xs transition-colors group relative cursor-pointer lg:h-auto lg:px-3 lg:py-1.5"
-          :class="{
-            'border-blue-200 bg-blue-50/50 text-blue-700': isKnowledgeEnabled && engineStatus === 'checking',
-            'border-emerald-200 bg-emerald-50/50 text-emerald-700': isKnowledgeEnabled && engineStatus === 'connected',
-            'border-amber-200 bg-amber-50/50 text-amber-700': !isKnowledgeEnabled || engineStatus === 'disconnected'
-          }"
-        >
-          <span
-            class="inline-block h-2 w-2 shrink-0 rounded-full"
-            :class="{
-              'bg-blue-500 animate-pulse': engineStatus === 'checking',
-              'bg-emerald-500': engineStatus === 'connected',
-              'bg-amber-500': engineStatus === 'disconnected'
-            }"
-          ></span>
-          <span class="whitespace-nowrap font-medium lg:hidden">{{ engineStatusShort }}</span>
-          <span class="hidden whitespace-nowrap font-medium lg:inline">引擎 {{ engineStatusText }}</span>
-
-          <!-- 悬浮 Tooltip 提示引擎详细配置 -->
-          <span class="absolute top-full right-0 mt-2 hidden group-hover:block bg-slate-900 text-white text-xs p-2.5 rounded-lg shadow-xl z-50 text-left font-sans font-normal pointer-events-none">
-            <div class="font-medium mb-1 border-b border-white/10 pb-1">知识库引擎信息</div>
-            <div class="opacity-80">地址: {{ ragflowApiUrl }}</div>
-            <div class="opacity-80 mt-1">
-              API Key: 
-              <span v-if="ragflowConfig?.api_key_configured" class="text-emerald-400">已配置</span>
-              <span v-else class="text-amber-400">未配置</span>
-            </div>
-          </span>
-        </div>
         <button
           type="button"
           class="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-gray-200 bg-white text-gray-600 transition-all hover:bg-gray-50 lg:h-auto lg:w-auto lg:px-4 lg:py-2"
@@ -4127,7 +4492,7 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
                 class="space-y-0.5"
                 :class="group.isFlat ? '' : 'ml-1.5 border-l border-gray-100 pl-2.5'"
               >
-                <div v-for="dataset in group.datasets" :key="dataset.ragflow_dataset_id || dataset.id">
+                <div v-for="dataset in visibleGroupDatasets(group)" :key="dataset.ragflow_dataset_id || dataset.id">
               
               <!-- Dataset Node (Parent) -->
               <div
@@ -4182,6 +4547,24 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
 
 
                 </div>
+
+                <!--
+                  分组内增量渲染：一个部门下有几百个库时，全渲染会把 DOM 撑到上千个节点。
+                  树不做页码（翻页找部门很反直觉），而是「先给 6 个，再看 10 个」，
+                  搜索时直接展开全部命中——那时列表已经足够短。
+                -->
+                <button
+                  v-if="treeGroupRemaining(group) > 0"
+                  type="button"
+                  class="ml-1 flex h-6 w-full items-center gap-1 rounded-md px-2 text-[11px] text-gray-400 transition-colors hover:bg-gray-50 hover:text-primary"
+                  @click="expandTreeGroup(group)"
+                >
+                  <svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 5v14M5 12h14" />
+                  </svg>
+                  再显示 {{ Math.min(10, treeGroupRemaining(group)) }} 个
+                  <span class="text-gray-300">（还剩 {{ treeGroupRemaining(group) }} 个）</span>
+                </button>
               </div>
             </div>
           </div>
@@ -4268,6 +4651,14 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
                   :class="visibilityBadgeClass(selectedDataset)"
                   :title="visibilityHint(selectedDataset)"
                 >{{ visibilityLabel(selectedDataset) }}</span>
+                <!-- 我的编辑权限：用户最关心的其实是「我能不能改」，不是策略本身 -->
+                <span
+                  class="shrink-0 cursor-default rounded-full border px-2 py-0.5 text-[11px] font-semibold leading-normal"
+                  :class="selectedDatasetContentWritable
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-600'
+                    : 'border-gray-200 bg-gray-50 text-gray-500'"
+                  :title="contentWritableHint"
+                >{{ selectedDatasetContentWritable ? '可编辑' : '只读' }}</span>
                 <HoverTip
                   v-if="selectedDataset.is_missing_in_ragflow"
                   :text="MISSING_DATASET_HINT"
@@ -4442,6 +4833,17 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
               :selected-ids="selectedDocIds"
               :active-id="selectedDocument?.id ?? null"
               :root-key="workspaceDatasetId"
+              :total="docTotal"
+              :all-total="docAllTotal"
+              :page="docPage"
+              :page-size="docPageSize"
+              :page-sizes="DOC_PAGE_SIZES"
+              :keyword="docKeyword"
+              :status="docStatus"
+              :sort="docSort"
+              :folder="docFolder"
+              :status-counts="docStatusCounts"
+              :folder-counts="docFolderCounts"
               @open-doc="workspaceOpenDoc"
               @parse-doc="workspaceParseDoc"
               @delete-doc="deletingDocument = $event"
@@ -4450,10 +4852,15 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
               @rename-folder="workspaceRenameFolder"
               @delete-folder="workspaceDeleteFolder"
               @update:selected-ids="workspaceUpdateSelection"
-              @upload="openLibDrawer('settings')"
+              @update:page="onDocPageChange"
+              @update:page-size="onDocPageSizeChange"
+              @update:keyword="onDocKeywordInput"
+              @update:status="onDocStatusChange"
+              @update:sort="onDocSortChange"
+              @update:folder="onDocFolderChange"
               @bulk-parse="bulkParseDocuments()"
               @bulk-delete="bulkDeleteDocuments()"
-              @bulk-move="showToast('拖动文件到文件夹行即可批量移动', 'warning')"
+              @bulk-move="showToast('拖动文件到下方文件夹标签即可批量移动', 'warning')"
               :bulk-enabled-busy="bulkEnabledBusy"
               @bulk-toggle-enabled="bulkToggleDocEnabled"
             />
@@ -4476,22 +4883,33 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
           <div class="mt-3 flex flex-wrap items-center gap-2">
             <div class="relative min-w-[180px] flex-1">
               <input
-                v-model="libraryQuery"
+                :value="libraryQuery"
                 type="search"
-                placeholder="搜索知识库名称 / 负责人"
+                placeholder="搜索知识库名称 / 负责人 / ID"
                 class="w-full rounded-lg border border-gray-200 bg-white py-1.5 pl-8 pr-3 text-[12px] placeholder-gray-400 transition-all focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20"
+                @input="onLibraryQueryInput(($event.target as HTMLInputElement).value)"
               />
               <svg class="absolute left-2.5 top-2 h-3.5 w-3.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
               </svg>
             </div>
             <select
-              v-model="libraryScope"
+              :value="libraryScope"
               class="rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-[12px] text-gray-600 focus:border-primary focus:outline-none"
+              aria-label="可见范围"
+              @change="onLibraryScopeChange"
             >
               <option value="all">全部范围</option>
               <option v-for="tab in VISIBILITY_TABS" :key="tab.key" :value="tab.key">{{ tab.label }}</option>
               <option value="missing">仅失联库</option>
+            </select>
+            <select
+              :value="librarySort"
+              class="rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-[12px] text-gray-600 focus:border-primary focus:outline-none"
+              aria-label="排序方式"
+              @change="onLibrarySortChange"
+            >
+              <option v-for="option in LIBRARY_SORT_OPTIONS" :key="option.key" :value="option.key">{{ option.label }}</option>
             </select>
             <div class="flex shrink-0 items-center rounded-lg bg-gray-100 p-0.5" role="tablist" aria-label="视图切换">
               <button
@@ -4526,21 +4944,28 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
           </div>
 
           <div
-            v-if="!libraryListRows.length"
+            v-if="libraryLoading && !libraryRows.length"
+            class="flex flex-1 items-center justify-center text-sm text-gray-400"
+          >正在加载知识库列表…</div>
+
+          <div
+            v-else-if="!libraryRows.length"
             class="flex flex-1 flex-col items-center justify-center gap-1.5 text-center"
           >
             <p class="text-sm text-gray-400">{{ libraryListEmpty }}</p>
-            <p v-if="listScope !== 'all'" class="text-xs text-gray-300">接口就绪后这里会自动有内容</p>
+            <p v-if="libraryQuery.trim() || libraryScope !== 'all'" class="text-xs text-gray-300">
+              换个关键词，或把可见范围切回「全部范围」
+            </p>
           </div>
 
           <div v-else-if="libraryView === 'list'" class="mt-3 flex-1 overflow-y-auto">
-            <div class="grid h-8 grid-cols-[18px_24px_minmax(0,1fr)_88px_48px_52px_62px_72px_88px_16px] items-center gap-x-2.5 rounded-lg bg-gray-50 px-3 text-[11px] font-semibold text-gray-400">
+            <div class="grid h-8 grid-cols-[18px_24px_minmax(0,1fr)_88px_48px_52px_62px_78px_72px_88px_16px] items-center gap-x-2.5 rounded-lg bg-gray-50 px-3 text-[11px] font-semibold text-gray-400">
               <input
                 type="checkbox"
                 class="h-3.5 w-3.5 rounded border-gray-300 text-primary focus:ring-primary/30"
                 :checked="libraryAllSelected"
                 :disabled="!librarySelectableRows.length"
-                :title="libraryAllSelected ? '取消全选' : '全选当前列表'"
+                :title="libraryAllSelected ? '取消全选（当前页）' : `全选当前页 ${librarySelectableRows.length} 个可管理的库`"
                 @change="toggleLibrarySelectAll"
               />
               <span></span>
@@ -4549,13 +4974,14 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
               <span>文档</span>
               <span>引用</span>
               <span>授权</span>
+              <span>编辑权限</span>
               <span>负责人</span>
               <span>更新时间</span>
             </div>
             <div
-              v-for="ds in libraryListRows"
+              v-for="ds in libraryRows"
               :key="ds.ragflow_dataset_id || ds.id"
-              class="grid w-full cursor-pointer grid-cols-[18px_24px_minmax(0,1fr)_88px_48px_52px_62px_72px_88px_16px] items-center gap-x-2.5 border-b border-gray-100 px-3 h-11 text-left transition-colors hover:bg-gray-50"
+              class="grid w-full cursor-pointer grid-cols-[18px_24px_minmax(0,1fr)_88px_48px_52px_62px_78px_72px_88px_16px] items-center gap-x-2.5 border-b border-gray-100 px-3 h-11 text-left transition-colors hover:bg-gray-50"
               @click="selectDatasetNode(ds)"
             >
               <input
@@ -4593,9 +5019,51 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
               <span class="text-[11px] tabular-nums" :class="(ds.agent_ref_count ?? 0) ? 'text-gray-500' : 'text-gray-300'" :title="libraryRefHint(ds)">
                 {{ (ds.agent_ref_count ?? 0) || '—' }}
               </span>
-              <span class="truncate text-[11px] tabular-nums" :class="(ds.grant_user_count ?? 0) || (ds.grant_role_count ?? 0) ? 'text-gray-500' : 'text-gray-300'" :title="libraryGrantHint(ds)">
-                {{ libraryGrantText(ds) }}
-              </span>
+              <button
+                v-if="canManageDataset(ds)"
+                type="button"
+                class="group/auth inline-flex max-w-full items-center gap-0.5 rounded px-1 py-0.5 text-[11px] tabular-nums transition-colors hover:bg-primary/5 hover:text-primary"
+                :class="(ds.grant_user_count ?? 0) || (ds.grant_role_count ?? 0) ? 'text-gray-500' : 'text-gray-300'"
+                :title="`${libraryGrantHint(ds)}；点击分配授权成员`"
+                @click.stop="openDatasetReferencesFor(ds)"
+              >
+                <span class="truncate">{{ libraryGrantText(ds) }}</span>
+                <svg class="h-2.5 w-2.5 shrink-0 opacity-0 transition-opacity group-hover/auth:opacity-100" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2" stroke-linecap="round" />
+                  <circle cx="9" cy="7" r="4" />
+                  <path d="M19 8v6M22 11h-6" stroke-linecap="round" />
+                </svg>
+              </button>
+              <span
+                v-else
+                class="truncate text-[11px] tabular-nums"
+                :class="(ds.grant_user_count ?? 0) || (ds.grant_role_count ?? 0) ? 'text-gray-500' : 'text-gray-300'"
+                :title="libraryGrantHint(ds)"
+              >{{ libraryGrantText(ds) }}</span>
+              <button
+                type="button"
+                class="group/edit inline-flex max-w-full items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-semibold transition-colors disabled:cursor-default"
+                :class="[
+                  editPolicyOf(ds).mode === 'readonly'
+                    ? 'border-gray-200 bg-white text-gray-500'
+                    : 'border-primary/30 bg-primary/10 text-primary',
+                  canConfigureEditPolicy(ds) ? 'hover:border-primary/50 hover:bg-primary/5' : '',
+                ]"
+                :disabled="!canConfigureEditPolicy(ds)"
+                :title="canConfigureEditPolicy(ds) ? '点击设置编辑权限范围' : editPolicyHint(ds)"
+                @click.stop="canConfigureEditPolicy(ds) ? openEditPolicyDialog(ds) : undefined"
+              >
+                <span class="truncate">{{ editPolicyLabel(ds) }}</span>
+                <!-- 只有有权限时才显示笔图标：它是「这里可以点」的信号，不是装饰 -->
+                <svg
+                  v-if="canConfigureEditPolicy(ds)"
+                  class="h-2.5 w-2.5 shrink-0 opacity-0 transition-opacity group-hover/edit:opacity-100 group-hover/edit:text-primary"
+                  viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                >
+                  <path d="M12 20h9" stroke-linecap="round" />
+                  <path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
               <span class="truncate text-[11px] text-gray-500">{{ libraryOwnerOf(ds) }}</span>
               <span class="text-[11px] text-gray-500 tabular-nums">{{ libraryUpdatedAtOf(ds) }}</span>
               <svg class="h-3 w-3 text-gray-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -4607,7 +5075,7 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
           <!-- 卡片视图：同样的数据换一种扫读方式，点卡片等价于点行 -->
           <div v-else class="mt-3 grid flex-1 content-start gap-3 overflow-y-auto pb-2 grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
             <button
-              v-for="ds in libraryListRows"
+              v-for="ds in libraryRows"
               :key="libraryRowId(ds)"
               type="button"
               class="group flex flex-col rounded-xl border border-gray-200 bg-white p-3 text-left transition-all hover:border-primary/40 hover:shadow-sm"
@@ -4637,7 +5105,27 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
               <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-gray-400">
                 <span><b class="font-semibold text-gray-600 tabular-nums">{{ docCountOf(ds) }}</b> 文档</span>
                 <span :title="libraryRefHint(ds)"><b class="font-semibold text-gray-600 tabular-nums">{{ (ds.agent_ref_count ?? 0) || '—' }}</b> 引用</span>
-                <span :title="libraryGrantHint(ds)"><b class="font-semibold text-gray-600 tabular-nums">{{ libraryGrantText(ds) }}</b> 授权</span>
+                <span
+                  :title="canManageDataset(ds) ? `${libraryGrantHint(ds)}；点击分配授权成员` : libraryGrantHint(ds)"
+                  :class="canManageDataset(ds) ? 'cursor-pointer underline decoration-dotted underline-offset-2 hover:text-primary' : ''"
+                  :role="canManageDataset(ds) ? 'button' : undefined"
+                  :tabindex="canManageDataset(ds) ? 0 : undefined"
+                  @click.stop="openDatasetReferencesFor(ds)"
+                  @keydown.enter.stop="openDatasetReferencesFor(ds)"
+                ><b class="font-semibold text-gray-600 tabular-nums">{{ libraryGrantText(ds) }}</b> 授权</span>
+                <!-- 卡片本身是 <button>，这里只能用 span：HTML 不允许 button 套 button。
+                     有权限时给下划线 + hover 变蓝，和行视图的笔图标表达同一件事 -->
+                <span
+                  role="button"
+                  tabindex="0"
+                  class="inline-flex items-center gap-0.5"
+                  :class="canConfigureEditPolicy(ds)
+                    ? 'cursor-pointer underline decoration-dotted underline-offset-2 hover:text-primary'
+                    : ''"
+                  :title="canConfigureEditPolicy(ds) ? '点击设置编辑权限范围' : editPolicyHint(ds)"
+                  @click.stop="canConfigureEditPolicy(ds) ? openEditPolicyDialog(ds) : undefined"
+                  @keydown.enter.stop="canConfigureEditPolicy(ds) ? openEditPolicyDialog(ds) : undefined"
+                >{{ editPolicyLabel(ds) }}</span>
               </div>
               <div class="mt-2 flex items-center gap-1.5 border-t border-dashed border-gray-100 pt-2 text-[10.5px] text-gray-400">
                 <span class="truncate">{{ libraryOwnerOf(ds) }}</span>
@@ -4646,6 +5134,22 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
               </div>
             </button>
           </div>
+
+          <!--
+            分页条常驻底部：翻页要能随时点，不该跟着列表一起滚走。
+            「全选」只作用于当前页，跨页勾选保留并在右侧写明数量。
+          -->
+          <PaginationBar
+            v-if="libraryRows.length"
+            :total="libraryTotal"
+            :page="libraryPage"
+            :page-size="libraryPageSize"
+            :page-sizes="LIBRARY_PAGE_SIZES"
+            unit="个知识库"
+            :note="librarySelectedCount ? `已选 ${librarySelectedCount} 个（跨页保留）` : ''"
+            @update:page="onLibraryPageChange"
+            @update:page-size="onLibraryPageSizeChange"
+          />
         </div>
 
         <!--
@@ -5463,45 +5967,6 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
                 </div>
             </section>
 
-
-            <!--
-              Extended config JSON：与编辑弹窗的「高级设置」同一口径——默认收起。
-              这坨 JSON 只有 folder_structure / custom_questions 两个键有消费者，
-              平时挂在详情页最底部纯属视觉噪音，还把左右分栏的高度全吃掉了。
-            -->
-            <div class="flex flex-col shrink-0 border-t border-gray-200 pt-5 mt-5">
-              <div class="flex items-center justify-between gap-2">
-                <button
-                  type="button"
-                  class="flex items-center gap-1.5 text-left text-[12.5px] font-semibold text-gray-800 transition-colors hover:text-primary"
-                  :aria-expanded="detailConfigOpen"
-                  @click="detailConfigOpen = !detailConfigOpen"
-                >
-                  <svg
-                    class="h-3 w-3 shrink-0 transition-transform duration-200"
-                    :class="{ 'rotate-90': detailConfigOpen }"
-                    fill="none" stroke="currentColor" viewBox="0 0 24 24"
-                  >
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
-                  </svg>
-                  业务元数据扩展配置 (JSON)
-                </button>
-                <div class="flex shrink-0 items-center gap-2">
-                  <button
-                    v-if="detailConfigOpen"
-                    class="text-xs font-semibold text-primary hover:underline"
-                    @click="copyToClipboard(JSON.stringify(selectedDataset.local_metadata?.extra_config || {}, null, 2))"
-                  >
-                    复制配置
-                  </button>
-                  <span class="text-[10px] text-gray-300 select-none">{{ detailConfigOpen ? '收起' : '展开' }}</span>
-                </div>
-              </div>
-              <pre
-                v-show="detailConfigOpen"
-                class="mt-2 max-h-[280px] overflow-auto rounded-xl bg-gray-900 p-4 font-mono text-xs leading-relaxed text-emerald-400 shadow-inner"
-              >{{ JSON.stringify(selectedDataset.local_metadata?.extra_config || {}, null, 2) }}</pre>
-            </div>
             </template>
 
             <!-- 操作日志：谁在什么时候对这个库做了什么 -->
@@ -5569,6 +6034,38 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
 
             <!-- 引用与授权：智能体绑定了本库 / 谁被授权访问本库 -->
             <div v-if="detailTab === 'references'" class="flex-1 space-y-4 pt-2 min-h-0 overflow-y-auto">
+              <!-- 编辑权限范围：谁能改这个库里的文档（不含库设置） -->
+              <section
+                v-if="visibilityOf(selectedDataset) !== 'private'"
+                class="rounded-xl border p-4"
+                :class="canConfigureEditPolicy(selectedDataset) ? 'border-primary/30 bg-primary/[0.03]' : 'border-gray-200 bg-white'"
+              >
+                <div class="flex items-center justify-between gap-2">
+                  <h3 class="text-sm font-semibold text-gray-800">
+                    编辑权限范围
+                    <span class="ml-1 text-xs font-normal text-gray-400">谁能改这个库的文档</span>
+                  </h3>
+                  <button
+                    v-if="canConfigureEditPolicy(selectedDataset)"
+                    type="button"
+                    class="rounded-lg bg-primary px-2.5 py-1 text-[11px] font-bold text-white shadow-sm transition-colors hover:bg-primary/90"
+                    @click="openEditPolicyDialog(selectedDataset)"
+                  >设置编辑范围</button>
+                </div>
+                <p class="mt-1 text-[11px] leading-relaxed text-gray-500">
+                  当前策略：
+                  <span class="ml-0.5 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-bold"
+                    :class="editPolicyOf(selectedDataset).mode === 'readonly' ? 'bg-gray-100 text-gray-500' : 'bg-primary/10 text-primary'"
+                  >{{ editPolicyLabel(selectedDataset) }}</span>
+                  <span v-if="editPolicyOf(selectedDataset).mode === 'selected'" class="ml-1">
+                    {{ editPolicyHint(selectedDataset) }}
+                  </span>
+                </p>
+                <p class="mt-1 text-[11px] leading-relaxed text-gray-400">
+                  编辑权 ≠ 管理权：能改文档的人改不了可见范围、授权名单，也删不了库。收窄策略立即生效。
+                </p>
+              </section>
+
               <section class="rounded-xl border border-gray-200 bg-white p-4">
                 <div class="flex items-center justify-between gap-2">
                   <h3 class="text-sm font-semibold text-gray-800">
@@ -5921,44 +6418,6 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
           <label class="block text-xs font-semibold text-gray-400 mb-1.5">平台备注</label>
           <textarea v-model="form.notes" class="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary" rows="2" placeholder="请输入备注"></textarea>
         </div>
-        <div class="overflow-hidden rounded-xl border border-gray-200">
-          <button
-            type="button"
-            class="flex w-full items-center justify-between bg-gray-50/60 px-3 py-2.5 text-left transition-colors hover:bg-gray-50"
-            :aria-expanded="createAdvancedConfigOpen"
-            @click="createAdvancedConfigOpen = !createAdvancedConfigOpen"
-          >
-            <span class="flex items-center gap-1.5">
-              <svg
-                class="h-3.5 w-3.5 shrink-0 text-gray-400 transition-transform duration-200"
-                :class="{ 'rotate-90': createAdvancedConfigOpen }"
-                fill="none" stroke="currentColor" viewBox="0 0 24 24"
-              >
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
-              </svg>
-              <span class="text-xs font-semibold text-gray-500">高级设置</span>
-              <span class="text-[11px] text-gray-400">· 业务扩展配置 JSON</span>
-            </span>
-            <span class="shrink-0 text-[10px] text-gray-400">{{ createAdvancedConfigOpen ? '收起' : '展开' }}</span>
-          </button>
-
-          <div v-show="createAdvancedConfigOpen" class="space-y-2 border-t border-gray-100 px-3 pb-3 pt-2.5">
-            <div class="space-y-1.5 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] leading-relaxed text-amber-800">
-              <p><b>保存是整份覆盖。</b>删掉 <code class="font-mono">folder_structure</code> 会让所有文档掉回「未分类」，虚拟文件夹丢失且无法撤销。</p>
-              <p>只有下面两个键会被读取，其余键写了也不会生效：</p>
-              <ul class="list-disc space-y-0.5 pl-4">
-                <li><code class="font-mono">folder_structure</code>：虚拟文件夹映射，由「新建文件夹 / 移动文档」自动维护，一般无需手改。</li>
-                <li><code class="font-mono">custom_questions</code>：知识库门户的快捷提问，形如 <code class="font-mono">[{label:'总结核心内容', query:'请帮我梳理要点'}]</code>。</li>
-              </ul>
-            </div>
-            <textarea
-              v-model="form.extraConfigText"
-              class="w-full rounded-xl border border-gray-200 bg-white px-3 py-2 font-mono text-xs focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary disabled:bg-gray-100"
-              rows="4"
-              placeholder="{}"
-            ></textarea>
-          </div>
-        </div>
         <div class="flex justify-end gap-3 pt-2">
           <button class="px-4 py-2 rounded-xl border text-sm font-semibold hover:bg-gray-50 transition-all" @click="showCreateModal = false">取消</button>
           <button class="px-4 py-2 rounded-xl bg-primary text-white text-sm font-semibold disabled:opacity-50" :disabled="!isEngineReady || creatingDataset" @click="createDataset">{{ creatingDataset ? '创建中…' : '确定创建' }}</button>
@@ -6185,50 +6644,6 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
           </div>
         </div>
 
-        <!--
-          额外扩展配置：本质是开发者的逃生舱口，不该摆在一级表单里。
-          只有 folder_structure 与 custom_questions 会被读取，其余键写了没人用；
-          而保存是整份覆盖——手滑删掉 folder_structure，所有文档会掉回「未分类」且无法撤销。
-          因此折叠起来 + 把代价写在脸上。
-        -->
-        <div class="overflow-hidden rounded-xl border border-gray-200">
-          <button
-            type="button"
-            class="flex w-full items-center justify-between bg-gray-50/60 px-3 py-2.5 text-left transition-colors hover:bg-gray-50"
-            :aria-expanded="advancedConfigOpen"
-            @click="advancedConfigOpen = !advancedConfigOpen"
-          >
-            <span class="flex items-center gap-1.5">
-              <svg
-                class="h-3.5 w-3.5 shrink-0 text-gray-400 transition-transform duration-200"
-                :class="{ 'rotate-90': advancedConfigOpen }"
-                fill="none" stroke="currentColor" viewBox="0 0 24 24"
-              >
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
-              </svg>
-              <span class="text-xs font-semibold text-gray-500">高级设置</span>
-              <span class="text-[11px] text-gray-400">· 额外扩展配置 JSON</span>
-            </span>
-            <span class="shrink-0 text-[10px] text-gray-400">{{ advancedConfigOpen ? '收起' : '展开' }}</span>
-          </button>
-
-          <div v-show="advancedConfigOpen" class="space-y-2 border-t border-gray-100 px-3 pb-3 pt-2.5">
-            <div class="space-y-1.5 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] leading-relaxed text-amber-800">
-              <p><b>保存是整份覆盖。</b>删掉 <code class="font-mono">folder_structure</code> 会让所有文档掉回「未分类」，虚拟文件夹丢失且无法撤销。</p>
-              <p>只有下面两个键会被读取，其余键写了也不会生效：</p>
-              <ul class="list-disc space-y-0.5 pl-4">
-                <li><code class="font-mono">folder_structure</code>：虚拟文件夹映射，由「新建文件夹 / 移动文档」自动维护，一般无需手改。</li>
-                <li><code class="font-mono">custom_questions</code>：知识库门户的快捷提问，形如 <code class="font-mono">[{label:'总结核心内容', query:'请帮我梳理要点'}]</code>。</li>
-              </ul>
-            </div>
-            <textarea
-              v-model="form.extraConfigText"
-              class="w-full rounded-xl border border-gray-200 bg-white px-3 py-2 font-mono text-xs focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary disabled:bg-gray-100"
-              rows="4"
-              placeholder="{}"
-            ></textarea>
-          </div>
-        </div>
         <div class="flex justify-end gap-3 pt-2">
           <button class="px-4 py-2 rounded-xl border text-sm font-semibold hover:bg-gray-50 transition-all" @click="showEditModal = false">取消</button>
           <button class="px-4 py-2 rounded-xl bg-primary text-white text-sm font-semibold disabled:opacity-50" :disabled="!isEngineReady || savingMetadata" @click="updateMetadata">{{ savingMetadata ? '保存中…' : '保存' }}</button>
@@ -7170,8 +7585,17 @@ const handleFlowGuideAction = (type: 'create' | 'sync') => {
              </div>
           </div>
         </div>
-      </div>
+</div>
     </Teleport>
+
+  <!-- 编辑权限范围设置：详情页与列表页共用同一个弹窗。
+       必须挂在根级：放进帮助面板/抽屉的分支里，分支不渲染时点按钮就没反应。 -->
+  <KnowledgeEditPolicyDialog
+    :show="showEditPolicyDialog"
+    :dataset="editPolicyTarget"
+    @close="showEditPolicyDialog = false"
+    @saved="onEditPolicySaved"
+  />
 </template>
 
 <style scoped>

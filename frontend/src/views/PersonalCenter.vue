@@ -210,8 +210,26 @@ const closeToast = () => {
  * 偏好存在账号级 Redis，切换后侧栏立即换排布；不做系统配置项，
  * 默认值由后端按角色给（管理员 pro、其他 user）。
  */
-const { uiMode, setUiMode } = useUiMode()
+const {
+  uiMode,
+  setUiMode,
+  blockedModes: uiModeBlockedModes,
+  blockedBy: uiModeBlockedBy,
+} = useUiMode()
 const switchingUiMode = ref(false)
+
+/**
+ * 角色级黑名单：被禁的模式置灰并写明来源，而不是直接消失。
+ * 直接隐藏会让用户以为「平台没有这个功能」，也找不到该找谁。
+ */
+const isUiModeBlocked = (mode: 'user' | 'pro') => uiModeBlockedModes.value.includes(mode)
+const uiModeBlockedReason = (mode: 'user' | 'pro') => {
+  if (!isUiModeBlocked(mode)) return ''
+  const who = uiModeBlockedBy.value.length
+    ? `角色「${uiModeBlockedBy.value[0]}」`
+    : '管理员统一设置'
+  return `由${who}关闭，需要恢复请联系管理员`
+}
 
 const uiModeOptions: Array<{ value: 'user' | 'pro'; label: string; desc: string }> = [
   {
@@ -807,13 +825,14 @@ import NotificationConfigs from '../components/personal/NotificationConfigs.vue'
 import DataPortalHome from './DataPortalHome.vue'
 import SkillsManagement from './SkillsManagement.vue'
 import McpManagement from './McpManagement.vue'
+import SecretCenter from './SecretCenter.vue'
 import TaskCenter from './TaskCenter.vue'
 import { useRoute, useRouter } from 'vue-router'
 
-type PersonalTab = 'info' | 'permissions' | 'memory' | 'tokens' | 'notifications' | 'data' | 'skills' | 'mcp' | 'tasks'
+type PersonalTab = 'info' | 'permissions' | 'memory' | 'tokens' | 'notifications' | 'data' | 'skills' | 'mcp' | 'secrets' | 'tasks'
 const route = useRoute()
 const router = useRouter()
-const personalTabs: PersonalTab[] = ['info', 'permissions', 'memory', 'tokens', 'notifications', 'data', 'skills', 'mcp', 'tasks']
+const personalTabs: PersonalTab[] = ['info', 'permissions', 'memory', 'tokens', 'notifications', 'data', 'skills', 'mcp', 'secrets', 'tasks']
 /** 申请并进「我的权限」后，旧深链 ?tab=requests 仍然要能用 */
 const wantsRequestView =
     route.query.tab === 'requests' || route.query.subtab === 'requests'
@@ -1091,6 +1110,17 @@ onMounted(() => {
                 >
                     我的权限
                 </button>
+                <button
+                    @click="activeTab = 'secrets'"
+                    :class="[
+                        activeTab === 'secrets'
+                            ? 'border-blue-500 text-blue-600'
+                            : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300',
+                        'whitespace-nowrap py-3 sm:py-4 px-1 border-b-2 font-medium text-xs sm:text-sm transition-colors'
+                    ]"
+                >
+                    我的凭据
+                </button>
                 <button 
                     @click="activeTab = 'memory'"
                     :class="[
@@ -1146,7 +1176,7 @@ onMounted(() => {
                 >
                     我的 MCP
                 </button>
-                <button
+                                <button
                     @click="activeTab = 'tasks'"
                     :class="[
                         activeTab === 'tasks'
@@ -1171,7 +1201,7 @@ onMounted(() => {
             </nav>
         </div>
 
-        <div :class="(activeTab === 'data' || activeTab === 'skills' || activeTab === 'mcp' || activeTab === 'tasks' || activeTab === 'info') ? 'pt-4 sm:pt-5' : 'px-4 pt-4 pb-4 sm:px-6 sm:pt-5 sm:pb-6'">
+        <div :class="(activeTab === 'data' || activeTab === 'skills' || activeTab === 'mcp' || activeTab === 'secrets' || activeTab === 'tasks' || activeTab === 'info') ? 'pt-4 sm:pt-5' : 'px-4 pt-4 pb-4 sm:px-6 sm:pt-5 sm:pb-6'">
         <!-- Info Tab (类似我的数据门户：左侧子菜单 + 右侧主内容) -->
         <div v-if="activeTab === 'info'" class="grid grid-cols-1 overflow-hidden bg-white md:grid-cols-[200px_minmax(0,1fr)] min-h-[560px]">
             <!-- 左侧 Aside 垂直导航栏 -->
@@ -1728,20 +1758,36 @@ onMounted(() => {
                             :key="option.value"
                             type="button"
                             class="rounded-xl border p-4 text-left transition-all"
-                            :class="uiMode === option.value
-                                ? 'border-blue-500 bg-blue-50/40 shadow-[0_0_0_3px_rgba(22,119,255,0.09)]'
-                                : 'border-gray-200 bg-white hover:border-gray-300'"
-                            :disabled="switchingUiMode"
+                            :class="isUiModeBlocked(option.value)
+                                ? 'border-dashed border-gray-200 bg-gray-50/60'
+                                : uiMode === option.value
+                                    ? 'border-blue-500 bg-blue-50/40 shadow-[0_0_0_3px_rgba(22,119,255,0.09)]'
+                                    : 'border-gray-200 bg-white hover:border-gray-300'"
+                            :disabled="switchingUiMode || isUiModeBlocked(option.value)"
                             @click="handleSwitchUiMode(option.value)"
                         >
                             <div class="flex items-center gap-2">
-                                <span class="text-sm font-semibold text-gray-900">{{ option.label }}</span>
                                 <span
-                                    v-if="uiMode === option.value"
+                                    class="text-sm font-semibold"
+                                    :class="isUiModeBlocked(option.value) ? 'text-gray-400' : 'text-gray-900'"
+                                >{{ option.label }}</span>
+                                <span
+                                    v-if="isUiModeBlocked(option.value)"
+                                    class="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] font-semibold text-gray-500"
+                                >管理员已禁用</span>
+                                <span
+                                    v-else-if="uiMode === option.value"
                                     class="rounded bg-blue-100 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700"
                                 >当前</span>
                             </div>
-                            <p class="mt-1.5 text-xs leading-relaxed text-gray-500">{{ option.desc }}</p>
+                            <p
+                                class="mt-1.5 text-xs leading-relaxed"
+                                :class="isUiModeBlocked(option.value) ? 'text-gray-400' : 'text-gray-500'"
+                            >{{ option.desc }}</p>
+                            <p
+                                v-if="isUiModeBlocked(option.value)"
+                                class="mt-1 text-[11px] leading-relaxed text-amber-600"
+                            >{{ uiModeBlockedReason(option.value) }}</p>
                         </button>
                     </div>
 
@@ -2080,6 +2126,10 @@ onMounted(() => {
 
         <div v-else-if="activeTab === 'mcp'" class="px-3 pb-4 sm:px-6 sm:pb-6 min-h-[28rem]">
             <McpManagement personal-only :initial-personal-menu="mcpInitialMenu" />
+        </div>
+
+        <div v-else-if="activeTab === 'secrets'" class="px-3 pb-4 sm:px-6 sm:pb-6 min-h-[28rem]">
+            <SecretCenter />
         </div>
 
         <div v-else-if="activeTab === 'tasks'" class="px-4 pb-4 sm:px-6 sm:pb-6 min-h-[32rem]">

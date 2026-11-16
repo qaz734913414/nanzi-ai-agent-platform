@@ -46,8 +46,10 @@ from app.services.ai.tools.request_signing import (
     validate_signing_key_id,
     validate_signing_secret,
 )
+from app.services.ai.tools.registry import ToolRegistry
 from app.services.ai.tools.system_params import SystemParamConfigError, validate_system_params
 from app.services.ai.tools.user_placeholders import UserPlaceholderError
+from app.services.secrets.redact import redact_value
 from app.utils.masking import mask_sensitive_data
 
 router = APIRouter()
@@ -433,6 +435,9 @@ async def create_tool(
         await db.rollback()
         raise HTTPException(status_code=400, detail="签名 Key-Id 已被其他工具使用") from exc
     await db.refresh(new_tool)
+    # 脚本工具和 MCP 服务改完都清缓存，API 工具原来没清：新建/改过之后，
+    # 智能体在缓存有效期内拿到的仍是旧定义，新加的系统参数或请求头看不见。
+    ToolRegistry.clear_db_tool_cache()
     return new_tool
 
 @router.put("/{tool_id}", response_model=SysApiToolResponse)
@@ -481,6 +486,18 @@ async def update_tool(
         await db.rollback()
         raise HTTPException(status_code=400, detail="签名 Key-Id 已被其他工具使用") from exc
     await db.refresh(tool)
+    ToolRegistry.clear_db_tool_cache()
+
+    # URL / method 决定了参数落在 path、query 还是 body。改了配置之后旧槽位就是
+    # 孤儿——界面按参数名查还显示「已绑定」，运行时按新槽位查却取不到。
+    try:
+        from app.services.secrets.center import migrate_api_tool_param_slots
+
+        await migrate_api_tool_param_slots(db, tool)
+    except Exception:  # noqa: BLE001
+        # 迁移失败不该让「保存工具」整体失败：绑定还在，用户重新选一次即可。
+        logger.warning("迁移 API 工具 %s 的参数绑定槽位失败", tool.id, exc_info=True)
+
     return tool
 
 @router.post("/batch-group")
@@ -499,6 +516,7 @@ async def batch_set_tool_group(
     for tool in tools:
         tool.group_name = payload.group_name
     await db.commit()
+    ToolRegistry.clear_db_tool_cache()
     return {"updated": len(tools), "group_name": payload.group_name}
 
 
@@ -516,6 +534,12 @@ async def delete_tool(
     
     await db.delete(tool)
     await db.commit()
+    ToolRegistry.clear_db_tool_cache()
+    # 表间没有外键，孤儿绑定没人替我们清：不清的话「这条凭据被绑到哪了」
+    # 会一直显示一个已经删掉的工具。
+    from app.services.secrets import center as secret_center
+
+    await secret_center.detach_consumer(db, consumer_type="api_tool", consumer_id=tool_id)
     return {"status": "success", "message": "Tool deleted"}
 
 
@@ -600,8 +624,11 @@ async def preview_tool(
         )
 
     # 内存草稿：与运行时拿到的 SysApiTool 同形（headers / schema 都是 JSON 字符串）
+    # id 要尽量真：凭据绑定按 consumer_id 查，用假 id 的话标成「来自凭据」
+    # 的参数在试跑时永远解析不到，只会报「未绑定」——而运行时是好用的。
+    # 新建工具还没有 id，那就退回占位符（此时确实没有绑定可查）。
     draft = SysApiTool(
-        id="__preview__",
+        id=str(payload.tool_id or "__preview__"),
         name="__preview__",
         method=method,
         url_template=payload.url_template,
@@ -616,12 +643,16 @@ async def preview_tool(
         """把内核捕获的最终请求转成响应；凭据只以脱敏形式离开服务端。"""
         if not capture:
             return None
+        safe_url = redact_value(capture.get("url") or "", where="API 工具试跑请求", log_hits=False)
+        safe_headers = redact_value(capture.get("headers") or {}, where="API 工具试跑请求", log_hits=False)
+        safe_query = redact_value(capture.get("query") or {}, where="API 工具试跑请求", log_hits=False)
+        safe_body = redact_value(capture.get("body"), where="API 工具试跑请求", log_hits=False)
         return SysApiToolPreviewRequestInfo(
             method=str(capture.get("method") or ""),
-            url=str(mask_sensitive_data(capture.get("url") or "") or ""),
-            headers=mask_sensitive_data(capture.get("headers") or {}) or {},
-            query=mask_sensitive_data(capture.get("query") or {}) or {},
-            body=mask_sensitive_data(capture.get("body")),
+            url=str(mask_sensitive_data(safe_url) or ""),
+            headers=mask_sensitive_data(safe_headers) or {},
+            query=mask_sensitive_data(safe_query) or {},
+            body=mask_sensitive_data(safe_body),
         )
 
     try:
@@ -673,22 +704,26 @@ async def preview_tool(
             request=request_info(),
         )
     except httpx.HTTPError as exc:
+        safe_exc = redact_value(str(exc), where="API 工具试跑异常")
         return SysApiToolPreviewResponse(
             ok=False,
             error_kind="connection",
-            message=f"没能连上目标接口（{type(exc).__name__}）：{exc}",
+            message=f"没能连上目标接口（{type(exc).__name__}）：{safe_exc}",
             request=request_info(),
         )
     except Exception as exc:  # noqa: BLE001 —— 试跑必须给出原因，而不是甩一个 500
-        logger.warning("[ToolPreview] unexpected failure: %s", exc)
+        safe_exc = redact_value(str(exc), where="API 工具试跑异常")
+        logger.warning("[ToolPreview] unexpected failure: %s", safe_exc)
         return SysApiToolPreviewResponse(
-            ok=False, error_kind="connection", message=f"试跑失败：{exc}",
+            ok=False, error_kind="connection", message=f"试跑失败：{safe_exc}",
             request=request_info(),
         )
 
     raw_body = response.text or ""
-    truncated = len(raw_body) > PREVIEW_BODY_LIMIT
-    body_text = raw_body[:PREVIEW_BODY_LIMIT]
+    # 先脱敏再截断，避免跨越 PREVIEW_BODY_LIMIT 的凭据只剩下前半段明文
+    redacted_body = redact_value(raw_body, where="API 工具试跑响应")
+    truncated = len(redacted_body) > PREVIEW_BODY_LIMIT
+    body_text = redacted_body[:PREVIEW_BODY_LIMIT]
 
     if 200 <= response.status_code < 300:
         return SysApiToolPreviewResponse(

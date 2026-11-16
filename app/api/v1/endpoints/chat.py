@@ -3,7 +3,7 @@ import os
 import time
 import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, AsyncGenerator, Dict, Any, Union, Literal
+from typing import List, Optional, AsyncGenerator, Awaitable, Callable, Dict, Any, Union, Literal
 from fastapi import APIRouter, HTTPException, Depends, Query, Request, UploadFile, File
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from pydantic import AliasChoices, BaseModel, Field, field_validator
@@ -275,7 +275,9 @@ class ArtifactListItem(BaseModel):
     mime_type: Optional[str] = None
     size: int
     conversation_id: Optional[str] = None
+    parent_conversation_id: Optional[str] = None
     trace_id: Optional[str] = None
+    parent_trace_id: Optional[str] = None
     created_at: Optional[datetime] = None
     expires_at: Optional[datetime] = None
     download_url: str
@@ -305,7 +307,7 @@ async def list_artifacts(
         build_download_url,
     )
     from app.services.app_public_url_service import get_app_public_url
-    from sqlalchemy import func, select
+    from sqlalchemy import func, or_, select
 
     user_id = _require_numeric_chat_user_id(user_info)
 
@@ -313,9 +315,21 @@ async def list_artifacts(
     if artifact_type:
         filters.append(AiArtifact.artifact_type == artifact_type)
     if conversation_id:
-        filters.append(AiArtifact.conversation_id == conversation_id)
+        # 子代理委派产物：conversation_id 仍是实际产生的子会话（审计口径），
+        # parent_conversation_id 指向父会话，主会话的产物面板据此直接聚合。
+        filters.append(
+            or_(
+                AiArtifact.conversation_id == conversation_id,
+                AiArtifact.parent_conversation_id == conversation_id,
+            )
+        )
     if trace_id:
-        filters.append(AiArtifact.trace_id == trace_id)
+        filters.append(
+            or_(
+                AiArtifact.trace_id == trace_id,
+                AiArtifact.parent_trace_id == trace_id,
+            )
+        )
     total = await db.scalar(
         select(func.count())
         .select_from(AiArtifact)
@@ -355,7 +369,9 @@ async def list_artifacts(
                 mime_type=row.mime_type,
                 size=int(row.size or 0),
                 conversation_id=row.conversation_id,
+                parent_conversation_id=row.parent_conversation_id,
                 trace_id=row.trace_id,
+                parent_trace_id=row.parent_trace_id,
                 created_at=row.created_at,
                 expires_at=expires_at,
                 download_url=build_download_url(
@@ -387,7 +403,8 @@ class ArtifactCountsByTrace(BaseModel):
     response_model=StandardResponse[ArtifactCountsByTrace],
     summary="会话内产物数量统计",
     description="按 conversation_id 一次返回当前用户该会话内各 trace_id 的产物数量，"
-    "仅统计 trace_id 非空的产物；不含文件元信息、不签发下载 token，供前端判断某条 AI 消息是否真有产物及显示数量角标。",
+    "子代理委派产物按父 trace 归并到对应 AI 消息；仅统计有效 trace_id 非空的产物；"
+    "不含文件元信息、不签发下载 token，供前端判断某条 AI 消息是否真有产物及显示数量角标。",
 )
 async def count_artifacts_by_trace(
     conversation_id: str = Query(..., description="会话 id"),
@@ -395,19 +412,24 @@ async def count_artifacts_by_trace(
     db: AsyncSession = Depends(get_db_session),
 ):
     from app.models.artifact import AiArtifact
-    from sqlalchemy import func, select
+    from sqlalchemy import func, or_, select
 
     user_id = _require_numeric_chat_user_id(user_info)
 
+    # 子代理产物把 parent_trace_id 归到父消息；没有父归属时退回产物自身 trace。
+    effective_trace_id = func.coalesce(AiArtifact.parent_trace_id, AiArtifact.trace_id)
     rows = (
         await db.execute(
-            select(AiArtifact.trace_id, func.count())
+            select(effective_trace_id, func.count())
             .where(
                 AiArtifact.owner_user_id == user_id,
-                AiArtifact.conversation_id == conversation_id,
-                AiArtifact.trace_id.isnot(None),
+                or_(
+                    AiArtifact.conversation_id == conversation_id,
+                    AiArtifact.parent_conversation_id == conversation_id,
+                ),
+                effective_trace_id.isnot(None),
             )
-            .group_by(AiArtifact.trace_id)
+            .group_by(effective_trace_id)
         )
     ).all()
 
@@ -1231,6 +1253,20 @@ async def get_conversation_stream_events(
     return StandardResponse(data=ConversationStreamEventsResponse(**payload))
 
 
+def _audit_query_candidates(content: str) -> list[str]:
+    """生成 Redis 末尾消息与 DB 审计记录的匹配候选，兼容 @mention 前缀剥离。"""
+    import re
+
+    text = str(content or "")
+    candidates = [text]
+    mention_match = re.match(r"^[@＠]([^\s]+)\s+(.*)$", text, re.DOTALL)
+    if mention_match:
+        stripped = mention_match.group(2).strip()
+        if stripped and stripped not in candidates:
+            candidates.append(stripped)
+    return candidates
+
+
 def _merge_latest_audit_assistant(
     history: list[dict[str, Any]],
     audit_messages: list[dict[str, Any]],
@@ -1238,7 +1274,7 @@ def _merge_latest_audit_assistant(
     """仅补齐 Redis 尾部 user 对应的缺失 assistant，避免重复整段历史。"""
     if not history or history[-1].get("role") != "user":
         return history
-    latest_content = str(history[-1].get("content") or "")
+    candidates = set(_audit_query_candidates(str(history[-1].get("content") or "")))
     existing_trace_ids = {
         str(message.get("trace_id"))
         for message in history
@@ -1247,7 +1283,7 @@ def _merge_latest_audit_assistant(
     for item in audit_messages:
         assistant = item.get("assistant")
         if (
-            str(item.get("query") or "") == latest_content
+            str(item.get("query") or "") in candidates
             and isinstance(assistant, dict)
             and assistant.get("trace_id")
             and str(assistant["trace_id"]) not in existing_trace_ids
@@ -1286,12 +1322,13 @@ async def get_conversation_history(
         from sqlalchemy import select
 
         latest_user_content = str(history[-1].get("content") or "")
+        query_candidates = _audit_query_candidates(latest_user_content)
         stmt = (
             select(AgentExecutionHistory)
             .where(
                 AgentExecutionHistory.conversation_id == conversation_id,
                 AgentExecutionHistory.user_id == user_id,
-                AgentExecutionHistory.query == latest_user_content,
+                AgentExecutionHistory.query.in_(query_candidates),
             )
             .order_by(AgentExecutionHistory.created_at.desc())
             .limit(5)
@@ -1440,6 +1477,113 @@ async def get_conversation_history(
     ))
 
 
+async def _load_active_chat_model(db: AsyncSession, model_name: str):
+    """按 `model_id` 取一条启用的模型记录；查不到返回 None。"""
+    from sqlalchemy import select
+
+    from app.models.ai_model import AIModel
+
+    result = await db.execute(
+        select(AIModel).where(
+            AIModel.model_id == model_name,
+            AIModel.is_active.is_(True),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _load_conversation_agent_models(
+    db: AsyncSession, *, conversation_id: str, user_id: Any
+) -> tuple[str, str]:
+    """反查该会话所属智能体的已发布版本模型：返回 (主模型, 合成模型)。
+
+    输入框没有手动选模型时，前端不会传 `model_id`，端点此前只能退回
+    `agent_context_max_tokens`——那是**系统设置里的可配置项**（初始值 64k，见
+    系统设置 · 系统配置，迁移 V126 写入），不是常量；而执行期预算是按版本模型
+    （以及独立配置的合成模型）的真实窗口算的。两者不相等时分母就与实际不符
+    （配置 64k 而模型 128k 时界面显示偏满、模型 32k 时显示偏空——以为还能装，
+    其实已经该压缩了）。注意两种「本来就该用配置值」的情形：模型注册表没配
+    `context_size`，或会话走的是系统默认模型（执行期对这两类不采纳模型窗口）。
+    会话没有独立表，智能体归属取该会话最近一条执行历史。
+    """
+    from sqlalchemy import desc, select
+
+    from app.models.agent import AIAgentVersion
+    from app.models.audit import AgentExecutionHistory
+
+    stmt = (
+        select(AgentExecutionHistory.agent_id)
+        .where(
+            AgentExecutionHistory.conversation_id == conversation_id,
+            AgentExecutionHistory.user_id == str(user_id),
+        )
+        .order_by(desc(AgentExecutionHistory.created_at))
+        .limit(1)
+    )
+    agent_id = (await db.execute(stmt)).scalar_one_or_none()
+    if not agent_id:
+        return "", ""
+    version_stmt = (
+        select(AIAgentVersion.model_name, AIAgentVersion.synthesis_model_name)
+        .where(
+            AIAgentVersion.agent_id == agent_id,
+            AIAgentVersion.status == "PUBLISHED",
+        )
+        .order_by(AIAgentVersion.version_number.desc())
+        .limit(1)
+    )
+    row = (await db.execute(version_stmt)).first()
+    if not row:
+        return "", ""
+    return str(row[0] or "").strip(), str(row[1] or "").strip()
+
+
+def _merge_context_usage_model_names(
+    requested_model_id: Optional[str], agent_models: tuple[str, str]
+) -> tuple[str, str]:
+    """合并「输入框选中的主模型」与「版本配置的主/合成模型」。
+
+    合成模型**永远**来自版本配置，与用户有没有手动选主模型无关：执行期的预算
+    契约是 `min(主模型窗口, 合成模型窗口)`（见 `_runtime_context_metadata`），
+    只要漏掉合成模型，用户选一个大窗口模型时水位线分母就会偏大——界面说还装得下，
+    后端其实已经按合成模型的窗口开始压缩了。
+    """
+    agent_primary, agent_synthesis = agent_models
+    primary = str(requested_model_id or "").strip() or str(agent_primary or "").strip()
+    synthesis = str(agent_synthesis or "").strip()
+    if not synthesis or synthesis == primary:
+        synthesis = ""
+    return primary, synthesis
+
+
+async def _resolve_context_usage_models(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+    user_id: Any,
+    requested_model_id: Optional[str],
+) -> tuple[Any, Any]:
+    """解析水位线要用的 (主模型行, 合成模型行)；查不到的一侧为 None。
+
+    合成模型**无条件**反查：它只存在于版本配置里，而执行期预算是主模型与合成模型
+    窗口的较小值。曾经只在「没传 model_id」时才反查，用户手动选大窗口模型时合成
+    模型就被丢掉，水位线分母偏大。
+    """
+    primary_name, synthesis_name = _merge_context_usage_model_names(
+        requested_model_id,
+        await _load_conversation_agent_models(
+            db, conversation_id=conversation_id, user_id=user_id
+        ),
+    )
+    primary_row = await _load_active_chat_model(db, primary_name) if primary_name else None
+    synthesis_row = (
+        await _load_active_chat_model(db, synthesis_name)
+        if synthesis_name and synthesis_name != primary_name
+        else None
+    )
+    return primary_row, synthesis_row
+
+
 @router.get(
     "/conversation/{conversation_id}/context-usage",
     response_model=StandardResponse[Dict[str, Any]],
@@ -1455,18 +1599,16 @@ async def get_conversation_context_usage(
     user_id = _require_chat_user_id(user_info)
 
     runtime_model_info: Dict[str, Any] = {}
-    if model_id and db is not None:
-        from sqlalchemy import select
-
-        from app.models.ai_model import AIModel
-
-        result = await db.execute(
-            select(AIModel).where(
-                AIModel.model_id == model_id,
-                AIModel.is_active.is_(True),
-            )
+    # 主模型：显式选中的优先，否则跟随智能体默认（版本配置）。两种情况下都要反查
+    # 版本配置——合成模型只在那里，而执行期预算是主模型与合成模型的较小窗口。
+    requested_model_id = str(model_id or "").strip()
+    if db is not None:
+        model, synthesis_model = await _resolve_context_usage_models(
+            db,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            requested_model_id=requested_model_id,
         )
-        model = result.scalar_one_or_none()
         if model is not None:
             # 复用 post-route 的预算契约（`_runtime_context_metadata`），**不要**在这里
             # 手搓 runtime_model_info：手搓必然漏字段，而 `estimate_context_usage` 是按
@@ -1477,15 +1619,28 @@ async def get_conversation_context_usage(
                 from app.services.ai.agent_service import AgentService
                 from app.services.ai.config import RuntimeModelInfo
 
-                runtime_model_info = await AgentService()._runtime_context_metadata(
-                    RuntimeModelInfo(
-                        configured_model=model.model_id,
-                        effective_model_id=model.model_id,
-                        # 与阶段②采纳模型窗口的判据一致：显式选中的模型才用它的窗口。
-                        source="runtime_override",
-                        context_size=model.context_size,
-                        max_output_tokens=model.max_output_tokens,
+                def _info(row: Any, source: str) -> Any:
+                    return RuntimeModelInfo(
+                        configured_model=row.model_id,
+                        effective_model_id=row.model_id,
+                        source=source,
+                        context_size=row.context_size,
+                        max_output_tokens=row.max_output_tokens,
                     )
+
+                runtime_model_info = await AgentService()._runtime_context_metadata(
+                    _info(
+                        model,
+                        # 与阶段②采纳模型窗口的判据一致：显式选中的模型才用它的窗口。
+                        source="runtime_override" if model_id else "agent_config",
+                    ),
+                    # 执行期预算取主模型与合成模型的较小窗口，这里必须同口径；漏掉
+                    # 合成模型会让分母偏大（合成窗口更小时尤其明显）。
+                    synthesis_runtime_model_info=(
+                        _info(synthesis_model, "agent_config")
+                        if synthesis_model is not None
+                        else None
+                    ),
                 )
             except Exception as exc:
                 # 预算契约不可用时**不要**退回手搓的字段字典：那份字典正是本接口此前
@@ -1991,6 +2146,13 @@ async def create_chat_completion(
         effective_execution_options["grounding_action"] = dict(
             completion_request.grounding_action
         )
+    # 无人值守来源（定时 / 订阅任务）必须在 execution_options 里留一个标记：
+    # 工具层只拿得到 execution_options，拿不到 user_info，否则 ask_user_question
+    # 会在没有在线用户的链路里弹出一张永远没人回答的卡。
+    from app.services.ai.tool_nudge_policy import unattended_delivery_marker
+
+    if unattended_delivery_marker(user_info):
+        effective_execution_options["unattended"] = True
     if effective_execution_options:
         set_execution_options_context(effective_execution_options)
     else:
@@ -2224,19 +2386,27 @@ async def create_chat_completion(
 
             await conversation_stream_journal.append(lane_user_id, conversation_id, [chunk])
 
+        lane_acquired = False
+
+        async def _clear_stream_journal_on_lane() -> None:
+            nonlocal lane_acquired
+            if lane_acquired:
+                return
+            # 必须在拿到会话运行锁之后才能清理事件日志：若当前尚有上一轮任务持锁运行，
+            # 排队中的新请求提前 clear 会把在途任务的过程日志与序号全部抹掉。
+            from app.services.ai.runtime.conversation_stream_journal import (
+                conversation_stream_journal,
+            )
+
+            await conversation_stream_journal.clear(lane_user_id, conversation_id)
+            lane_acquired = True
+
+        request_observability["_on_lane_acquired"] = _clear_stream_journal_on_lane
+
         async def _producer_task() -> None:
-            nonlocal claim_trace_id, claim_status
+            nonlocal claim_trace_id, claim_status, request_claim
             terminal_enqueued = False
             try:
-                # 新一轮开始：清空上一轮的事件日志与序号计数器，使本轮 _seq 从 1 重新
-                # 计数、日志只含本轮事件。前端在新一轮会把续显游标整体归零，两边口径
-                # 一致——否则残留的上一轮事件会被续显当成「本轮过程」重放出来。
-                from app.services.ai.runtime.conversation_stream_journal import (
-                    conversation_stream_journal,
-                )
-
-                await conversation_stream_journal.clear(lane_user_id, conversation_id)
-
                 async for chunk in agent_service.chat_completion_stream(
                     history,
                     agent_id=completion_request.agent_id,
@@ -2255,24 +2425,28 @@ async def create_chat_completion(
                 ):
                     if isinstance(chunk, dict):
                         if chunk.get("trace_id"):
-                            claim_trace_id = str(chunk["trace_id"])
+                            new_trace_id = str(chunk["trace_id"])
+                            if new_trace_id != claim_trace_id:
+                                claim_trace_id = new_trace_id
+                                if request_claim is not None:
+                                    from app.services.ai.runtime.chat_request_idempotency import (
+                                        chat_request_idempotency,
+                                    )
+
+                                    request_claim = await chat_request_idempotency.update_trace_id(
+                                        request_claim, claim_trace_id
+                                    )
                         if chunk.get("type") == "error" or chunk.get("status") == "error":
                             claim_status = "failed"
+                    # 清理只由 `_on_lane_acquired`（真正拿到会话锁之后）驱动，这里**不能**有兜底：
+                    # 会话忙 / 配额超限的早退路径从未持有过锁，它们随后发出的 error 帧一旦触发
+                    # clear，就会把仍持锁在跑那一轮的 journal 与序号计数一起抹掉，前端续显直接断。
                     # 事件日志独立于连接状态：客户端断开后 producer 仍继续跑，
-                    # 这些事件是切回页面时"继续实时显示"的唯一来源。
-                    await _record_stream_event(chunk)
+                    # 这些事件是切回页面时"继续实时显示"的唯一来源；未拿锁期间不污染上一轮日志。
+                    if lane_acquired:
+                        await _record_stream_event(chunk)
                     if not client_disconnected_event.is_set():
                         await queue.put(("chunk", chunk))
-                    # run_status 表示模型输出已完成。提前结束 SSE 响应，producer
-                    # 仍继续消费生成器，以便在后台完成 Redis/摘要持久化和会话收尾。
-                    if (
-                        isinstance(chunk, dict)
-                        and chunk.get("type") == "run_status"
-                        and not terminal_enqueued
-                        and not client_disconnected_event.is_set()
-                    ):
-                        await queue.put(("done", None))
-                        terminal_enqueued = True
                 if not terminal_enqueued and not client_disconnected_event.is_set():
                     await queue.put(("done", None))
                 await _flush_stream_journal(force=True)
@@ -2510,6 +2684,227 @@ async def create_chat_completion(
         return StandardResponse(data=result)
 
 
+_RESUME_JOURNAL_COALESCED_TYPES = {
+    "answer",
+    "answer_delta",
+    "reasoning_content",
+    "thinking",
+    "process_narration",
+    "process_narration_commit",
+    "process_narration_promote",
+}
+
+
+async def _build_resume_background_sse_response(
+    *,
+    request: Request,
+    pending_request_id: str,
+    user_info: Dict[str, Any],
+    stream_factory: Callable[[Callable[[], Awaitable[None]]], AsyncGenerator[Dict[str, Any], None]],
+    label: str,
+) -> StreamingResponse:
+    """为工具确认与外部执行恢复端点提供与主对话一致的后台 producer + journal + keepalive SSE。"""
+    from app.services.ai.runtime.agentscope.confirmations import pending_agentscope_confirmations
+    from app.services.ai.runtime.conversation_run_cancel import release_conversation_run_locks
+    from app.services.ai.runtime.conversation_stream_journal import (
+        TRANSIENT_EVENT_TYPES,
+        conversation_stream_journal,
+    )
+
+    current_user_id = (user_info or {}).get("user_id") or (user_info or {}).get("id")
+    pending = await pending_agentscope_confirmations.peek_async(
+        pending_request_id,
+        user_id=current_user_id,
+    )
+    conversation_id = (
+        getattr(getattr(pending, "runner", None), "conversation_id", None)
+        or (getattr(getattr(pending, "snapshot", None), "conversation_id", None) if pending else None)
+    )
+    lane_user_id = current_user_id or (getattr(pending, "user_id", None) if pending else None)
+
+    client_disconnected_event = asyncio.Event()
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+    stream_journal_pending: list[dict[str, Any]] = []
+    stream_journal_chars = 0
+    stream_journal_last_flush = time.monotonic()
+    lane_acquired = False
+
+    async def _release_locks_on_abort() -> None:
+        if lane_user_id and conversation_id:
+            await release_conversation_run_locks(
+                user_id=lane_user_id,
+                conversation_id=conversation_id,
+            )
+
+    async def _flush_resume_journal(*, force: bool = False) -> None:
+        nonlocal stream_journal_chars, stream_journal_last_flush
+        if not stream_journal_pending or not conversation_id or not lane_user_id:
+            return
+        now = time.monotonic()
+        if not force and now - stream_journal_last_flush < 1.0 and stream_journal_chars < 2000:
+            return
+        batch = list(stream_journal_pending)
+        stream_journal_pending.clear()
+        stream_journal_chars = 0
+        stream_journal_last_flush = now
+        await conversation_stream_journal.append(lane_user_id, conversation_id, batch)
+
+    async def _record_resume_event(chunk: Any) -> None:
+        nonlocal stream_journal_chars
+        if not isinstance(chunk, dict) or not conversation_id or not lane_user_id:
+            return
+        event_type = str(chunk.get("type") or "")
+        if event_type in TRANSIENT_EVENT_TYPES:
+            return
+        if event_type in _RESUME_JOURNAL_COALESCED_TYPES:
+            stream_journal_pending.append(chunk)
+            stream_journal_chars += len(str(chunk.get("content") or ""))
+            await _flush_resume_journal()
+            return
+        await _flush_resume_journal(force=True)
+        await conversation_stream_journal.append(lane_user_id, conversation_id, [chunk])
+
+    async def _on_lane_acquired() -> None:
+        nonlocal lane_acquired
+        if lane_acquired:
+            return
+        if conversation_id and lane_user_id:
+            await conversation_stream_journal.clear(lane_user_id, conversation_id)
+        lane_acquired = True
+
+    async def _producer_task() -> None:
+        try:
+            async for chunk in stream_factory(_on_lane_acquired):
+                if lane_acquired:
+                    await _record_resume_event(chunk)
+                if not client_disconnected_event.is_set():
+                    await queue.put(("chunk", chunk))
+            if not client_disconnected_event.is_set():
+                await queue.put(("done", None))
+            await _flush_resume_journal(force=True)
+        except asyncio.CancelledError:
+            from app.core.cancellation import spawn_detached
+
+            spawn_detached(
+                _release_locks_on_abort(),
+                name=f"release-locks-resume-{conversation_id or 'unknown'}",
+            )
+            raise
+        except Exception as exc:
+            logger.error(
+                "[ChatAPI] Background resume producer (%s) encountered error: %s",
+                label,
+                exc,
+                exc_info=True,
+            )
+            if not client_disconnected_event.is_set():
+                await queue.put(("error", exc))
+
+    producer_task = asyncio.create_task(
+        _producer_task(),
+        name=f"chat-resume-producer-{label}-{conversation_id or 'unknown'}",
+    )
+
+    async def _producer_watchdog(
+        hard_timeout: float, lock_grace_seconds: float = 5.0
+    ) -> None:
+        try:
+            await asyncio.wait_for(asyncio.shield(producer_task), timeout=hard_timeout)
+        except asyncio.TimeoutError:
+            logger.error(
+                "[ChatAPI] resume producer (%s) hard timeout %.0fs conversation=%s",
+                label,
+                hard_timeout,
+                conversation_id,
+            )
+            if not producer_task.done():
+                producer_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(producer_task), timeout=lock_grace_seconds
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            try:
+                await _release_locks_on_abort()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[ChatAPI] resume watchdog failed to release locks conversation=%s: %s",
+                    conversation_id,
+                    exc,
+                )
+        except asyncio.CancelledError:
+            if not producer_task.done():
+                producer_task.cancel()
+            raise
+
+    hard_timeout = await load_producer_hard_timeout()
+    if hard_timeout > 0:
+        watchdog_task = asyncio.create_task(
+            _producer_watchdog(hard_timeout),
+            name=f"chat-resume-watchdog-{label}-{conversation_id or 'unknown'}",
+        )
+        _BACKGROUND_TASKS.add(watchdog_task)
+        watchdog_task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    async def sse_generator() -> AsyncGenerator[str, None]:
+        client_disconnected = False
+        last_keepalive = 0.0
+        try:
+            while True:
+                if not client_disconnected and await request.is_disconnected():
+                    client_disconnected = True
+                    client_disconnected_event.set()
+                    break
+                try:
+                    tag, payload = await asyncio.wait_for(queue.get(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    if producer_task.done() and queue.empty():
+                        break
+                    now = time.monotonic()
+                    if now - last_keepalive >= 1.0:
+                        yield 'data: {"type":"keepalive"}\n\n'
+                        last_keepalive = now
+                    continue
+
+                if tag == "chunk":
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                elif tag == "done":
+                    yield "data: [DONE]\n\n"
+                    break
+                elif tag == "error":
+                    try:
+                        err_text = sanitize_error_text(payload) if payload is not None else "未知错误"
+                    except Exception:
+                        err_text = "服务处理出错，请稍后重试"
+                    yield (
+                        "data: "
+                        + json.dumps({"type": "error", "content": err_text}, ensure_ascii=False)
+                        + "\n\n"
+                    )
+                    yield "data: [DONE]\n\n"
+                    break
+        except asyncio.CancelledError:
+            client_disconnected_event.set()
+            logger.info(
+                "[ChatAPI] Resume SSE (%s) cancelled by client for conversation=%s; "
+                "background producer continues.",
+                label,
+                conversation_id,
+            )
+        finally:
+            client_disconnected_event.set()
+
+    return StreamingResponse(
+        sse_generator(),
+        media_type="text/event-stream",
+        headers=SSE_RESPONSE_HEADERS,
+    )
+
+
 @router.post(
     "/permissions/{permission_request_id}/confirm",
     summary="确认或拒绝待执行工具调用",
@@ -2518,22 +2913,21 @@ async def create_chat_completion(
 async def confirm_tool_permission(
     permission_request_id: str,
     confirm_request: ToolPermissionConfirmRequest,
+    request: Request,
     user_info: Dict[str, Any] = Depends(require_api_key),
 ):
-    async def sse_generator() -> AsyncGenerator[str, None]:
-        async for chunk in agent_service.resume_agentscope_permission_stream(
+    return await _build_resume_background_sse_response(
+        request=request,
+        pending_request_id=permission_request_id,
+        user_info=user_info,
+        label="permission",
+        stream_factory=lambda on_lane_acquired: agent_service.resume_agentscope_permission_stream(
             permission_request_id=permission_request_id,
             confirmed=confirm_request.confirmed,
             grant_scope=confirm_request.scope,
             user_info=user_info,
-        ):
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(
-        sse_generator(),
-        media_type="text/event-stream",
-        headers=SSE_RESPONSE_HEADERS,
+            on_lane_acquired=on_lane_acquired,
+        ),
     )
 
 
@@ -2598,21 +2992,20 @@ async def revoke_tool_permission_grant(
 async def resume_external_execution(
     external_execution_request_id: str,
     resume_request: ExternalExecutionResumeRequest,
+    request: Request,
     user_info: Dict[str, Any] = Depends(require_api_key),
 ):
-    async def sse_generator() -> AsyncGenerator[str, None]:
-        async for chunk in agent_service.resume_agentscope_external_execution_stream(
+    return await _build_resume_background_sse_response(
+        request=request,
+        pending_request_id=external_execution_request_id,
+        user_info=user_info,
+        label="external",
+        stream_factory=lambda on_lane_acquired: agent_service.resume_agentscope_external_execution_stream(
             external_execution_request_id=external_execution_request_id,
             results=[item.model_dump() for item in resume_request.results],
             user_info=user_info,
-        ):
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(
-        sse_generator(),
-        media_type="text/event-stream",
-        headers=SSE_RESPONSE_HEADERS,
+            on_lane_acquired=on_lane_acquired,
+        ),
     )
 
 
@@ -2899,6 +3292,77 @@ async def _build_chat_history_response(
     ))
 
 
+class HomeRecommendationRequest(BaseModel):
+    """首页推荐生成参数；variation 只用于“换一批”时换角度。"""
+
+    variation: str = Field(default="", max_length=64)
+    days: int = Field(default=3, ge=1, le=7)
+
+
+@router.get(
+    "/home-context",
+    summary="获取欢迎页最近会话上下文",
+    description="当前用户最近 N 天的普通会话，仅返回标题、智能体与时间，不触发模型调用；days=0 表示不限时间，只取最近一条。",
+)
+async def get_home_context(
+    days: int = Query(0, ge=0, le=365),
+    limit: int = Query(1, ge=1, le=5),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db_session),
+):
+    user_info = getattr(request.state, "user", None) if request else None
+    user_id = _require_numeric_chat_user_id(user_info)
+    from app.services.workbench_conversation_service import list_recent_conversations
+
+    # days=0 表示“只要最近一条”，不受时间窗限制；继续入口用这个口径。
+    since = datetime.now() - timedelta(days=days) if days > 0 else None
+    rows = await list_recent_conversations(db, user_id=user_id, limit=limit, since=since)
+    items = []
+    for row in rows:
+        target = row.get("target") or {}
+        items.append({
+            "conversation_id": target.get("conversation_id") or "",
+            "title": row.get("title") or "未命名会话",
+            "subtitle": row.get("subtitle") or "",
+            "agent_id": target.get("agent_id") or "",
+            "occurred_at": row.get("occurred_at") or "",
+        })
+    return {"items": items, "count": len(items)}
+
+
+@router.post(
+    "/home-recommendations",
+    summary="生成欢迎页行动推荐",
+    description="基于当前用户最近 N 天会话生成 3 张可执行卡片；无上下文时返回空列表。",
+)
+async def generate_home_recommendations_endpoint(
+    payload: Optional[HomeRecommendationRequest] = None,
+    request: Request = None,
+    db: AsyncSession = Depends(get_db_session),
+):
+    user_info = getattr(request.state, "user", None) if request else None
+    user_id = _require_chat_user_id(user_info)
+    from app.services.ai.home_recommendation_service import (
+        generate_home_recommendations,
+        load_recent_conversation_context,
+    )
+
+    days = payload.days if payload else 3
+    context = await load_recent_conversation_context(db, user_id=user_id, days=days, limit=5)
+    if not context:
+        return {"cards": [], "source_count": 0}
+    try:
+        cards = await generate_home_recommendations(
+            context,
+            variation_seed=payload.variation if payload else "",
+            days=days,
+        )
+    except Exception as exc:
+        logger.warning("Failed to generate home recommendations: %s", exc)
+        raise HTTPException(status_code=503, detail="生成推荐失败，请稍后重试") from exc
+    return {"cards": cards, "source_count": len(context)}
+
+
 @router.get("/history", 
     response_model=StandardResponse[AgentExecutionHistoryListResponse],
     summary="查询历史记录",
@@ -2935,6 +3399,30 @@ async def get_admin_history(
         params=params, request=request, db=db, cross_user=True
     )
 
+async def _clear_conversation_runtime_state(user_id: Any, conversation_id: Optional[str]) -> None:
+    """删除或截断会话历史后同步清理 AgentState、挂起确认与断线回放日志。"""
+    if user_id is None or not conversation_id:
+        return
+    try:
+        from app.services.ai.runtime.agentscope.confirmations import (
+            pending_agentscope_confirmations,
+        )
+        from app.services.ai.runtime.agentscope.state_store import agent_state_store
+        from app.services.ai.runtime.conversation_stream_journal import (
+            conversation_stream_journal,
+        )
+
+        await agent_state_store.delete(user_id, conversation_id)
+        await pending_agentscope_confirmations.clear_conversation(user_id, conversation_id)
+        await conversation_stream_journal.clear(user_id, conversation_id)
+    except Exception as cleanup_err:
+        logger.warning(
+            "[ChatAPI] Failed to clear runtime state for conversation=%s: %s",
+            conversation_id,
+            cleanup_err,
+        )
+
+
 @router.delete("/history/{trace_id}",
     response_model=StandardResponse[Dict[str, bool]],
     summary="删除历史记录",
@@ -2943,6 +3431,7 @@ async def get_admin_history(
 async def delete_history(
     trace_id: str,
     request: Request,
+    user_info: Dict[str, Any] = Depends(require_api_key),
     db: AsyncSession = Depends(get_db_session)
 ):
     """
@@ -2951,8 +3440,8 @@ async def delete_history(
     from app.models.audit import AgentExecutionHistory, AgentExecutionTrace
     from sqlalchemy import delete, select
 
-    user_info = getattr(request.state, "user", None) if request else None
-    current_user_id = _require_chat_user_id(user_info)
+    effective_user_info = user_info or (getattr(request.state, "user", None) if request else None)
+    current_user_id = _require_chat_user_id(effective_user_info)
 
     # 1. Find Record——先按「当前用户」过滤：他人记录一律按不存在处理（404），
     #    任何角色（含 admin）都不能删除别人的历史与轨迹。
@@ -2993,6 +3482,7 @@ class BatchDeleteHistoryRequest(BaseModel):
 async def batch_delete_history(
     payload: BatchDeleteHistoryRequest,
     request: Request,
+    user_info: Dict[str, Any] = Depends(require_api_key),
     db: AsyncSession = Depends(get_db_session)
 ):
     from app.models.audit import AgentExecutionHistory, AgentExecutionTrace
@@ -3003,8 +3493,8 @@ async def batch_delete_history(
 
     # 1. 严格自隔离：任何角色（含 admin）都只能删除属于自己的会话，
     #    不能借 conversation_ids 删除他人的 DB 历史与 Redis 记忆。
-    user_info = getattr(request.state, "user", None)
-    current_user_id = _require_chat_user_id(user_info)
+    effective_user_info = user_info or (getattr(request.state, "user", None) if request else None)
+    current_user_id = _require_chat_user_id(effective_user_info)
 
     # 2. 取出会话归属人；Redis key 的 user_id 必须与 DB 删除范围同源。
     stmt = (
@@ -3043,12 +3533,12 @@ async def batch_delete_history(
 
         await knowledge_citation_store.delete_many(trace_ids)
 
-    # 数据库历史删除后同步清理会话 Redis，避免项目资源范围和记忆残留。
-    # 删除范围已被 user_id 收敛到当前用户，因此 Redis 也只清当前用户自己的键——
-    # 绝不能按传入的 conversation_id 去清他人的记忆。
+    # 数据库历史删除后同步清理会话 Redis、AgentScope 状态、挂起快照与断线回放日志。
+    # 删除范围已被 user_id 收敛到当前用户，绝不能按传入的 conversation_id 去清他人状态。
     from app.services.ai.memory_service import memory_service
     for conversation_id in payload.conversation_ids:
         await memory_service.clear_history(current_user_id, conversation_id)
+        await _clear_conversation_runtime_state(current_user_id, conversation_id)
 
     return StandardResponse(data={"success": True})
 
@@ -3072,9 +3562,20 @@ async def truncate_history_endpoint(
 ):
     from app.models.audit import AgentExecutionHistory, AgentExecutionTrace
     from app.services.ai.memory_service import memory_service
+    from app.services.ai.runtime.session_run_lane import conversation_run_lane
     from sqlalchemy import delete, select
 
     user_id = _require_chat_user_id(user_info)
+
+    # 拦截运行中的截断请求，避免后台 producer 与截断并发写入造成历史错位或状态撕裂。
+    if await conversation_run_lane.is_locked(
+        user_id=str(user_id),
+        conversation_id=payload.conversation_id,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="当前会话正在生成中，请先停止生成后再重发或截断历史",
+        )
 
     # 1. 截断 Redis 记忆
     history_truncated = await memory_service.truncate_history(
@@ -3088,8 +3589,17 @@ async def truncate_history_endpoint(
             detail="会话历史暂时无法同步，请稍后重试",
         )
 
-    # 2. 如果保留数量对应的轮次之后的 DB 历史也可以同步裁剪
-    keep_turns = payload.keep_count // 2
+    # 2. 基于保留消息轨迹精确同步裁剪 DB 审计历史（而非脆弱的 keep_count // 2 猜轮数）
+    remaining_messages: List[Dict[str, Any]] = []
+    if payload.keep_count > 0:
+        try:
+            remaining_messages = await memory_service.get_history(
+                str(user_id),
+                payload.conversation_id,
+            )
+        except Exception:
+            remaining_messages = []
+
     stmt = (
         select(AgentExecutionHistory)
         .where(
@@ -3100,8 +3610,34 @@ async def truncate_history_endpoint(
     )
     result = await db.execute(stmt)
     rows = result.scalars().all()
-    if len(rows) > keep_turns:
-        to_delete = rows[keep_turns:]
+
+    to_delete = []
+    if rows:
+        if payload.keep_count == 0:
+            to_delete = list(rows)
+        elif remaining_messages:
+            retained_trace_ids = {
+                str(msg.get("trace_id"))
+                for msg in remaining_messages
+                if isinstance(msg, dict) and msg.get("trace_id")
+            }
+            matched_indices = [
+                idx for idx, row in enumerate(rows) if row.trace_id and row.trace_id in retained_trace_ids
+            ]
+            if matched_indices:
+                to_delete = rows[max(matched_indices) + 1 :]
+            else:
+                retained_user_turns = sum(
+                    1
+                    for msg in remaining_messages
+                    if isinstance(msg, dict) and msg.get("role") == "user"
+                )
+                to_delete = rows[retained_user_turns:]
+        else:
+            keep_turns = payload.keep_count // 2
+            to_delete = rows[keep_turns:]
+
+    if to_delete:
         trace_ids = [r.trace_id for r in to_delete if r.trace_id]
         if trace_ids:
             await db.execute(
@@ -3117,6 +3653,8 @@ async def truncate_history_endpoint(
             from app.services.ai.knowledge_citation_store import knowledge_citation_store
 
             await knowledge_citation_store.delete_many(trace_ids)
+
+    await _clear_conversation_runtime_state(str(user_id), payload.conversation_id)
 
     return StandardResponse(data={"success": True, "keep_count": payload.keep_count})
 
@@ -3236,14 +3774,22 @@ async def get_admin_trace_logs(
 async def create_agent_chat(
     agent_id: str, 
     completion_request: ChatCompletionRequest,
-    request: Request
+    request: Request,
+    # 与 create_chat_completion 保持同一套鉴权与 session 生命周期：这里只是换了个
+    # RESTful 入口，鉴权强度不能跟着入口变。
+    user_info: Dict[str, Any] = Depends(require_api_key),
+    db: AsyncSession = Depends(get_db_session, scope="function"),
 ):
     """
     RESTful endpoint for agent-specific chat.
     Overrides agent_id in request body if provided.
     """
     completion_request.agent_id = agent_id
-    return await create_chat_completion(completion_request, request)
+    # create_chat_completion 是 FastAPI 路径函数，user_info/db 的默认值只是 Depends
+    # 占位对象，直调时不会被解析（进函数取 user_id 就会 401）。必须由本端点声明后显式透传。
+    return await create_chat_completion(
+        completion_request, request, user_info=user_info, db=db
+    )
 
 @router.get("/export/data/{trace_id}",
     summary="导出查询数据",

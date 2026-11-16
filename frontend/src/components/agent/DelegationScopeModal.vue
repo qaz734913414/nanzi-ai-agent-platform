@@ -46,6 +46,16 @@ const props = defineProps<{
   /** 当前用户被授予的 agent 权限 id；null 表示拿不到权限信息，此时不标灰。 */
   authorizedAgentIds?: string[] | null;
   readonly?: boolean;
+  /**
+   * 层级覆盖。默认 10010 是给「版本抽屉」用的；被「专家团设置」（同为 10010）
+   * 内部唤起时必须传更高值，否则两个同层窗口互相盖住、点不到。
+   */
+  zIndex?: number;
+  /**
+   * 最多能选几个。不传 = 不限制（版本抽屉里的老调用方保持原行为）。
+   * 有上限时必须在这里拦：否则用户勾满 25 个点确定，要等提交后端才收到 422。
+   */
+  maxSelectable?: number;
 }>();
 
 const emit = defineEmits<{
@@ -57,6 +67,15 @@ const localSelected = ref<string[]>([]);
 const keyword = ref("");
 const onlySelected = ref(false);
 const showClearConfirm = ref(false);
+/**
+ * 规则说明默认折叠。
+ *
+ * 它相当于四条常驻的「说明书」，一进弹窗就占掉三分之一屏，而弹窗本身已经很高了
+ * （团设置里再叠一层更是如此）。折叠态只留最关键的一行——未配置 vs 配置后到底
+ * 差在哪，这是唯一会导致误操作的语义；其余三条（自建默认不可委派、batch 跟随、
+ * main 不可作为目标）看列表里的徽标也能明白，需要时再展开。
+ */
+const showRules = ref(false);
 const activeTab = ref<ScopeTab>("system");
 
 const knownIds = computed(() => new Set(props.agents.map((a) => a.id)));
@@ -162,7 +181,45 @@ watch([keyword, onlySelected], () => {
  * 真正想要的是**那个团的能力**时，才该改用成员——见下面的 adoptTeamMembers 快捷操作。
  */
 const isTeamLead = (agent: DelegationScopeAgent) => agent.is_expert_team_lead === true;
-const isSelectable = (agent: DelegationScopeAgent) => isAuthorized(agent);
+/**
+ * 主助手（系统兜底入口）**不能**被选为委派目标——与后端
+ * `agent_delegate_tool.is_main_general_agent_target` / `filter_delegable_agents`
+ * 同一份口径（固定 ID + 兼容 slug），三处必须一致：
+ * 这里置灰、后端候选剔除、运行时调用拒绝。
+ *
+ * 理由：它是 `AssistantAgentRunner` 的兜底入口，被委派进来时执行深度已是 1，
+ * 自身又被隐式挂了委派工具，再委派只会撞 `depth_exceeded`；语义上也等于把
+ * 问题丢回「无法分类」的万金油。判定同时认 ID 与 slug，改名/历史数据同样挡得住。
+ */
+const MAIN_AGENT_ID = "sys-agent-chat";
+const MAIN_AGENT_SLUGS = ["main", "assistant", "general-chat"];
+const isMainAgent = (agent: DelegationScopeAgent): boolean => {
+  const id = String(agent?.id ?? "").trim();
+  const name = String(agent?.name ?? "").trim().toLowerCase();
+  return id === MAIN_AGENT_ID || MAIN_AGENT_SLUGS.includes(name);
+};
+
+const isSelectable = (agent: DelegationScopeAgent) =>
+  isAuthorized(agent) && !isMainAgent(agent);
+
+/** 已达上限：未选中的行不能再勾（已选的仍可取消）。 */
+const atLimit = computed(
+  () =>
+    typeof props.maxSelectable === "number" &&
+    localSelected.value.length >= props.maxSelectable,
+);
+
+/** 名单里已存在的 main id（存量配置）：保存时静默剔除会让用户以为没生效，所以先提示。 */
+const mainAgentIds = computed(
+  () => new Set(props.agents.filter((agent) => isMainAgent(agent)).map((agent) => agent.id)),
+);
+const legacyMainIds = computed(() =>
+  localSelected.value.filter((id) => mainAgentIds.value.has(id)),
+);
+/** 保存后真正生效的数量：main 不进名单，不能算进「已选 N 个」。 */
+const effectiveSelectedCount = computed(
+  () => localSelected.value.filter((id) => !mainAgentIds.value.has(id)).length,
+);
 
 const teamMembersOf = (agent: DelegationScopeAgent) =>
   (agent.team_member_ids || [])
@@ -177,13 +234,27 @@ const adoptTeamMembers = (agent: DelegationScopeAgent) => {
   if (!ids.length) return;
   // 快照，不是引用：以后主专家改了成员，这里不会自动同步
   const next = new Set(localSelected.value);
-  ids.forEach((id) => next.add(id));
+  for (const id of ids) {
+    // 批量导入同样要受上限约束：单条勾选拦住了，这里不拦就一次超员，
+    // 用户点确定时看着没问题，提交到后端才收到 422。
+    if (typeof props.maxSelectable === "number" && next.size >= props.maxSelectable) break;
+    next.add(id);
+  }
   localSelected.value = Array.from(next);
 };
 
 const toggle = (agent: DelegationScopeAgent) => {
   if (props.readonly) return;
   if (!isSelectable(agent)) return;
+  // 上限只拦「加」，不拦「减」：已选中的必须能取消，否则用户被卡死在满员状态。
+  if (
+    atLimit.value &&
+    typeof props.maxSelectable === "number" &&
+    localSelected.value.length >= props.maxSelectable &&
+    !localSelected.value.includes(agent.id)
+  ) {
+    return;
+  }
   const idx = localSelected.value.indexOf(agent.id);
   if (idx >= 0) {
     localSelected.value.splice(idx, 1);
@@ -198,8 +269,15 @@ const clearAll = () => {
 };
 
 const submit = () => {
-  emit("save", [...localSelected.value]);
+  // 存量名单里的 main 一律不写回：后端候选层与运行时都已拒绝，留着只会变成
+  // 「配置里明明有、调用却报错的幽灵条目」。
+  const cleaned = localSelected.value.filter((id) => !mainAgentIds.value.has(id));
+  emit("save", cleaned);
   emit("update:model", false);
+};
+
+const dropLegacyMain = () => {
+  localSelected.value = localSelected.value.filter((id) => !mainAgentIds.value.has(id));
 };
 
 const close = () => emit("update:model", false);
@@ -212,7 +290,7 @@ const displayName = (agent: DelegationScopeAgent) => agent.display_name || agent
     :show="model"
     title="调度白名单"
     size="max-w-3xl"
-    :z-index="DELEGATION_SCOPE_Z_INDEX"
+    :z-index="zIndex ?? DELEGATION_SCOPE_Z_INDEX"
     @close="close"
     @update:model-value="close"
   >
@@ -227,13 +305,57 @@ const displayName = (agent: DelegationScopeAgent) => agent.display_name || agent
         限制本智能体可以委派的子智能体范围。不配置则维持默认，配置后名单外的智能体一律拒绝。
       </p>
 
-      <!-- 规则提示 -->
-      <div class="mt-3 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-xs leading-relaxed text-gray-600">
-        <span class="font-bold text-gray-800">未配置</span> = 全部「已授权给你的系统智能体」；
-        <span class="font-bold text-gray-800">配置后</span> = 只从名单中调度。<br />
-        你自己的智能体默认<span class="font-semibold text-amber-600">不可被委派</span>，加入名单后才开通；
-        系统智能体即使进名单，仍要校验你的 agent 授权。<br />
-        该名单同时作用于<code class="rounded bg-white px-1">sub_agent_batch_call</code>，批量委派不单独配置。
+      <!-- 规则提示：默认折叠，只留「未配置 vs 配置后」这一行 -->
+      <div class="mt-3 overflow-hidden rounded-lg border border-gray-200 bg-gray-50">
+        <button
+          type="button"
+          class="flex w-full items-center gap-1.5 px-3 py-2 text-left text-xs leading-relaxed text-gray-600 transition hover:bg-gray-100"
+          :aria-expanded="showRules"
+          @click="showRules = !showRules"
+        >
+          <svg
+            class="h-3 w-3 shrink-0 text-gray-400 transition-transform"
+            :class="showRules ? 'rotate-90' : ''"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+          >
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m9 5 7 7-7 7" />
+          </svg>
+          <span class="min-w-0 flex-1">
+            <span class="font-bold text-gray-800">未配置</span> = 全部「已授权给你的系统智能体」；
+            <span class="font-bold text-gray-800">配置后</span> = 只从名单中调度。
+          </span>
+          <span class="shrink-0 text-[11px] text-gray-400">{{ showRules ? "收起" : "展开" }}</span>
+        </button>
+        <div
+          v-show="showRules"
+          class="border-t border-gray-200 px-3 pb-2 pt-1.5 pl-[1.65rem] text-xs leading-relaxed text-gray-600"
+        >
+          你自己的智能体默认<span class="font-semibold text-amber-600">不可被委派</span>，加入名单后才开通；
+          系统智能体即使进名单，仍要校验你的 agent 授权。<br />
+          该名单同时作用于<code class="rounded bg-white px-1">sub_agent_batch_call</code>，批量委派不单独配置。<br />
+          主助手（<code class="rounded bg-white px-1">main</code>）是系统兜底入口，<span class="font-semibold text-gray-800">不可作为委派目标</span>。
+        </div>
+      </div>
+
+      <!-- 存量名单里含 main：明确告诉用户它不会被保存，而不是静默消失 -->
+      <div
+        v-if="legacyMainIds.length"
+        class="mt-2 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-700"
+      >
+        <span class="flex-1">
+          名单里包含主助手（<code class="rounded bg-white px-1">main</code>）：它是系统兜底入口，
+          不能作为委派目标，<b>保存时会自动移除</b>。
+        </span>
+        <button
+          v-if="!readonly"
+          type="button"
+          class="shrink-0 rounded border border-amber-300 bg-white px-2 py-0.5 text-[11px] text-amber-700 transition hover:bg-amber-100"
+          @click="dropLegacyMain"
+        >
+          立即移除
+        </button>
       </div>
 
       <!-- 搜索 + 只看已选：容器画边框，内部控件必须 border-0 p-0
@@ -298,6 +420,15 @@ const displayName = (agent: DelegationScopeAgent) => agent.display_name || agent
         </button>
       </div>
 
+      <p
+        v-if="typeof maxSelectable === 'number'"
+        class="mt-2 text-[11px]"
+        :class="atLimit ? 'text-amber-600' : 'text-gray-400'"
+      >
+        最多可选 {{ maxSelectable }} 个，已选 {{ localSelected.length }} 个
+        <span v-if="atLimit">（已达上限，需先取消其他选择）</span>
+      </p>
+
       <div class="mt-1">
         <!-- 我的智能体：默认不可委派的说明放在 tab 内，避免只挂在分组标题上被切走 -->
         <div
@@ -315,6 +446,7 @@ const displayName = (agent: DelegationScopeAgent) => agent.display_name || agent
           :class="[
             localSelected.includes(agent.id) ? 'bg-primary/5' : '',
             !isSelectable(agent) ? 'cursor-not-allowed opacity-55 hover:bg-transparent' : '',
+            !localSelected.includes(agent.id) && atLimit ? 'cursor-not-allowed opacity-55 hover:bg-transparent' : '',
           ]"
           @click="toggle(agent)"
         >
@@ -345,7 +477,7 @@ const displayName = (agent: DelegationScopeAgent) => agent.display_name || agent
             </div>
             <div class="mt-0.5 text-[11px] leading-relaxed text-gray-500">{{ agent.description || "无描述" }}</div>
             <button
-              v-if="isTeamLead(agent) && isAuthorized(agent)"
+              v-if="isTeamLead(agent) && isAuthorized(agent) && !isMainAgent(agent)"
               type="button"
               class="mt-1 rounded-md border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
               :disabled="readonly || !teamMembersOf(agent).length"
@@ -364,7 +496,14 @@ const displayName = (agent: DelegationScopeAgent) => agent.display_name || agent
             </div>
           </div>
           <span
-            v-if="isTeamLead(agent) && isAuthorized(agent)"
+            v-if="isMainAgent(agent)"
+            class="shrink-0 whitespace-nowrap rounded-full border border-slate-300 bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600"
+            title="主助手是系统兜底入口：被委派进来时深度已到上限，自身还隐式挂了委派工具，只会撞 depth_exceeded。请直接回答用户，或改为委派具体专家。"
+          >
+            系统兜底 · 不可委派
+          </span>
+          <span
+            v-else-if="isTeamLead(agent) && isAuthorized(agent)"
             class="shrink-0 whitespace-nowrap rounded-full border border-teal-200 bg-teal-50 px-2 py-0.5 text-[10px] text-teal-700"
             :title="`它在「${agent.team_name || agent.display_name}」里是主专家；被委派进来时深度已到上限，只能用个人能力，不会调度它的团成员。想要整个团的能力请改用成员。`"
           >
@@ -414,7 +553,7 @@ const displayName = (agent: DelegationScopeAgent) => agent.display_name || agent
     <template #footer>
       <div class="flex items-center gap-2">
         <span class="text-xs text-gray-500">
-          已选 <b class="text-gray-800">{{ localSelected.length }}</b> 个智能体
+          已选 <b class="text-gray-800">{{ effectiveSelectedCount }}</b> 个智能体
         </span>
         <button
           v-if="!readonly"

@@ -11,6 +11,7 @@ from app.core.orm import AsyncSessionLocal
 from app.models.mcp import McpOutboundAuditLog, McpServer
 from app.services.ai.audit_payload import bound_audit_payload
 from app.services.ai.user_extra_data import sanitize_extra_data
+from app.services.secrets.guard import build_storage_scanner
 from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
@@ -46,12 +47,28 @@ async def record_outbound_audit_log(
             agent_name = str((agent_info or {}).get("agent_name") or "").strip() or None
 
             # 工具入参/出参可能带密码、Token；审计只保留打码后的结构。
+            # 先叠加当前调用 ContextVar 中已注入的明文（避免多 worker 下 60s 存储快照
+            # 缓存延迟导致新凭据短暂漏扫），再过全库存储扫描器。
+            from app.services.secrets.redact import redact_text, redact_value
+
+            scanner = await build_storage_scanner()
             bounded_input = bound_audit_payload(
-                sanitize_extra_data(arguments or {})
+                scanner.mask_data(
+                    redact_value(sanitize_extra_data(arguments or {}), log_hits=False)
+                )
             )
             bounded_output = (
-                bound_audit_payload(sanitize_extra_data(tool_output))
+                bound_audit_payload(
+                    scanner.mask_data(
+                        redact_value(sanitize_extra_data(tool_output), log_hits=False)
+                    )
+                )
                 if tool_output is not None
+                else None
+            )
+            safe_error_message = (
+                scanner.mask_text(redact_text(str(error_message), log_hits=False))[:2000]
+                if error_message
                 else None
             )
 
@@ -67,7 +84,7 @@ async def record_outbound_audit_log(
                 trace_id=request_id,
                 status=status[:32],
                 latency_ms=latency_ms,
-                error_message=str(error_message)[:2000] if error_message else None,
+                error_message=safe_error_message,
                 tool_input=bounded_input,
                 tool_output=bounded_output,
                 created_at=datetime.utcnow(),

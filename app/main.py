@@ -45,7 +45,9 @@ from app.services.mcp.platform_mcp import platform_mcp_http_app, platform_mcp_li
 from app.api.mcp_platform import router as mcp_platform_router
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
+from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError, ProgrammingError
+
+logger = logging.getLogger(__name__)
 
 
 logging.getLogger('apscheduler').setLevel(logging.DEBUG)
@@ -66,6 +68,24 @@ async def lifespan(app: FastAPI):
     await database.init_db()
     await redis.init_redis()
     await AuditService.start_worker()
+
+    # 多实例心跳：每 15s 把本节点快照写进共享 Redis，供「系统诊断 → 实例」聚合展示。
+    # Redis 未启用时它自己会跳过，不阻塞启动。
+    try:
+        from app.services.instance_registry import heartbeat_reporter
+
+        await heartbeat_reporter.start()
+    except Exception as exc:  # noqa: BLE001 - 心跳是旁路，不能拖垮启动
+        logging.warning("启动实例心跳上报失败（已忽略）: %s", exc)
+
+    # 事件循环延迟采样：与心跳同属旁路。QPS / P95 只看 HTTP，事件循环被同步
+    # 代码堵住时它们只会说「请求很少但很慢」，这个数能指出「里面堵住了」。
+    try:
+        from app.core.request_metrics import loop_lag
+
+        loop_lag.start()
+    except Exception as exc:  # noqa: BLE001 - 采样是旁路，不能拖垮启动
+        logging.warning("启动事件循环延迟采样失败（已忽略）: %s", exc)
     
     # Initialize Oracle Thick Mode if requested
     if os.environ.get("USE_ORACLE_THICK_MODE") == "1":
@@ -180,6 +200,19 @@ async def lifespan(app: FastAPI):
     await browser_runtime.shutdown()
     from app.services.pool_manager import DataSourcePoolManager
     await DataSourcePoolManager.close_all_pools()
+    # 必须早于 redis.close_redis()：清理自己的实例键要用 Redis
+    try:
+        from app.services.instance_registry import heartbeat_reporter
+
+        await heartbeat_reporter.stop()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("停止实例心跳上报失败（已忽略）: %s", exc)
+    try:
+        from app.core.request_metrics import loop_lag
+
+        await loop_lag.stop()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("停止事件循环延迟采样失败（已忽略）: %s", exc)
     await database.close_db()
     await redis.close_redis()
 
@@ -309,7 +342,7 @@ async def database_connection_exception_handler(request: Request, exc: Exception
         content={
             "code": ErrorCode.DATABASE_CONNECTION_FAILED,
             "message": "数据库连接失败",
-            "detail": str(exc) if settings.API_SERVICE_ENV != "production" else "数据库暂时不可用，请稍后重试。",
+            "detail": "数据库暂时不可用，请稍后重试。" if settings.is_production else str(exc),
             "data": None,
             "timestamp": datetime.datetime.now().isoformat(),
             "trace_id": trace_id,
@@ -317,6 +350,61 @@ async def database_connection_exception_handler(request: Request, exc: Exception
         },
         headers={"Retry-After": "30"}
     )
+
+@app.exception_handler(ProgrammingError)
+async def database_schema_exception_handler(request: Request, exc: Exception):
+    """表不存在 / 结构不匹配 —— 几乎总是「迁移没执行」。
+
+    默认行为是把 SQLAlchemy 的原始报错整个吐给前端（一整屏带 SQL 语句的红字），
+    对着那坨文字没人能想到去执行迁移。这里只识别「表/列不存在」这一类，其余
+    ProgrammingError 仍按 500 抛出——真正的 SQL bug 不该被这张网兜住。
+    """
+    trace_id = getattr(request.state, "trace_id", str(uuid.uuid4()))
+    message = str(exc)
+
+    is_missing_table = (
+        "doesn't exist" in message      # MySQL 1146
+        # PostgreSQL 的措辞是 "relation ... does not exist"，不是 doesn't ——
+        # 少了这一条，PG 部署下缺表会绕过提示直接抛 500
+        or "does not exist" in message
+        or "UndefinedTable" in message  # PostgreSQL（异常类名）
+        or "no such table" in message   # SQLite（测试库）
+    )
+    if not is_missing_table:
+        raise exc
+
+    table = ""
+    for marker in ("Table '", 'relation "', "table "):
+        if marker in message:
+            tail = message.split(marker, 1)[1]
+            table = tail.split("'")[0].split('"')[0].split(" ")[0]
+            break
+    if "." in table:
+        table = table.split(".")[-1]
+
+    hint = (
+        f"数据表 {table} 不存在，数据库迁移还没执行。"
+        if table
+        else "依赖的数据表不存在，数据库迁移还没执行。"
+    )
+    if table.startswith("sys_secret"):
+        hint += "请执行 db-prod/V209-add-credential-center.sql（PostgreSQL 为 db-prod-pg/V109）。"
+    else:
+        hint += "请检查对应版本的迁移脚本是否已执行。"
+
+    logger.error("[Schema] 请求 %s 命中缺失的表 %s", request.url.path, table or "?")
+    return JSONResponse(
+        status_code=503,
+        content={
+            "code": ErrorCode.DATABASE_CONNECTION_FAILED,
+            "message": hint,
+            "detail": hint if settings.is_production else message,
+            "data": None,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "trace_id": trace_id,
+        },
+    )
+
 
 @app.exception_handler(RagFlowError)
 async def ragflow_exception_handler(request: Request, exc: RagFlowError):
@@ -426,7 +514,7 @@ async def general_exception_handler(request: Request, exc: Exception):
         content={
             "code": ErrorCode.INTERNAL_SERVER_ERROR,
             "message": "服务器内部错误",
-            "detail": str(exc) if settings.API_SERVICE_ENV != "production" else "系统遇到未预期错误，请联系技术支持。",
+            "detail": "系统遇到未预期错误，请联系技术支持。" if settings.is_production else str(exc),
             "data": None,
             "timestamp": datetime.datetime.now().isoformat(),
             "trace_id": trace_id,
@@ -449,6 +537,12 @@ app.add_middleware(
 # 安全响应头放在最外层：保证所有响应（含 CORS 预检、异常响应与静态文件）都带上。
 app.add_middleware(SecurityHeadersMiddleware)
 
+# 请求指标（QPS / P95 / 5xx / 并发）：只给「实例」页做本节点口径，不对外暴露。
+# 用纯 ASGI 实现，避免 BaseHTTPMiddleware 缓冲聊天 SSE 的响应体。
+from app.core.request_metrics import RequestMetricsMiddleware  # noqa: E402
+
+app.add_middleware(RequestMetricsMiddleware)
+
 # 内置 Echo MCP：平台实例供所有智能体挂载；个人实例把 server_id 编进路径复用同一端点。
 app.mount("/mcp/echo", EchoServerIdMiddleware(echo_mcp_http_app()))
 app.mount("/mcp", platform_mcp_http_app())
@@ -463,6 +557,14 @@ app.include_router(v1_router, prefix="/api/v1")
 
 # 挂载流程控制门户路由 (管理控制台)
 app.include_router(portal_router, prefix="/api/portal")
+
+# 内置 HTTP 回显（验收 API 工具的凭据注入用）。只在非生产环境挂载：
+# 生产里多一个能回显请求头的端点没有任何好处。
+if not settings.is_production:
+    from app.services.mcp.http_echo import echo_router
+
+    app.include_router(echo_router, prefix="/api/test/echo")
+
 
 @app.get("/health")
 async def health_check():

@@ -72,10 +72,184 @@
 <script>
 const ITEMS = [
   {
+    "file": "2026-11-15-raw-json-visual-editor.html",
+    "date": "2026-11-15",
+    "title": "自定义 JSON 凭据 · 从手写 JSON 到键值对可视化编辑器",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-15-param-credential-tabs.html",
+    "date": "2026-11-15",
+    "title": "参数设置 · 单值凭据与多值凭据两种配法",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-15-credential-structured-input.html",
+    "date": "2026-11-15",
+    "title": "凭证录入 · 结构化 JSON 与内置模板编辑原型",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-15-credential-field-binding.html",
+    "date": "2026-11-15",
+    "title": "凭据字段级绑定 · 从「整条凭据」到「选定具体字段」",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-13-timeline-rail-weight.html",
+    "date": "2026-11-13",
+    "title": "执行链路轨迹线 · 三档灰度对比",
+    "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-13-timeline-rail-ideas.html",
+    "date": "2026-11-13",
+    "title": "执行链路轨迹 · 四种减重思路对比",
+    "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-13-expert-team-member-editing.html",
+    "date": "2026-11-13",
+    "title": "专家团设置 · 成员就地编辑（隐式新版本）",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-13-ai-thinking-display.html",
+    "date": "2026-11-13",
+    "title": "AI 思考展示 · 链路内改造（轨道 / 密度 / 委派）+ 全状态覆盖",
+    "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-12-tool-runtime-override.html",
+    "date": "2026-11-12",
+    "title": "工具高级配置 · 工具级超时三级覆盖与参数取舍",
+    "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-12-tool-group-tabs.html",
+    "date": "2026-11-12",
+    "title": "工具注册表 · 业务分组多 Tab 与顶部筛选联动",
+    "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-12-skill-group-tabs.html",
+    "date": "2026-11-12",
+    "title": "技能工作台 · 业务分组页签与筛选",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-12-notification-channels-multi.html",
+    "date": "2026-11-12",
+    "title": "消息通道多渠道 · 钉钉/飞书/企微统一多群与按群 ID 指定",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-12-metadata-dataset-group-tabs.html",
+    "date": "2026-11-12",
+    "title": "元数据管理 · 业务分组页签与筛选",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-12-mcp-workspace-regroup.html",
+    "date": "2026-11-12",
+    "title": "MCP 工具集 · 左栏加分组页签并重排版式",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-12-agent-group-tabs.html",
+    "date": "2026-11-12",
+    "title": "智能体中心 · 给「全部 / 我的智能体」加业务分组页签",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-12-agent-assigned-view.html",
+    "date": "2026-11-12",
+    "title": "智能体中心 · 「分配给我」只读视图",
+    "kind": "效果预览"
+  },
+  {
+    "file": "2026-11-10-subagent-session-resume.html",
+    "date": "2026-11-10",
+    "title": "子代理续聊与提问透传 · 追问保留上下文 / 子代理提问直达用户",
+    "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-10-dynamic-credential-locator.html",
+    "date": "2026-11-10",
+    "title": "凭据来源 · 固定值 / 固定凭据 / 按规则匹配",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-10-diagnostics-instance-nodes.html",
+    "date": "2026-11-10",
+    "title": "系统诊断 · 二级左栏与多实例节点总览原型",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-09-user-credential-center.html",
+    "date": "2026-11-09",
+    "title": "凭据中心 · 用户级密钥管理与自动注入原型",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-09-mcp-tool-param-credential.html",
+    "date": "2026-11-09",
+    "title": "MCP 工具 · 参数级凭据注入原型",
+    "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-09-mcp-service-desk-master-switch.html",
+    "date": "2026-11-09",
+    "title": "MCP 服务台 · 总开关关闭时能力组开关的表达对比",
+    "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-09-about-changelog-link.html",
+    "date": "2026-11-09",
+    "title": "关于面板更新日志入口 · 四种方案与链接规则",
+    "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-06-ui-mode-blacklist.html",
+    "date": "2026-11-06",
+    "title": "界面模式 · 角色级黑名单与 URL 拦截",
+    "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-06-sidebar-conversation-tone.html",
+    "date": "2026-11-06",
+    "title": "侧边栏会话列表 · 标题与「已加载全部」的亮度重排",
+    "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-06-metadata-dataset-clone.html",
+    "date": "2026-11-06",
+    "title": "元数据管理 · 数据集复制新建向导",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-06-knowledge-pagination.html",
+    "date": "2026-11-06",
+    "title": "知识库 · 大数据量分页方案原型",
+    "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-06-chat-home-redesign.html",
+    "date": "2026-11-06",
+    "title": "对话首页 · 我的资源与快捷入口重设计",
+    "kind": "方案对比"
+  },
+  {
     "file": "2026-11-05-user-mode-sidebar.html",
     "date": "2026-11-05",
     "title": "侧栏 · 用户模式简化菜单与视图切换原型",
     "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-05-user-mode-sidebar-conversation-filters.html",
+    "date": "2026-11-05",
+    "title": "会话列表搜索 · 把筛选条件放进筛选面板",
+    "kind": "交互原型"
   },
   {
     "file": "2026-11-05-token-stats-date-range.html",
@@ -90,10 +264,28 @@ const ITEMS = [
     "kind": "交互原型"
   },
   {
+    "file": "2026-11-05-knowledge-edit-policy.html",
+    "date": "2026-11-05",
+    "title": "知识库编辑权限范围 · 让「能看的人」可选是否也能改",
+    "kind": "交互原型"
+  },
+  {
     "file": "2026-11-05-embed-welcome-card-size.html",
     "date": "2026-11-05",
     "title": "首页欢迎页 · 资源卡与快捷入口放大方案",
     "kind": "方案对比"
+  },
+  {
+    "file": "2026-11-05-dataset-permission-overview.html",
+    "date": "2026-11-05",
+    "title": "数据集权限总览 · 全局查看授权分配（管理员只读）",
+    "kind": "交互原型"
+  },
+  {
+    "file": "2026-11-05-dataset-permission-console.html",
+    "date": "2026-11-05",
+    "title": "数据集权限管理 · 数据集/表/字段/行四层门禁重构原型",
+    "kind": "交互原型"
   },
   {
     "file": "2026-11-05-account-menu.html",

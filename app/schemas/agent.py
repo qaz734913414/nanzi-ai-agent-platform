@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field, ConfigDict, StrictInt, model_validator, f
 from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 from app.services.ai.agent_types import AgentType
+from app.utils.group_name import GROUP_NAME_MAX_LEN, normalize_group_name
 
 # --- Agent Management Schemas ---
 
@@ -9,8 +10,14 @@ class ToolConfigItem(BaseModel):
     """Specific configuration for a tool instance usage."""
     name: str
     enabled: bool = True
-    model_name: Optional[str] = None  # Override Agent's model
-    temperature: Optional[float] = None # Override Agent's temperature
+    # 历史字段：AgentScope 运行链只有一个 agent 级模型，工具是纯 callable，
+    # 这里填的模型没有任何下发点。保留解析只为兼容旧版本 JSON，不再展示、不再生效。
+    model_name: Optional[str] = None
+    temperature: Optional[float] = None # Override Agent's temperature / 仅对内部自调 LLM 的工具生效
+    # 工具级执行超时：留空跟随上层（智能体版本级 → 全局级）。
+    # 可以超过上层值——上层是默认值而不是天花板；超过时配置界面会给提示，
+    # 运行时不再静默截断，详见 tool_timeout.resolve_tool_timeout。
+    timeout_seconds: Optional[StrictInt] = Field(default=None, ge=1, le=86400)
     description_override: Optional[str] = None # Optional: Allow prompting tuning
     engine_config_override: Optional[Dict[str, Any]] = None
     metadata_dataset_ids: Optional[List[str]] = None  # get_dataset_schema 可见元数据集范围
@@ -20,6 +27,27 @@ class ToolConfigItem(BaseModel):
     #   非空 = 只允许名单内的（系统级仍要过 agent 授权，自建仍要过本人创建）
     # 与 metadata_dataset_ids 同构：只对特定工具生效，随发布版本走。
     delegable_agent_ids: Optional[List[str]] = None
+
+    @field_validator("timeout_seconds", mode="before")
+    @classmethod
+    def _coerce_timeout_seconds(cls, value: Any) -> Any:
+        """历史 JSON 里的脏超时（0 / 负数 / 字符串 / 超范围）当作「未配置」。
+
+        ``ChatConfig.tools`` 直接持有 ``ToolConfigItem``，任何一个脏值都会让整份
+        配置校验失败 → 会话直接不可用，这比丢一个字段严重得多。清洗口径与
+        ``registry._parse_tool_config_dict`` 保持一致：只保留 1–86400 的整数。
+        """
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            parsed = float(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        # JSON 里 10.0 很常见：先按浮点解析再判整，否则 int("10.0") 会把它洗成「未配置」
+        if not parsed.is_integer():
+            return None
+        number = int(parsed)
+        return number if 1 <= number <= 86400 else None
 
     @model_validator(mode="after")
     def _validate_metadata_dataset_ids(self):
@@ -126,8 +154,10 @@ class AIAgentVersionResponse(AIAgentVersionBase):
     model_config = ConfigDict(from_attributes=True)
 
 class AIAgentBase(BaseModel):
-    name: str
-    display_name: str
+    # 与 ai_agents.name / display_name 的 String(100) 对齐，超长在入参阶段就拦，
+    # 不要等 DB 抛 DataError 再变成 500。
+    name: str = Field(..., max_length=100)
+    display_name: str = Field(..., max_length=100)
     description: Optional[str] = None
     avatar_url: Optional[str] = None
     capabilities: Optional[List[str]] = []
@@ -141,6 +171,19 @@ class AIAgentBase(BaseModel):
     team_profile: Optional[Dict[str, Any]] = None
     engine_type: str = "LOCAL"
     engine_config: Optional[Dict[str, Any]] = None
+    # 业务分组（单值）：只服务智能体中心的页签与筛选。
+    # 与 owner_group（所属用户组 / 权限维度）、capabilities（多值路由标签）是三件事，
+    # 详见 db-prod/V214 的说明。空白串归一成 None（= 未分组）。
+    group_name: Optional[str] = Field(
+        None,
+        max_length=GROUP_NAME_MAX_LEN,
+        description="业务分组名：智能体中心按它出分组页签；为空表示未分组",
+    )
+
+    @field_validator("group_name", mode="before")
+    @classmethod
+    def normalize_group(cls, v):
+        return normalize_group_name(v)
 
     @field_validator("is_expert_team_lead", mode="before")
     @classmethod
@@ -158,6 +201,22 @@ class AIAgentBase(BaseModel):
         if not name and not intro:
             return None
         return {"name": name, "intro": intro}
+
+class AgentGroupUpdateRequest(BaseModel):
+    """只改「业务分组」的请求体。
+
+    刻意不复用 ``AIAgentBase`` 整表单 PUT：那条路会连带校验
+    「是否系统级不能改」「引擎创建后不可修改」「待审中冻结」等一堆与分组无关的规则，
+    用户只是想把智能体归个类，不该因此被拒；也不会顺手把别的字段写回。
+    """
+
+    group_name: Optional[str] = Field(None, max_length=GROUP_NAME_MAX_LEN)
+
+    @field_validator("group_name", mode="before")
+    @classmethod
+    def normalize_group(cls, v):
+        return normalize_group_name(v)
+
 
 class AgentDuplicateRequest(BaseModel):
     """复制智能体时的目标标识与显示名；其余配置一律从源智能体复制。"""
@@ -450,3 +509,16 @@ class AgentSystemUnpublishPreview(BaseModel):
     agent_id: str
     affected_user_count: int
     sample_user_names: List[str] = []
+
+
+class DelegationScopeUpdate(BaseModel):
+    """专家团成员的整份替换。
+
+    名单是**整体替换**语义：传什么就是什么，空数组表示「显式禁止委派任何子专家」，
+    与「未配置（null，表示全部可委派）」是两件事，不要用缺省值混淆。
+    """
+
+    delegable_agent_ids: List[str] = Field(default_factory=list)
+    #: 已发布版本没启用 sub_agent_call 时，是否同意这次保存一并启用它。
+    #: 默认 False：启用工具属于改动工具集，必须由调用方明确表示同意。
+    enable_delegation_tool: bool = False

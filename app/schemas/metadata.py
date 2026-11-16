@@ -1,6 +1,8 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
+
+from app.utils.group_name import GROUP_NAME_MAX_LEN, normalize_group_name
 
 # --- Table/Column Schemas (Defined first for nesting) ---
 
@@ -83,10 +85,22 @@ class DatasetBase(BaseModel):
     display_name: Optional[str] = None
     description: Optional[str] = None
     tags: Optional[List[str]] = []
+    # 业务分组：单值。tags 是多维打标（会进 AI 数据集目录），两者分工不同，不要合并
+    group_name: Optional[str] = Field(default=None, max_length=GROUP_NAME_MAX_LEN)
     data_source: Optional[str] = "clickhouse"
     status: Optional[int] = 0
     enable_data_perm: Optional[bool] = False
     row_filter_config: Optional[Dict[str, Any]] = None
+
+    @field_validator("group_name", mode="before")
+    @classmethod
+    def _normalize_group_name(cls, value):
+        """业务分组归一：与工具 / 智能体 / MCP 同一口径（`app/utils/group_name.py`）。
+
+        三个前端输入框都限了 64 字符，但接口可以被直接调用：全空格的 `"   "` 会在页签上
+        变成一个看不见的空分组，超长则在 MySQL 严格模式下直接 500，而不是静默截断。
+        """
+        return normalize_group_name(value)
 
 class DatasetCreate(DatasetBase):
     pass
@@ -95,10 +109,21 @@ class DatasetUpdate(BaseModel):
     display_name: Optional[str] = None
     description: Optional[str] = None
     tags: Optional[List[str]] = None
+    group_name: Optional[str] = Field(default=None, max_length=GROUP_NAME_MAX_LEN)
     data_source: Optional[str] = None
     status: Optional[int] = None
     enable_data_perm: Optional[bool] = None
     row_filter_config: Optional[Dict[str, Any]] = None
+
+    @field_validator("group_name", mode="before")
+    @classmethod
+    def _normalize_group_name(cls, value):
+        """业务分组归一：与工具 / 智能体 / MCP 同一口径（`app/utils/group_name.py`）。
+
+        三个前端输入框都限了 64 字符，但接口可以被直接调用：全空格的 `"   "` 会在页签上
+        变成一个看不见的空分组，超长则在 MySQL 严格模式下直接 500，而不是静默截断。
+        """
+        return normalize_group_name(value)
 
 class DatasetResponse(DatasetBase):
     id: int
@@ -329,3 +354,50 @@ class RecommendColumnSemanticResponse(BaseModel):
     sibling_terms: List[str] = Field(default_factory=list)
 
 
+
+
+# --- Dataset Clone Schemas ---
+#
+# 「复制新建」提交的是用户在向导里改完的**整份草稿**，不是「复制哪些 id」：
+# 中间步骤允许改术语/描述、删表、删关系、改指标，保存时以草稿为准。
+# 关系用物理表名做引用（表 id 会重新生成），join_condition 原样保留。
+
+class CloneRelationshipPayload(BaseModel):
+    source_table: str
+    target_table: str
+    join_condition: str = ""
+    join_type: str = "LEFT"
+    description: Optional[str] = None
+
+
+class CloneDatasetRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    display_name: Optional[str] = Field(default=None, max_length=100)
+    description: Optional[str] = None
+    tags: Optional[List[str]] = []
+    # 复制时默认沿用源数据集的分组（前端向导里可改）
+    group_name: Optional[str] = Field(default=None, max_length=GROUP_NAME_MAX_LEN)
+    data_source: Optional[str] = Field(default=None, max_length=50)
+    tables: List[TableCreate] = []
+    relationships: List[CloneRelationshipPayload] = []
+    metrics: List[MetricSchema] = []
+    # 行级策略属于「数据集自身配置」，默认不继承（绑了具体部门/人，复制易越权）
+    copy_permissions: bool = False
+    # detail: 数据集 1 条 + 每张表/关系/指标各 1 条；summary: 只写 1 条汇总
+    log_mode: Literal["detail", "summary"] = "detail"
+
+
+    @field_validator("group_name", mode="before")
+    @classmethod
+    def _normalize_group_name(cls, value):
+        """业务分组归一：与工具 / 智能体 / MCP 同一口径（`app/utils/group_name.py`）。
+
+        三个前端输入框都限了 64 字符，但接口可以被直接调用：全空格的 `"   "` 会在页签上
+        变成一个看不见的空分组，超长则在 MySQL 严格模式下直接 500，而不是静默截断。
+        """
+        return normalize_group_name(value)
+
+class BatchDeleteDatasetsRequest(BaseModel):
+    """批量删除数据集：一次最多 100 个，重复 id 自动去重。"""
+
+    ids: List[int] = Field(default_factory=list)

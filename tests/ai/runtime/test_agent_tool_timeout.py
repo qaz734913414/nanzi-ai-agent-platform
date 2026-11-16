@@ -51,14 +51,15 @@ def test_agent_tool_timeout_config_parsing_and_precedence():
         ),
     ]
 
+    # 上层是默认值，不是天花板：没配的工具继承上层，自带/工具级配置则原样生效
     limited = apply_agent_tool_timeout(specs, 180.0)
-    assert [spec.timeout_seconds for spec in limited] == [180.0, 180.0]
+    assert [spec.timeout_seconds for spec in limited] == [180.0, 600.0]
 
     version_limited = apply_agent_tool_timeout(specs, 120.0, agent_timeout=300.0)
-    assert [spec.timeout_seconds for spec in version_limited] == [300.0, 300.0]
+    assert [spec.timeout_seconds for spec in version_limited] == [300.0, 600.0]
 
     version_over_global = apply_agent_tool_timeout(specs, 300.0, agent_timeout=120.0)
-    assert [spec.timeout_seconds for spec in version_over_global] == [120.0, 120.0]
+    assert [spec.timeout_seconds for spec in version_over_global] == [120.0, 600.0]
 
 
 @pytest.mark.asyncio
@@ -94,19 +95,45 @@ async def test_configured_agent_tool_timeout_uses_version_override_without_extra
 
     config_get = AsyncMock(return_value="45")
     monkeypatch.setattr("app.services.config_service.ConfigService.get", config_get)
+    # 不带工具自带超时：版本级 30 应当生效，且不额外读系统配置。
     spec = RuntimeToolSpec(
         name="version_snapshot_tool",
         description="",
         parameters_schema={"type": "object", "properties": {}},
         source_type="static",
         callable=lambda: "ok",
-        timeout_seconds=10.0,
     )
 
     limited = await apply_configured_agent_tool_timeout([spec], agent_timeout=30)
 
     assert limited[0].timeout_seconds == 30.0
+    assert limited[0].timeout_source == "agent"
     config_get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tool_defined_timeout_outranks_version_timeout(monkeypatch):
+    """脚本工具注册时自带的超时要保留，不能被版本级/全局级整批抹平。"""
+    from app.services.ai.runtime.agentscope.tool_timeout import (
+        apply_configured_agent_tool_timeout,
+    )
+    from app.services.ai.runtime.agentscope.tools import RuntimeToolSpec
+
+    config_get = AsyncMock(return_value="45")
+    monkeypatch.setattr("app.services.config_service.ConfigService.get", config_get)
+    spec = RuntimeToolSpec(
+        name="script_defined_tool",
+        description="",
+        parameters_schema={"type": "object", "properties": {}},
+        source_type="script_tool",
+        callable=lambda: "ok",
+        timeout_seconds=10.0,
+    )
+
+    limited = await apply_configured_agent_tool_timeout([spec], agent_timeout=30)
+
+    assert limited[0].timeout_seconds == 10.0
+    assert limited[0].timeout_source == "tool_defined"
 
 
 def test_timeout_argument_is_replaced_by_configured_timeout():

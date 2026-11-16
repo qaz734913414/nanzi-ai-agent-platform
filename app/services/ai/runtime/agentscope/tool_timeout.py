@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 import re
+from contextvars import ContextVar, Token
 from dataclasses import replace
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 
 AGENT_MAX_TOOLCALL_TIMEOUT_KEY = "agent_max_toolcall_timeout"
@@ -13,6 +14,10 @@ DEFAULT_AGENT_MAX_TOOLCALL_TIMEOUT = 180.0
 MIN_AGENT_MAX_TOOLCALL_TIMEOUT = 1.0
 MAX_AGENT_MAX_TOOLCALL_TIMEOUT = 3600.0
 MAX_AGENT_VERSION_TOOLCALL_TIMEOUT = 86400.0
+#: 单个工具允许配置的上限，与版本级同口径（1 天）。
+#: 工具级不再被上层钳制——某些工具天生就慢（大文件处理、外部批处理、长脚本），
+#: 「只能收紧」会逼用户把整个版本级的默认值调大，等于连带放大了所有工具。
+MAX_TOOL_TIMEOUT_SECONDS = 86400.0
 _INTEGER_PATTERN = re.compile(r"^[0-9]+$")
 
 
@@ -109,6 +114,44 @@ def resolve_agent_toolcall_timeout(global_timeout: Any, agent_timeout: Any = Non
     return parse_agent_max_toolcall_timeout(global_timeout)
 
 
+def resolve_tool_timeout(
+    *,
+    tool_config_timeout: Any = None,
+    spec_timeout: Any = None,
+    agent_timeout: Any = None,
+    global_timeout: Any = None,
+) -> tuple[float, str]:
+    """解析单个工具的真实生效超时与来源层级。
+
+    逐级覆盖：工具级配置 > 工具自带定义 > 智能体版本级 > 全局级。
+    **上层是默认值，不是天花板**：工具级可以把某个慢工具的预算放大到超过上层
+    （典型场景：一个大文件处理工具需要 600s，而版本级默认 180s）。
+    超上限只在配置界面提示，不在运行时静默截断——静默截断会让"界面上填的值"
+    和"实际生效的值"再次对不上，而这正是本模块要消灭的问题。
+
+    失控风险由「工具级取值范围（≤ 86400）」+ 管理员对版本级/全局级的把控共同兜底。
+
+    Returns:
+        (生效秒数, 来源)。来源取值：``tool`` / ``tool_defined`` / ``agent`` / ``global``。
+    """
+    ceiling = resolve_agent_toolcall_timeout(global_timeout, agent_timeout)
+    ceiling_source = (
+        "agent"
+        if parse_agent_version_toolcall_timeout(agent_timeout) is not None
+        else "global"
+    )
+
+    configured = _coerce_positive_timeout(tool_config_timeout)
+    if configured is not None:
+        return configured, "tool"
+
+    defined = _coerce_positive_timeout(spec_timeout)
+    if defined is not None:
+        return defined, "tool_defined"
+
+    return ceiling, ceiling_source
+
+
 async def load_agent_max_toolcall_timeout() -> float:
     """读取当前请求构建工具时使用的全局工具调用超时。"""
     from app.services.config_service import ConfigService
@@ -123,30 +166,102 @@ async def load_agent_max_toolcall_timeout() -> float:
     return parse_agent_max_toolcall_timeout(raw)
 
 
+def collect_tool_timeouts(tool_configs: Any) -> dict[str, float]:
+    """从版本 ``tools`` 配置里收集「工具名 → 工具级超时」。
+
+    兼容三种元素形态：字符串（无配置）、dict（DB JSON 直出）、
+    ``ToolConfigItem``（运行时对象）。未设置/非法值一律跳过，交给上层回落。
+    """
+    collected: dict[str, float] = {}
+    for item in tool_configs or []:
+        if isinstance(item, str):
+            continue
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+            raw = item.get("timeout_seconds")
+        else:
+            name = str(getattr(item, "name", "") or "").strip()
+            raw = getattr(item, "timeout_seconds", None)
+        value = _coerce_positive_timeout(raw)
+        if name and value is not None:
+            collected[name] = value
+    return collected
+
+
+#: spec 上记录「平台配置名」的 metadata 键。
+#: 配置按平台名（`exec_command`）存，运行时 spec 的名字却是另一个
+#: （AgentScope 原生 `Bash`、MCP 的 model 化名），只按 spec.name 查表必然漏。
+PLATFORM_TOOL_NAME_KEY = "_platform_tool_name"
+
+
+def _lookup_tool_timeout(
+    table: Mapping[str, Any],
+    *,
+    spec_name: str,
+    platform_name: str | None,
+) -> Any:
+    """按「平台配置名 → spec 名 → 别名」的顺序查工具级超时。
+
+    三条路径都要留：
+    1. 平台名（首选）：配置就是按它存的；
+    2. spec 名：少数工具两者本就同名；
+    3. 别名反查：某些链路（如 workspace 重新绑定）会重建 spec 丢掉 metadata，
+       此时仍能靠 ``exec_command → Bash`` 这张表把配置对上。
+    """
+    if platform_name and platform_name in table:
+        return table[platform_name]
+    if spec_name and spec_name in table:
+        return table[spec_name]
+    if spec_name and table:
+        # 延迟导入：registry 依赖面很大，模块级导入会造成循环依赖。
+        from app.services.ai.tools.registry import AGENTSCOPE_BUILTIN_TOOL_ALIASES
+
+        for configured_name, value in table.items():
+            if AGENTSCOPE_BUILTIN_TOOL_ALIASES.get(configured_name) == spec_name:
+                return value
+    return None
+
+
 def apply_agent_tool_timeout(
     specs: Iterable[Any],
     global_timeout: Any,
     *,
     agent_timeout: Any = None,
+    tool_timeouts: Mapping[str, Any] | None = None,
 ) -> list[Any]:
-    """给一批运行时工具应用当前版本选定的配置超时快照。"""
-    configured_timeout = resolve_agent_toolcall_timeout(global_timeout, agent_timeout)
+    """给一批运行时工具应用超时快照，逐个工具解析而非整批覆盖。
+
+    ``tool_timeouts`` 是「工具名 → 工具级超时」的映射（来自版本 tools JSON）。
+    历史实现用同一个值覆盖整批 spec 的 ``timeout_seconds``，会把脚本工具注册时
+    自带的超时一并抹平；这里改为逐 spec 走 :func:`resolve_tool_timeout`。
+    """
+    configured = dict(tool_timeouts or {})
     from dataclasses import is_dataclass
 
     result = []
     for spec in specs:
+        tool_name = str(getattr(spec, "name", "") or "")
+        metadata = getattr(spec, "metadata", None)
+        platform_name: str | None = None
+        if isinstance(metadata, dict):
+            platform_name = str(metadata.get(PLATFORM_TOOL_NAME_KEY) or "") or None
+        timeout_seconds, timeout_source = resolve_tool_timeout(
+            tool_config_timeout=_lookup_tool_timeout(
+                configured, spec_name=tool_name, platform_name=platform_name
+            ),
+            spec_timeout=getattr(spec, "timeout_seconds", None),
+            agent_timeout=agent_timeout,
+            global_timeout=global_timeout,
+        )
+        updates = {"timeout_seconds": timeout_seconds, "timeout_source": timeout_source}
         if is_dataclass(spec) and not isinstance(spec, type):
-            result.append(
-                replace(
-                    spec,
-                    timeout_seconds=effective_tool_timeout(configured_timeout),
-                )
-            )
+            result.append(replace(spec, **updates))
         else:
-            try:
-                setattr(spec, "timeout_seconds", effective_tool_timeout(configured_timeout))
-            except Exception:
-                pass
+            for key, value in updates.items():
+                try:
+                    setattr(spec, key, value)
+                except Exception:
+                    pass
             result.append(spec)
     return result
 
@@ -155,12 +270,14 @@ async def apply_configured_agent_tool_timeout(
     specs: Sequence[Any] | Iterable[Any],
     *,
     agent_timeout: Any = None,
+    tool_timeouts: Mapping[str, Any] | None = None,
 ) -> list[Any]:
     """读取一次系统配置并返回当前版本的工具超时快照。"""
     return apply_agent_tool_timeout(
         specs,
         await load_agent_max_toolcall_timeout(),
         agent_timeout=agent_timeout,
+        tool_timeouts=tool_timeouts,
     )
 
 
@@ -196,3 +313,25 @@ async def apply_sandbox_gateway_timeout(workspace: Any) -> float | None:
     except Exception:
         return None
     return timeout
+
+
+_active_tool_timeout_seconds: ContextVar[float | None] = ContextVar(
+    "active_tool_timeout_seconds", default=None
+)
+
+
+def get_active_tool_timeout_seconds() -> float | None:
+    """获取当前正在执行的工具实例经三级规则解析后的生效超时秒数。"""
+    return _active_tool_timeout_seconds.get()
+
+
+def set_active_tool_timeout_seconds(value: float | None) -> Token[float | None]:
+    """绑定当前工具调用的三级解析超时秒数，供 MCP / 子代理内部超时与外层保持同源。"""
+    return _active_tool_timeout_seconds.set(
+        float(value) if value is not None and value > 0 else None
+    )
+
+
+def reset_active_tool_timeout_seconds(token: Token[float | None]) -> None:
+    """恢复进入工具调用前的 active_tool_timeout_seconds 上下文状态。"""
+    _active_tool_timeout_seconds.reset(token)

@@ -32,6 +32,18 @@ class ToolMetadata:
 
 
 _KNOWN_TOOL_METADATA: Mapping[str, ToolMetadata] = {
+    # 用户自己配了哪些消息群。只读、无副作用，与凭据 / 数据集清单同口径；
+    # 显式登记是为了让 capability/source 字段与其它清单工具一致，
+    # 而不是靠 READ_ONLY_TOOL_NAMES + evidence_types 兜底推导出 unknown。
+    "list_notification_channels": ToolMetadata(
+        capability="notification_channels",
+        source="user_config",
+        freshness="realtime",
+        side_effect="read",
+        confirmation="none",
+        idempotent="yes",
+        nudge_mode="evidence",
+    ),
     "get_current_model": ToolMetadata(
         capability="current_model",
         source="runtime_environment",
@@ -130,6 +142,25 @@ _KNOWN_TOOL_METADATA: Mapping[str, ToolMetadata] = {
         confirmation="none",
         idempotent="yes",
         nudge_mode="evidence",
+    ),
+    # 知识库写操作：不可逆，且会改变别人能检索到什么 —— confirmation=ask
+    "create_knowledge_base": ToolMetadata(
+        capability="knowledge_management",
+        source="platform_control",
+        freshness="realtime",
+        side_effect="write",
+        confirmation="ask",
+        idempotent="no",
+        nudge_mode="explicit",
+    ),
+    "upload_document_to_knowledge_base": ToolMetadata(
+        capability="knowledge_management",
+        source="platform_control",
+        freshness="realtime",
+        side_effect="write",
+        confirmation="ask",
+        idempotent="no",
+        nudge_mode="explicit",
     ),
     "create_recurring_task": ToolMetadata(
         capability="task_management",

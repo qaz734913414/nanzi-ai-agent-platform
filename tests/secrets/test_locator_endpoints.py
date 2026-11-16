@@ -1,0 +1,143 @@
+"""规则绑定的接口契约：钉住几个「改回去就静默失效」的点。
+
+这些用例不测业务逻辑（那在 ``test_locator_rule.py`` / ``test_locator_resolve.py``
+里），只守源码层面的护栏——每一条都对应一个真实会出现的故障现象。
+"""
+from pathlib import Path
+
+SRC = Path("app/api/portal/endpoints/secrets.py").read_text(encoding="utf-8")
+CENTER = Path("app/services/secrets/center.py").read_text(encoding="utf-8")
+
+
+def test_bindings_list_uses_outerjoin():
+    """规则行没有 secret_id，INNER JOIN 会让它整行消失。
+
+    故障现象：配了规则，绑定列表里却什么都没有。
+    """
+    assert "outerjoin(UserSecret" in SRC
+
+
+def test_bindings_list_exposes_strategy_and_rule_summary():
+    """前端要靠 strategy 决定显示「凭据名」还是「规则摘要」。"""
+    assert '"strategy"' in SRC
+    assert "rule_summary" in SRC
+
+
+def test_bind_request_accepts_rule_without_secret_id():
+    """规则绑定没有 secret_id；它若仍是必填，请求会直接 422。"""
+    assert 'secret_id: str = ""' in SRC
+    assert 'strategy: str = "fixed"' in SRC
+    assert "rule: dict | None = None" in SRC
+
+
+def test_unbind_request_carries_strategy():
+    """解绑不区分策略，会把同层的规则和固定一起删掉。"""
+    assert "strategy=payload.strategy" in SRC
+
+
+def test_unbind_slot_filters_by_strategy():
+    assert "SecretBinding.strategy == strategy" in CENTER
+
+
+def test_bind_secret_only_clears_fixed_row():
+    """配固定凭据时不能把同槽位的规则静默删掉（先删后插要限定 strategy）。"""
+    assert 'SecretBinding.strategy == "fixed"' in CENTER
+
+
+def test_bind_rule_exists_and_persists_only_normalized_fields():
+    """规则落库只写归一号过的字段，顺手把 secret_id 挡在库外。"""
+    assert "async def bind_rule(" in CENTER
+    assert '"key_source": spec.key_source' in CENTER
+
+
+def test_locate_preview_uses_logged_in_user_only():
+    """试算身份固定为当前登录人（已拍板），不接受指定用户。"""
+    assert '@router.post("/locate-preview"' in SRC
+    assert "sample_user_id" not in SRC
+
+
+def test_locate_matches_only_within_visible_set():
+    """规则只能在「调用者可见的」凭据里匹配，绝不能按 key 去查全表。
+
+    这条是越权防线的守卫：``_visible_records`` 走的是 ``list_visible_secrets``
+    （本人的 + 被授权的系统级）。一旦有人图省事改成
+    ``select(UserSecret).where(UserSecret.secret_key == ...)``，别人的私有凭据
+    就会进入匹配范围——而规则是用户随手能改的东西。
+
+    变异验证：在 resolver.py 里加任何 ``UserSecret.secret_key`` 引用，这条会红。
+
+    断言从 ``visible`` 改成了 ``pool``：模板约束要参与**候选筛选**（按 name 匹配时
+    可能有多条同名不同模板的凭据，先挑中再否掉会让本该命中的那条永远轮不到），
+    所以传进 ``pick_match`` 的是过滤后的池子。约束只会缩小范围——这里同时钉住
+    ``pool`` 的初值必须是 ``visible``，别有人绕过可见集合另起一个来源。
+    """
+    resolver_src = Path("app/services/secrets/resolver.py").read_text(encoding="utf-8")
+    # 2026-11-16：调用多了一个 field_value 回调（target=field 时按字段值匹配要解密），
+    # 但「候选池来自 visible」这条不变，所以断言放宽到前缀。
+    assert "pick_match(spec, wanted, pool" in resolver_src
+    # 2026-11-16：pool 不再是 `visible` 本身——先按「场景放行 + 未过期」剔一遍，
+    # 否则一条注定被拒的凭据会先胜出、把后面可用的挡住。断言改成「过滤的输入
+    # 必须是 visible」，别有人绕过可见集合另起来源。
+    assert "for record in visible" in resolver_src
+    assert "if _record_is_candidate(record, _now_utc(), scene)" in resolver_src
+    assert "UserSecret.secret_key" not in resolver_src
+
+
+def test_platform_targets_uses_resolve_api_tool_slot():
+    """API 工具的参数槽位必须由统一函数推，不能按 method 自己拼。
+
+    故障现象：``POST /refund/{applicant}`` 里 applicant 是 path 参数，端点却
+    生成 ``body:applicant``，而注入层用 ``path:applicant`` 去查——绑定写进去了、
+    面板还显示「已绑定」，调用时永远匹配不到，且没有任何报错。
+
+    变异验证：把 param_slots 改回 ``f"{param_prefix}:{name}"``，这条会红。
+    """
+    assert "resolve_api_tool_slot(" in SRC
+    # 「按方法选前缀」的写法不许回来
+    assert 'param_prefix = "query" if' not in SRC
+
+
+def test_platform_targets_param_slots_cover_path_query_body():
+    """三种落位都要能生成，别只覆盖两种。"""
+    from app.services.secrets.policy import resolve_api_tool_slot
+
+    assert resolve_api_tool_slot(
+        name="applicant", method="POST", url_template="http://x/refund/{applicant}"
+    ) == "path:applicant"
+    assert resolve_api_tool_slot(
+        name="q", method="GET", url_template="http://x/search"
+    ) == "query:q"
+    assert resolve_api_tool_slot(
+        name="body", method="POST", url_template="http://x/search"
+    ) == "body:body"
+
+
+def test_preview_wires_the_same_field_value_resolver_as_runtime():
+    """试算必须和运行时用**同一个**字段取值器。
+
+    这条盯的是一个真实回归：`target="field"` 上线后，试算接口调 `pick_match` 时没传
+    `field_value`，而取值器的语义是「没给回调就当取不到」——于是配置者点「试算一下」
+    永远看到「未命中」，真实调用却能命中。同一份规则两个答案，比不给试算更糟：
+    用户会反复改规则、最后放弃这个功能。
+
+    变异验证：删掉 `locate_preview` 里的 `field_value=` 实参，这条会红。
+    """
+    src = Path("app/api/portal/endpoints/secrets.py").read_text(encoding="utf-8")
+    # 2026-11-16：调用补了 scene（不带的话，只授权给别的场景的凭据会在试算里显示
+    # 命中、真实调用被过滤），所以断言放过参数、只钉住接线本身。
+    assert "field_value = field_value_resolver(" in src
+    assert "spec.target_field, scene=_scene_of_consumer(payload.consumer_type)" in src
+    assert "pick_match(spec, wanted, pool, field_value=field_value)" in src
+    # 取值器必须是模块级的那一个（试算和运行时共用），不能各写一份
+    resolver_src = Path("app/services/secrets/resolver.py").read_text(encoding="utf-8")
+    assert "def field_value_resolver(" in resolver_src
+
+
+def test_preview_miss_reason_names_the_field():
+    """未命中原因要说清比的是哪个字段。
+
+    「没有 field = alice@corp.com 的凭据」看不出是哪一项没对上，用户只会觉得
+    规则坏了。
+    """
+    src = Path("app/api/portal/endpoints/secrets.py").read_text(encoding="utf-8")
+    assert 'f"没有 {spec.target_field} 字段 = {used} 的凭据"' in src

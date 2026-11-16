@@ -10,7 +10,7 @@
  * - `onDenied: 'lock'`：没权限也保留位置、置灰、点击提示联系管理员。
  *   只给「知识库」用——用户需要知道平台有这个能力，否则会以为资料传不上去。
  * - `onDenied: 'hide'`（默认）：没权限直接不渲染，避免点进去被守卫弹回来。
- * - `adminOnly`：只给管理员看（系统管理）。
+ * - `adminOnly`：只给管理员看（当前只有「更多 → 系统设置」用）。
  *
  * 定时任务刻意不挂权限码：它只列当前用户自己建的任务，走 /dashboard/my-tasks，
  * 属于「人人都有」的能力；而 /dashboard/tasks（任务调度台，能看全平台任务）
@@ -27,6 +27,8 @@ export type UserModeIconKey =
   | "rectangle_stack"
   | "dashboard"
   | "memory"
+  | "users"
+  | "roles"
   | "token_stats"
   | "user_circle"
   | "system"
@@ -148,6 +150,36 @@ export const USER_MODE_MENU: readonly UserModeMenuItem[] = [
         path: "/dashboard",
         permission: "menu:dashboard",
       },
+      {
+        key: "users",
+        label: "用户管理",
+        icon: "users",
+        // 与「系统设置」同一套口径：管理员专用 + 菜单码双保险。
+        // 普通用户既没有 menu:system:users，管理员身份也不成立，两个条件都挡。
+        path: "/dashboard/users",
+        permission: "menu:system:users",
+        adminOnly: true,
+      },
+      {
+        key: "roles",
+        label: "角色管理",
+        icon: "roles",
+        path: "/dashboard/roles",
+        permission: "menu:system:roles",
+        adminOnly: true,
+      },
+      {
+        key: "system",
+        label: "系统设置",
+        icon: "system",
+        // 管理员在用户模式下也要能直达系统配置。以前这里没有入口，改一个配置要
+        // 先切到专业模式、再从左侧菜单进——日常维护多绕一步。
+        // 普通用户没有 menu:system:config，露出来只会被守卫踢回落地页，
+        // 所以 adminOnly + 权限码双保险：两个条件都满足才渲染。
+        path: "/dashboard/system",
+        permission: "menu:system:config",
+        adminOnly: true,
+      },
     ],
   },
 ]
@@ -252,4 +284,54 @@ export function collectUserModePaths(menu: readonly UserModeMenuItem[] = USER_MO
     for (const child of item.children || []) paths.push(child.path)
   }
   return paths
+}
+
+
+/**
+ * 账户菜单 / 全站导航里能到、但**不在侧栏菜单**里的页面。
+ *
+ * 用户模式侧栏没有「个人中心」入口，但账号菜单里有。禁用专业模式后要靠下面
+ * 这份清单判断可达性——漏了它，用户点头像进个人中心会被守卫踢回聊天页。
+ */
+export const USER_MODE_EXTRA_REACHABLE_PATHS: readonly string[] = ["/dashboard/personal"]
+
+/**
+ * 禁用专业模式时仍可到达的路径 = 用户模式菜单 ∪ 账户菜单入口。
+ *
+ * 单一来源：菜单改了这里跟着变，不用维护第二份白名单。
+ */
+export function collectUserModeReachablePaths(
+  menu: readonly UserModeMenuItem[] = USER_MODE_MENU,
+): string[] {
+  const paths = collectUserModePaths(menu)
+  for (const path of USER_MODE_EXTRA_REACHABLE_PATHS) {
+    if (!paths.includes(path)) paths.push(path)
+  }
+  return paths
+}
+
+/** 去掉查询串 / hash / 末尾斜杠，便于与白名单比较 */
+function normalizeReachablePath(path: string): string {
+  const [withoutQuery = ""] = String(path || "").split("?")
+  const [target = ""] = withoutQuery.split("#")
+  if (!target) return "/"
+  const trimmed = target.length > 1 ? target.replace(/\/+$/, "") : target
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`
+}
+
+/**
+ * 某路径在「禁用专业模式」时是否仍可访问。
+ *
+ * `/dashboard`（系统概览）**只做精确匹配**：它本身是用户模式「更多」里的入口，
+ * 但如果按前缀匹配，`/dashboard/users`、`/dashboard/system` 这些专业模式页面
+ * 会被当成它的子路径一起放行——等于白禁。
+ */
+export function isUserModeReachable(path: string): boolean {
+  const target = normalizeReachablePath(path)
+  for (const allowed of collectUserModeReachablePaths()) {
+    const base = normalizeReachablePath(allowed)
+    if (target === base) return true
+    if (base !== "/dashboard" && target.startsWith(`${base}/`)) return true
+  }
+  return false
 }

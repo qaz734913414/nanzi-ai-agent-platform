@@ -2,14 +2,14 @@ import logging
 import time
 import httpx
 import json
-from typing import Dict, Any, Mapping, Type
+from typing import Dict, Any, Mapping, Optional, Type
 from pydantic import create_model, Field
 from app.services.ai.tools.request_signing import (
     parse_signing_config,
     sign_request,
     validate_no_reserved_signing_headers,
 )
-from app.services.ai.tools.system_params import apply_system_params
+from app.services.ai.tools.system_params import apply_system_params, credential_param_names
 from app.services.ai.tools.tool_compat import StructuredTool
 from app.services.ai.tools.user_placeholders import (
     contains_user_placeholder,
@@ -25,6 +25,8 @@ from app.services.ai.tools.parameter_schema import (
     parse_parameter_schema as _parse_parameter_schema,
 )
 from app.services.ai.tools.tool_credentials import unresolved_credential_headers
+from app.services.secrets.injection import apply_api_tool_bindings, apply_api_tool_param_bindings
+from app.services.secrets.redact import redact_value
 
 logger = logging.getLogger(__name__)
 
@@ -62,21 +64,60 @@ class UnsupportedMethodError(Exception):
 
 
 class UnresolvedCredentialError(Exception):
-    """工具还带着导入时的 ``${CREDENTIAL:<name>}`` 占位符。
+    """工具还带着导入时的 ``${CREDENTIAL:<name>}`` 占位符，或凭据参数没注入成功。
 
     导入的工具默认没有凭据（导出侧永不带走密钥），若使用者启用前没补，这里必须
     明确拦住。把占位符原样发给对方服务只会得到一个莫名其妙的 401，让人以为是
     「接口变了」。
     """
 
-    def __init__(self, tool_name: str, headers: list[str]):
+    #: ``denials`` 的 key 是**槽位**（``header:Authorization`` / ``query:token`` /
+    #: ``body:password`` / ``path:applicant``），调用方手里只有名字。
+    #: 不按前缀挨个试，参数级的拒绝原因就永远查不到——表现是「明明是参数缺凭据，
+    #: 却让用户去改 header」，真正的原因（规则未命中 / 过期 / 停用）全被吞掉。
+    SLOT_PREFIXES = ("header:", "query:", "body:", "path:", "")
+
+    def __init__(self, tool_name: str, names: list[str], denials: dict[str, str] | None = None):
         self.tool_name = tool_name
-        self.headers = list(headers)
-        names = "、".join(self.headers)
-        super().__init__(
-            f"工具 {tool_name} 的请求凭据还没填：{names}。"
-            "请在「工具管理」里把 header 值改成真实凭据后再调用"
-        )
+        self.names = list(names)
+        #: 兼容旧名：它原本只表示 header 名，现在也可能是凭据参数名
+        self.headers = self.names
+        # 有拒绝原因时要说清是「过期了」还是「被停用了」——这两种情况用户要做的事
+        # 完全不同（轮换 vs 找管理员恢复），都笼统说成「还没填」等于没说。
+        denials = denials or {}
+        reasons: dict[str, str] = {}
+        for name in self.names:
+            for prefix in self.SLOT_PREFIXES:
+                text = denials.get(f"{prefix}{name}") if prefix else denials.get(name)
+                if text:
+                    reasons[name] = text
+                    break
+        if reasons:
+            from app.services.secrets.injection import denial_hint, denial_text
+
+            detail = "；".join(
+                f"{name}（{denial_text(reason)}）" for name, reason in reasons.items()
+            )
+            self.reasons = reasons
+            # 按原因给具体的修复动作：域名白名单不对时凭据状态是正常的，
+            # 一句「检查状态」会把人引到错误的页面。
+            hints: list[str] = []
+            for reason in reasons.values():
+                hint = denial_hint(reason)
+                if hint and hint not in hints:
+                    hints.append(hint)
+            message = f"工具 {tool_name} 的请求凭据没有注入：{detail}"
+            if hints:
+                message += "。" + "；".join(hints)
+            super().__init__(message + "。也可以在工具里改用固定值。")
+        else:
+            self.reasons = {}
+            names = "、".join(self.names)
+            # 别点名「header」：这里也可能是参数级凭据，指错位置比不指更费时间
+            super().__init__(
+                f"工具 {tool_name} 的请求凭据还没填：{names}。"
+                "请在「工具管理」里把这几处改成真实值，或给它绑定一条凭据后再调用"
+            )
 
 
 class GenericApiToolFactory:
@@ -147,6 +188,42 @@ class GenericApiToolFactory:
                 # Simple case assumes required
             
             fields[param_name] = (p_type, Field(default=p_default, description=p_desc))
+
+        # 凭据参数在模型侧没有值可填（值由平台注入），但「规则没匹配上时让模型
+        # 挑一条」需要一条回传通道：给每个凭据参数配一个可选编号字段。
+        # 编号来自 ``list_my_credentials`` 的返回，两边用同一套排序（secret_key → id），
+        # 与 MCP 工具参数那条链路逐位一致。
+        # **不在这里注入候选清单**：工具定义可能被缓存复用，而候选按用户可见范围算。
+        try:
+            _credential_names = credential_param_names(
+                getattr(tool_config, "parameter_schema", None)
+            )
+        except Exception as exc:  # noqa: BLE001 - 坏配置不该让整个工具定义构建失败
+            logger.warning(
+                "[GenericApi] 工具 %s 的系统参数配置不合法，跳过凭据编号字段: %s",
+                getattr(tool_config, "name", "?"),
+                exc,
+            )
+            _credential_names = []
+
+        if _credential_names:
+            from app.services.secrets.locator import choice_field
+
+            for _name in _credential_names:
+                _alias = choice_field(_name)
+                if _alias in fields:
+                    continue
+                fields[_alias] = (
+                    Optional[str],
+                    Field(
+                        default=None,
+                        description=(
+                            f"可选。{_name} 用哪条凭据的编号（例如 c3），编号来自 "
+                            "list_my_credentials 工具的返回。只在平台规则没能自动匹配到"
+                            "凭据时才生效；拿不准就留空，平台会按规则自己去匹配。"
+                        ),
+                    ),
+                )
         
         # Create Pydantic model
         args_schema = create_model(f"{tool_config.name}Args", **fields)
@@ -223,6 +300,31 @@ class GenericApiToolFactory:
         params = _apply_user_placeholders(config, params, variables)
         params = apply_system_params(config.parameter_schema, params, variables)
 
+        method = config.method.upper()
+        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            raise UnsupportedMethodError(method)
+
+        # 凭据参数必须**先于**路径替换注入：`apply_system_params` 会把声明为
+        # 「来自凭据」的参数摘掉（它不能塞空串），URL 里 `{applicant}` 就再也
+        # 拿不到值，字面量会被原样发出去。
+        credential_params = credential_param_names(getattr(config, "parameter_schema", None))
+        if credential_params:
+            param_denials: dict[str, str] = {}
+            params = await apply_api_tool_param_bindings(
+                config, params, method=method, user_info=user_info, denials=param_denials
+            )
+            unresolved_params = [name for name in credential_params if name not in params]
+            if unresolved_params:
+                # 和 header 一样的口径：宁可在这里说清楚，也不要发出去换一个 401
+                raise UnresolvedCredentialError(config.name, unresolved_params, param_denials)
+            # 编号字段是给平台看的，绝不能进 query/body：远端收到未知参数会报错，
+            # 模型在挑哪条凭据也没有理由告诉对方。必须在上面的注入之后剥——
+            # 注入层正是从这里读模型的选择。
+            from app.services.secrets.locator import choice_field
+
+            for _name in credential_params:
+                params.pop(choice_field(_name), None)
+
         url = config.url_template
 
         # 1. Path Substitution
@@ -249,16 +351,22 @@ class GenericApiToolFactory:
                 headers.update(h_config)
         if headers:
             headers = replace_headers_user_placeholders(headers, variables)
-            pending = unresolved_credential_headers(headers)
-            if pending:
-                # 导入工具默认没有凭据；发出去只会换来对方的 401，不如在这里说清楚
-                raise UnresolvedCredentialError(config.name, pending)
+        # 凭据注入不能在 `if headers:` 里面：工具一个 header 都没配（`{}`）时，
+        # 后台绑好的 header:Authorization 就永远不生效——界面上写着「来自凭据」，
+        # 发出去的请求里却没有这个头，对方回 401，而这里看起来什么都对。
+        # 只补「本来就没填」的 header，手填的真实值一律不动。
+        # 必须在 unresolved_credential_headers 之前——否则占位符会先被判为
+        # 「未填」而抛错，绑定过的凭据根本没机会生效。
+        auth_denials: dict[str, str] = {}
+        headers = await apply_api_tool_bindings(
+            config, headers or {}, user_info=user_info, denials=auth_denials
+        )
+        pending = unresolved_credential_headers(headers)
+        if pending:
+            # 导入工具默认没有凭据；发出去只会换来对方的 401，不如在这里说清楚
+            raise UnresolvedCredentialError(config.name, pending, auth_denials)
 
         # 3. Request
-        method = config.method.upper()
-        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
-            raise UnsupportedMethodError(method)
-
         signing = parse_signing_config(config)
         if signing.enabled:
             validate_no_reserved_signing_headers(headers)
@@ -280,7 +388,15 @@ class GenericApiToolFactory:
                 "body": body,
             })
 
-        logger.info(f"[GenericTool] Executing {config.name} ({method} {url}) with params: {remaining_params}")
+        safe_log_url = redact_value(
+            url, where=f"API 工具 {config.name} 请求日志", log_hits=False
+        )
+        safe_log_params = redact_value(
+            remaining_params, where=f"API 工具 {config.name} 请求日志", log_hits=False
+        )
+        logger.info(
+            f"[GenericTool] Executing {config.name} ({method} {safe_log_url}) with params: {safe_log_params}"
+        )
 
         started = time.monotonic()
         # We disable trust_env=True to avoid SOCKS proxy issues if dependency is missing
@@ -347,9 +463,12 @@ class GenericApiToolFactory:
                 capture["headers"] = dict(actual_request.headers)
 
         if raise_on_http_error and not 200 <= response.status_code < 300:
-            raise RuntimeError(
-                f"HTTP {response.status_code}: {response.text[:500]}"
-            )
+            # 报错正文必须先脱敏再截断：若凭据值恰好跨越 500 字符切片边界，
+            # 先切片会破坏精确匹配，把密钥前半段明文直接交给模型。
+            safe_error_body = redact_value(
+                response.text, where=f"API 工具 {config.name} 错误响应"
+            )[:500]
+            raise RuntimeError(f"HTTP {response.status_code}: {safe_error_body}")
 
         return response, elapsed_ms, url
 
@@ -363,19 +482,25 @@ class GenericApiToolFactory:
                 config, params
             )
 
+            # 回灌之前掩码：远端把请求参数原样回显是常见操作，而模型不该看到注入的值。
+            where = f"API 工具 {config.name}"
             if response.status_code == 204 or not response.content:
                 return {"success": True, "content": ""}
 
             # Try to format JSON result
             try:
                 resp_json = response.json()
-                return json.dumps(resp_json, ensure_ascii=False)
+                return redact_value(
+                    json.dumps(resp_json, ensure_ascii=False), where=where
+                )
             except Exception:
-                return response.text
+                return redact_value(response.text, where=where)
 
         except UnsupportedMethodError as e:
             # 历史文案：``[Error] Unsupported method: XXX``
             return f"[Error] {e}"
         except Exception as e:
-            logger.error(f"[GenericTool] Execution failed: {e}")
-            return f"[Execution Error] {str(e)}"
+            # 先脱敏再写日志和返给模型：底层连接/HTTP 异常可能带着完整 URL query 与 headers。
+            safe_error = redact_value(str(e), where=f"API 工具 {config.name} 异常")
+            logger.error(f"[GenericTool] Execution failed: {safe_error}")
+            return f"[Execution Error] {safe_error}"

@@ -1,3 +1,4 @@
+import copy
 import logging
 import uuid
 from typing import Optional, List, Dict, Any, Tuple
@@ -12,6 +13,7 @@ from app.services.ai.agent_system_columns import attach_system_status
 from app.services.ai.agent_system_publication_service import AgentSystemPublicationService
 from app.services.ai.agent_types import resolve_agent_type
 from app.services.ai.welcome_card_service import normalize_welcome_config, safe_welcome_config
+from app.utils.group_name import normalize_group_name
 import json
 from dataclasses import dataclass
 
@@ -294,11 +296,16 @@ class AgentManagerService:
                     dropped_tool_refs=(),
                 )
 
-        conflict = await AgentManagerService.find_agent_name_conflict(session, data.name)
+        AgentManagerService._validate_engine_config(data.engine_type, data.engine_config)
+        normalized_name = AgentManagerService.normalize_agent_name(data.name)
+        if not normalized_name:
+            raise ValueError("物理标识符不能为空")
+
+        conflict = await AgentManagerService.find_agent_name_conflict(session, normalized_name)
         if conflict:
             from fastapi import HTTPException
 
-            raise HTTPException(status_code=400, detail=_agent_name_conflict_detail(data.name))
+            raise HTTPException(status_code=400, detail=_agent_name_conflict_detail(normalized_name))
 
         template = await AgentManagerService._resolve_onboarding_template(
             session, data.agent_type, user
@@ -312,8 +319,8 @@ class AgentManagerService:
         new_agent_id = str(uuid.uuid4())
         agent = AIAgent(
             id=new_agent_id,
-            name=data.name,
-            display_name=data.display_name,
+            name=normalized_name,
+            display_name=str(data.display_name or "").strip(),
             description=data.description,
             # 新建流程先传头像再建智能体，这里把待绑定文件转正，避免被 TTL 回收
             avatar_url=adopt_pending_avatar(data.avatar_url, new_agent_id),
@@ -323,6 +330,8 @@ class AgentManagerService:
                 values=data.capabilities,
             ),
             agent_type=resolved_agent_type.value,
+            # 新建向导也接受分组：建完就是归好类的，不必建完再去菜单里补一次
+            group_name=data.group_name,
             onboarding_key=onboarding_key,
             onboarding_step="VERSION",
             # 系统级只能通过「发布为系统级」获得（有事件、有流程），新建表单不再接受该字段
@@ -446,6 +455,10 @@ class AgentManagerService:
         名单只有一份（``sub_agent_call`` 为准，batch 上的历史字段兜底），与运行时
         ``sub_agent_call`` / ``sub_agent_batch_call`` 的校验口径完全同源——这里若
         再单独回落一次 batch，就会出现「卡片显示有成员、委派时却读不到」的分叉。
+
+        主助手（``MAIN_GENERAL_AGENT_ID``）要从成员里剔掉：权限层
+        （``filter_delegable_agents``）与运行时调用都已拒绝把它当委派目标，
+        卡片若还把它算成成员，就会出现「团显示 5 人、实际只能调 4 人」。
         """
         if published_version is None:
             return None
@@ -455,7 +468,12 @@ class AgentManagerService:
         configured, ids = resolve_delegation_allowlist(tools)
         if not configured:
             return None
-        return [str(item) for item in (ids or []) if str(item or "").strip()]
+        return [
+            str(item)
+            for item in (ids or [])
+            if str(item or "").strip()
+            and str(item).strip() != MAIN_GENERAL_AGENT_ID
+        ]
 
     @staticmethod
     def _count_team_members(published_version: Any) -> Optional[int]:
@@ -570,9 +588,19 @@ class AgentManagerService:
             if agent_id:
                 stmt = stmt.where(or_(AIAgent.id == agent_id, AIAgent.name == agent_id))
             elif agent_name:
-                stmt = stmt.where(AIAgent.name == agent_name)
+                # name 在 schema 上有唯一约束，但历史库/绕过约束写入可能存在同名记录；显式让
+                # 系统智能体优先并只取 1 行，避免 scalar_one_or_none 因多行抛 MultipleResultsFound 变成 500。
+                stmt = (
+                    stmt.where(AIAgent.name == agent_name)
+                    .order_by(AIAgent.is_system.desc(), AIAgent.is_enabled.desc())
+                    .limit(1)
+                )
             else:
-                stmt = stmt.where(AIAgent.name == 'chat-bi')
+                stmt = (
+                    stmt.where(AIAgent.name == 'chat-bi')
+                    .order_by(AIAgent.is_system.desc(), AIAgent.is_enabled.desc())
+                    .limit(1)
+                )
             
             result = await session.execute(stmt)
             agent = result.scalar_one_or_none()
@@ -1121,6 +1149,94 @@ class AgentManagerService:
 
         return list((await session.execute(stmt)).scalars().all())
 
+    @staticmethod
+    async def list_assigned_agents(
+        session: AsyncSession,
+        user: Any = None,
+    ) -> List[Any]:
+        """他人创建、经管理员授权、且当前启用的智能体，供「分配给我」只读视图使用。
+
+        口径与 ``_user_can_execute_agent`` **同源**：两者都取
+        ``PermissionService.get_user_permissions().permissions.agents``。
+        刻意不另写一套 SQL 判授权——「能用」与「看得见」一旦分叉，就会出现
+        「对话页选得到、智能体中心看不到」这种问题（本功能正是为此而加）。
+
+        与 ``list_agents`` 的三点区别：
+        1. 不返回自己创建的（那些在「我的智能体」里，重复出现只会让人以为有两份）；
+        2. 只返回已启用的（停用的智能体执行时会被 ``resolve_embed_agent_access``
+           直接 404，列出来只会让人以为系统坏了）；
+        3. 三个可编辑字段在服务端定死为 False，不交给前端判断。
+
+        管理员返回空列表：他已有「全部智能体」，再来一份「分配给我的」是重复视图。
+        """
+        if not user:
+            return []
+
+        is_admin, username, user_id = AgentManagerService._extract_user_identity(user)
+        if is_admin:
+            return []
+        # 身份缺 username 时不猜：`created_by != ''` 会把「别人创建的历史数据」全算成
+        # 「不是我创建的」，虽然仍受上面的授权集合约束，但没有依据就不要给出结果。
+        if not username:
+            return []
+
+        from app.services.permission_service import PermissionService
+
+        perm_service = PermissionService(session)
+        try:
+            uid_int = int(user_id)
+            perms = await perm_service.get_user_permissions(uid_int)
+            allowed_ids = list(perms.permissions.agents or [])
+        except (ValueError, TypeError):
+            # 与 list_allowed_agents 同一套容错：身份脏数据按「无授权」处理，不 500
+            allowed_ids = []
+
+        if not allowed_ids:
+            return []
+
+        stmt = select(AIAgent).where(
+            AIAgent.id.in_(allowed_ids),
+            # 必须与 `_user_can_execute_agent` 的判定保持一致：对**非**系统级智能体，
+            # 那边只认 `created_by == username`，授权行即使存在也不生效。少了这一条，
+            # 「分配给我」会列出点进去就 403 的死链——写入侧
+            # （permission_service.update_* 遍历 updates.agents）并不校验 is_system，
+            # 所以「非系统级也有授权行」这种脏数据是真的可能存在。
+            AIAgent.is_system == True,  # noqa: E712 — 与同文件既有写法保持一致
+            AIAgent.is_enabled == True,  # noqa: E712
+            # created_by 为空的历史数据在 list_agents 里同样不出现，
+            # 属「有授权但看不见」，必须收进来
+            or_(AIAgent.created_by != username, AIAgent.created_by.is_(None)),
+        )
+
+        main_first = case(
+            (or_(AIAgent.id == MAIN_GENERAL_AGENT_ID, AIAgent.name.in_(MAIN_GENERAL_AGENT_NAMES)), 0),
+            else_=1,
+        )
+        stmt = stmt.order_by(
+            main_first,
+            AIAgent.sort_order.desc(),
+            AIAgent.is_system.desc(),
+            AIAgent.display_name,
+        )
+
+        agents = list((await session.execute(stmt)).scalars().all())
+
+        for agent in agents:
+            # AIAgentResponse.is_editable 默认值是 True —— 默认值就是「可编辑」，
+            # 所以这三行是安全边界，不是装饰。漏算任何一处都等于放行。
+            #
+            # 注意这是**实例级动态属性**（不是映射列），赋值不会触发 UPDATE，但会留在
+            # 当前 session 的 identity map 里直到该请求结束。因此不要依赖这三个标记
+            # 跨调用传递状态：同一请求里若先调本方法、再调 ``list_agents``（它对同一
+            # 批 ORM 实例有另一套算法），后者的赋值会覆盖前者。今天没有端点同时调两个，
+            # 且非管理员时两者集合按构造互斥（``list_agents`` 只留 created_by == 自己），
+            # 但没有约束禁止将来这么做。
+            agent.is_editable = False
+            agent.can_edit_versions = False
+            agent.can_publish_version = False
+
+        return agents
+
     @classmethod
     async def attach_team_metadata(
         cls,
@@ -1288,13 +1404,16 @@ class AgentManagerService:
             is_admin = user and getattr(user, 'role', '') == 'admin'
 
         AgentManagerService._validate_engine_config(data.engine_type, data.engine_config)
-        
+        normalized_name = AgentManagerService.normalize_agent_name(data.name)
+        if not normalized_name:
+            raise ValueError("物理标识符不能为空")
+
         # 物理标识符在 ai_agents.name 上全局唯一，命中时给出中文可操作提示
-        conflict = await AgentManagerService.find_agent_name_conflict(session, data.name)
+        conflict = await AgentManagerService.find_agent_name_conflict(session, normalized_name)
         if conflict:
             from fastapi import HTTPException
 
-            raise HTTPException(status_code=400, detail=_agent_name_conflict_detail(data.name))
+            raise HTTPException(status_code=400, detail=_agent_name_conflict_detail(normalized_name))
 
         from app.services.ai.agent_types import (
             normalize_agent_capabilities_for_agent,
@@ -1305,8 +1424,8 @@ class AgentManagerService:
         new_agent_id = str(uuid.uuid4())
         agent = AIAgent(
             id=new_agent_id,
-            name=data.name,
-            display_name=data.display_name,
+            name=normalized_name,
+            display_name=str(data.display_name or "").strip(),
             description=data.description,
             # 新建流程先传头像再建智能体，这里把待绑定文件转正，避免被 TTL 回收
             avatar_url=adopt_pending_avatar(data.avatar_url, new_agent_id),
@@ -1318,11 +1437,19 @@ class AgentManagerService:
             agent_type=resolved_agent_type.value,
             # 系统级只能通过「发布为系统级」获得（有事件、有流程），新建表单不再接受该字段
             is_system=False,
+            # 主助手是系统兜底入口，不允许被设成专家团主专家（与 onboarding 同一口径）
+            is_expert_team_lead=(
+                bool(data.is_expert_team_lead)
+                and str(normalized_name).lower() not in MAIN_GENERAL_AGENT_NAMES
+            ),
+            team_profile=data.team_profile,
             sort_order=data.sort_order if data.sort_order is not None else 0,
             is_enabled=data.is_enabled if data.is_enabled is not None else True,
             created_by=created_by,
             engine_type=data.engine_type,
-            engine_config=data.engine_config
+            engine_config=data.engine_config,
+            # 业务分组（单值）：只影响列表页页签与筛选，默认未分组
+            group_name=data.group_name,
         )
         session.add(agent)
         await session.commit()
@@ -1409,6 +1536,8 @@ class AgentManagerService:
                 else source.engine_config
             ),
             owner_group=source.owner_group,
+            # 分组跟着副本走：复制通常是「照着这个再做一个同类」，落到未分组反而要再归一次
+            group_name=source.group_name,
         )
         session.add(agent)
 
@@ -1583,6 +1712,33 @@ class AgentManagerService:
         return agent
 
     @staticmethod
+    async def set_agent_group(
+        session: AsyncSession,
+        agent_id: str,
+        group_name: Optional[str],
+        user: Any = None,
+    ) -> Optional[AIAgent]:
+        """只改「业务分组」，不碰其它任何字段。
+
+        为什么单开端点而不是走 ``update_agent``：那条路为了「元数据整表单保存」加了一串
+        与分组无关的前置校验——待审冻结、是否系统级、引擎是否可改……用户只是想把智能体
+        归个类，不该因为「正在审核中」而被拒；而且整表单 PUT 要求前端回传全部字段，
+        任何一处少传都会覆盖。
+
+        **不检查「待审冻结」**：分组是纯导航字段，不改变审核方要评的内容（提示词、
+        工具、模型）；管理员审核期间所有者整理自己的分组是合理需求。
+        """
+        agent = await session.get(AIAgent, agent_id)
+        if not agent:
+            return None
+        if not AgentManagerService.can_edit_agent_meta(agent, user):
+            return None
+        agent.group_name = normalize_group_name(group_name)
+        await session.commit()
+        await session.refresh(agent)
+        return agent
+
+    @staticmethod
     async def update_agent(session: AsyncSession, agent_id: str, data: AIAgentBase, user: Any = None) -> Optional[AIAgent]:
         """Update existing agent metadata"""
         agent = await session.get(AIAgent, agent_id)
@@ -1624,15 +1780,22 @@ class AgentManagerService:
             if requested_engine_type != original_engine_type:
                 raise ValueError("执行引擎创建后不可修改；请新建智能体以使用其他引擎")
 
+        if data.engine_config is not None:
+            AgentManagerService._validate_engine_config(agent.engine_type, data.engine_config)
+
+        normalized_name = AgentManagerService.normalize_agent_name(data.name)
+        if not normalized_name:
+            raise ValueError("物理标识符不能为空")
+
         # 改名前先校验唯一性（排除自己），否则唯一索引会抛 IntegrityError 变成 500
-        if AgentManagerService.normalize_agent_name(data.name) != AgentManagerService.normalize_agent_name(agent.name):
+        if normalized_name != AgentManagerService.normalize_agent_name(agent.name):
             conflict = await AgentManagerService.find_agent_name_conflict(
-                session, data.name, exclude_agent_id=agent.id
+                session, normalized_name, exclude_agent_id=agent.id
             )
             if conflict:
                 from fastapi import HTTPException
 
-                raise HTTPException(status_code=400, detail=_agent_name_conflict_detail(data.name))
+                raise HTTPException(status_code=400, detail=_agent_name_conflict_detail(normalized_name))
 
         _before_meta = {
             "name": agent.name,
@@ -1641,10 +1804,13 @@ class AgentManagerService:
             "avatar_url": agent.avatar_url,
             "capabilities": agent.capabilities,
             "sort_order": agent.sort_order,
+            "engine_config": copy.deepcopy(agent.engine_config),
+            "is_expert_team_lead": bool(agent.is_expert_team_lead),
+            "team_profile": copy.deepcopy(agent.team_profile),
         }
 
-        agent.name = data.name
-        agent.display_name = data.display_name
+        agent.name = normalized_name
+        agent.display_name = str(data.display_name or "").strip()
         agent.description = data.description
         # 专家团字段是局部更新：编辑页的其他表单不会带这两项，无条件赋值会把开关和
         # 团名悄悄清空，所以只在 model_fields_set 里出现时才落库。
@@ -1656,6 +1822,10 @@ class AgentManagerService:
             )
         if "team_profile" in data.model_fields_set:
             agent.team_profile = data.team_profile
+        # 分组同样是「局部更新」：其它表单（版本配置、专家团、排版样式）不会带这个字段，
+        # 无条件赋值会把已设好的分组悄悄清空。只有真的想改它时才落库。
+        if "group_name" in data.model_fields_set:
+            agent.group_name = data.group_name
         agent.avatar_url = adopt_pending_avatar(data.avatar_url, agent.id)
         from app.services.ai.agent_types import (
             normalize_agent_capabilities_for_agent,
@@ -1726,13 +1896,61 @@ class AgentManagerService:
         # 待审期间不能删：申请单还指着一个不存在的智能体，审核页会打不开
         await AgentSystemPublicationService.assert_not_frozen(session, agent, user)
 
+        # 申请单/事件/授权/待处理分享都没有物理外键，按模型约定由应用层清理。
+        # 不清理的话：待审列表永远有孤儿单、授权表留下指向不存在资源的脏行、
+        # 收件箱里还能接受一个源已删除的分享。
+        from app.models.agent_share import AgentShareRequest, STATUS_PENDING
+        from app.models.agent_system import AgentSystemEvent, AgentSystemRequest
+        from app.models.permission import ResourcePermission
+        from app.services.ai.agent_share_service import AgentShareService
+        from app.services.ai.agent_system_columns import supports_system_status
+
+        granted_rows = await session.execute(
+            select(ResourcePermission.user_id).where(
+                ResourcePermission.resource_type == "agent",
+                ResourcePermission.resource_id == str(agent.id),
+            )
+        )
+        granted_user_ids = [row[0] for row in granted_rows.all() if row[0] is not None]
+
+        await session.execute(
+            delete(ResourcePermission).where(
+                ResourcePermission.resource_type == "agent",
+                ResourcePermission.resource_id == str(agent.id),
+            )
+        )
+
+        if await supports_system_status(session):
+            await session.execute(
+                delete(AgentSystemEvent).where(
+                    AgentSystemEvent.agent_id == str(agent.id)
+                )
+            )
+            await session.execute(
+                delete(AgentSystemRequest).where(
+                    AgentSystemRequest.agent_id == str(agent.id)
+                )
+            )
+
+        if await AgentShareService.supports_share(session):
+            await session.execute(
+                delete(AgentShareRequest).where(
+                    AgentShareRequest.agent_id == str(agent.id),
+                    AgentShareRequest.status == STATUS_PENDING,
+                )
+            )
+
         await session.delete(agent)
         await session.commit()
-        
-        # Invalidate Router Cache
-        from app.services.ai.router_service import router_service
-        router_service.invalidate_cache()
-        
+
+        # 文件与缓存都放在提交成功之后：数据库失败时不能先把头像删了。
+        from app.core.avatar_assets import delete_agent_avatars
+
+        delete_agent_avatars(str(agent_id))
+        await AgentSystemPublicationService._invalidate_access_caches(
+            session, granted_user_ids
+        )
+
         return True
 
     @staticmethod
@@ -2063,6 +2281,51 @@ class AgentManagerService:
         )
         agent.onboarding_step = "COMPLETE"
 
+        _, actor_name, actor_id = AgentSystemPublicationService.resolve_actor(user)
+
+        # 管理员绕过审核直接发布系统级版本时，必须把待审的 VERSION_RELEASE 申请单
+        # 一起收尾：否则它会一直挂在待审列表，点通过时又因版本已不是 DRAFT 而 409。
+        # 发布的就是申请的那个版本 -> 视为自动通过；发布的是别的版本 -> 驳回并说明。
+        if bool(agent.is_system):
+            from datetime import datetime
+
+            from app.services.ai.agent_system_columns import (
+                SYSTEM_STATUS_NONE,
+                supports_system_status,
+                write_system_status,
+            )
+            from app.services.ai.agent_system_publication_service import (
+                REQUEST_TYPE_RELEASE,
+                STATUS_APPROVED,
+                STATUS_REJECTED,
+            )
+
+            if await supports_system_status(session):
+                pending = await AgentSystemPublicationService._pending_request(
+                    session, agent.id
+                )
+                if pending is not None and (
+                    getattr(pending, "request_type", None) or ""
+                ) == REQUEST_TYPE_RELEASE:
+                    same_version = str(pending.snapshot_version_id or "") == str(
+                        version.id
+                    )
+                    pending.status = STATUS_APPROVED if same_version else STATUS_REJECTED
+                    pending.reviewed_at = datetime.now()
+                    if actor_id is not None:
+                        pending.reviewed_by = actor_id
+                    pending.review_comment = (
+                        "管理员直接发布了该版本，申请自动通过"
+                        if same_version
+                        else "管理员已直接发布其他版本，本次上线申请自动关闭"
+                    )
+                    await write_system_status(
+                        session,
+                        agent.id,
+                        status=SYSTEM_STATUS_NONE,
+                        pending_request_id=None,
+                    )
+
         # 「发布新版本」换掉的是线上基线，不管是不是系统级都必须留痕：
         # 否则发布历史里版本号变了，却查不到是谁在什么时候换的。
         # 普通智能体尤其需要——它没有审核环节，发布完全由所有者自行决定。
@@ -2070,7 +2333,6 @@ class AgentManagerService:
             ACTION_BASELINE_PUBLISH,
         )
 
-        _, actor_name, actor_id = AgentSystemPublicationService.resolve_actor(user)
         await AgentSystemPublicationService.record_event(
             session,
             agent=agent,

@@ -1,4 +1,5 @@
 import asyncio
+from collections import OrderedDict
 import json
 import logging
 import time
@@ -36,9 +37,54 @@ _datasets_cache: Dict[str, "tuple[float, List[Dict[str, Any]]]"] = {}
 _datasets_cache_locks: Dict[str, asyncio.Lock] = {}
 
 
+# 文档列表同理：知识库工作区要一次拿全量做内存过滤/排序/分页，不可能每翻一页
+# 就重打一遍 RAGFlow（250 个文档 = 3 个请求，翻页时会被放大成几十次）。
+# 键是 ``base_url|dataset_id``：不同知识库、不同引擎地址互不干扰。
+DOCUMENT_LIST_TTL = 60.0
+#: 缓存条目上限。每个库一份全量文档列表（大库几千条），只靠 TTL 惰性过期时，
+#: 一个小时内被翻过的库会一直占着内存。超限按 LRU 挤掉最久没访问的。
+DOCUMENTS_CACHE_MAX_ENTRIES = 200
+_documents_cache: "OrderedDict[str, tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
+_documents_cache_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _remember_documents(key: str, items: List[Dict[str, Any]]) -> None:
+    """写入缓存并维持 LRU 上限。
+
+    ``OrderedDict`` 保证「最近读过的排到最后」，超限时从头部淘汰。
+    用普通 dict 的话 popitem 淘汰的是最早**写入**的，热门库反而可能被挤掉。
+    """
+    _documents_cache[key] = (time.monotonic(), [dict(item) for item in items])
+    _documents_cache.move_to_end(key)
+    while len(_documents_cache) > DOCUMENTS_CACHE_MAX_ENTRIES:
+        _documents_cache.popitem(last=False)
+
+
 def clear_dataset_list_cache() -> None:
     """建库 / 删库 / 同步后调用：否则用户会看到 60 秒前的旧列表。"""
     _datasets_cache.clear()
+
+
+def clear_document_list_cache(dataset_id: Optional[str] = None) -> None:
+    """上传 / 删除 / 改名 / 触发解析后调用，避免列表在 60s 内看不到变化。
+
+    不传 ``dataset_id`` 时清空全部（跨库移动文档之类的场景）。
+    """
+    if not dataset_id:
+        _documents_cache.clear()
+        return
+    suffix = f"|{dataset_id}"
+    for key in [k for k in _documents_cache if k.endswith(suffix)]:
+        _documents_cache.pop(key, None)
+
+
+def clear_write_method_contract_cache() -> None:
+    """清掉「文档 / 切片更新用 PUT 还是 PATCH」的探测结果。
+
+    测试之间需要隔离；运维把 RAGFlow 换成另一个发行版（或回滚升级）后，
+    也应当调一次，否则会继续按旧的缓存方法发请求。
+    """
+    RagFlowClient._write_method_cache.clear()
 
 
 def _wrap_transport_error(
@@ -204,11 +250,31 @@ class RagFlowClient:
         return []
 
     @classmethod
+    def _extract_documents_page(
+        cls, data: Any
+    ) -> "tuple[List[Dict[str, Any]], Optional[int]]":
+        """文档列表的「当页 + 总数」：RAGFlow 把 total 放在 data 里，各版本层级不同。"""
+        docs = cls._extract_documents(data)
+        total: Optional[int] = None
+        if isinstance(data, dict):
+            raw_total = data.get("total")
+            try:
+                total = int(raw_total) if raw_total is not None else None
+            except (TypeError, ValueError):
+                total = None
+        return (docs if isinstance(docs, list) else []), total
+
+    @classmethod
     def _normalize_document(cls, document: Any) -> Any:
-        """把 1.0 的 ``ingestion_status`` 映射成前端认识的 ``run``。
+        """把 1.0 的字段别名补齐成前端认识的 0.x 契约。
 
         1.0 不再返回 ``run``，而前端 ``getDocStatus`` 只认 ``run`` / ``status``，
         缺字段会把已解析完成的文档显示成「未解析」，因此补一个等价别名。
+
+        同理，1.0 的列表只回 ``status``（``"1"`` / ``"0"`` 表示启用 / 停用），
+        不再回 ``enabled``，而前端 ``isDocEnabled`` 与文档详情页的「参与检索」
+        只读 ``enabled`` —— 缺字段会让停用文档显示成「参与检索」。这里只在
+        ``enabled`` 缺失时用 ``status`` 补，0.x 已有 ``enabled`` 时以它为准。
         """
         if not isinstance(document, dict):
             return document
@@ -217,6 +283,12 @@ class RagFlowClient:
             mapped = cls._INGESTION_STATUS_TO_RUN.get(status)
             if mapped:
                 document["run"] = mapped
+        if document.get("enabled") in (None, ""):
+            raw_status = document.get("status")
+            if raw_status not in (None, ""):
+                document["enabled"] = (
+                    1 if str(raw_status).strip().lower() in ("1", "true") else 0
+                )
         return document
 
     async def _handle_response(self, response: httpx.Response, action: str) -> Dict[str, Any]:
@@ -427,25 +499,114 @@ class RagFlowClient:
             return None
         return [dict(item) for item in cached[1]]
 
-    # 不同 RAGFlow 发行版的「建库」字段契约不同：
-    #   chunk_method —— 官方 Python 版：chunk_method + description + permission
-    #   parse_type   —— Go 版内置解析器：parse_type(int, 1=BuiltIn) + parser_id，
-    #                   并明确拒绝 description / chunk_method
+    # 不同 RAGFlow 发行版的「建库」字段契约不同（按 :meth:`create_dataset` 的
+    # 阶梯降级顺序排列）：
+    #   chunk_method            —— 官方 Python 版：chunk_method + description + permission
+    #   chunk_method_no_desc    —— 接受 chunk_method、只拒 description 的发行版
+    #                              （正式版源码），description 由 PUT 补写
+    #   parse_type              —— Go 版内置解析器：parse_type(int, 1=BuiltIn) + parser_id，
+    #                              并明确拒绝 description / chunk_method
     # 探测结果按 base_url 缓存，避免每次建库都多打一次被拒绝的请求。
     _create_contract_cache: Dict[str, str] = {}
 
-    # Go 版拒绝旧字段时的文案。只有命中这些提示才切换契约，
+    # 各发行版拒绝字段时的文案。只有命中这些提示才切换契约，
     # 避免把权限不足、模型未配置等真实错误也当成契约不匹配去重试。
-    _PARSE_TYPE_CONTRACT_HINTS = (
+    # 注意大小写不统一：rc3 源码返回 "Extra inputs are not permitted"，
+    # 正式版源码返回小写 "extra inputs are not permitted"，匹配必须忽略大小写，
+    # 否则正式版的报错会直接穿透给用户（既不切契约，也不补写描述）。
+    _DATASET_CONTRACT_HINTS = (
         "parse_type is required",
         "parser_id is required",
-        "Extra inputs are not permitted",
+        "extra inputs are not permitted",
+    )
+
+    # 「更新文档 / 更新切片」的 HTTP 方法也随发行版漂移：
+    #   PATCH —— RAGFlow 0.25+（api/apps/restful_apis/*）与 1.0 Go 版；
+    #   PUT   —— RAGFlow 0.24 及更早（api/apps/sdk/doc.py），且只注册了 PUT。
+    # 先按 PATCH 发，只有对方明确回「方法不支持」时才回退 PUT，并把成功的方法
+    # 按 base_url + 资源类型记住，避免每次写操作都多打一次被拒绝的请求。
+    _write_method_cache: Dict[str, str] = {}
+
+    # 「方法不支持」的两种表现：
+    #   0.24 及更早：Werkzeug 405 被包成 HTTP 200 + code 100 +
+    #                "<MethodNotAllowed '405: Method Not Allowed'>"；
+    #   1.0 Go 版：gin 落到 NoRoute，返回 404 +
+    #                {"message": "Not Found: /api/v1/datasets/…"}。
+    # 只认这两类信号，避免把权限不足、名字重复等真实错误也当成方法问题重试。
+    _METHOD_NOT_ALLOWED_HINTS = (
+        "methodnotallowed",
+        "method not allowed",
+        "405",
+        "not found: /api/",
     )
 
     @classmethod
-    def _looks_like_parse_type_contract_error(cls, message: str) -> bool:
-        msg = message or ""
-        return any(hint in msg for hint in cls._PARSE_TYPE_CONTRACT_HINTS)
+    def is_method_not_allowed_error(cls, message: str) -> bool:
+        msg = (message or "").lower()
+        return any(hint in msg for hint in cls._METHOD_NOT_ALLOWED_HINTS)
+
+    async def _write_with_method_fallback(
+        self,
+        *,
+        cache_scope: str,
+        url: str,
+        action: str,
+        payload: Dict[str, Any],
+    ) -> Any:
+        """按 PATCH 优先、PUT 兜底的顺序发一次「局部更新」写请求。
+
+        RAGFlow 0.25 起把文档 / 切片的更新方法从 PUT 换成了 PATCH，老发行版
+        又完全没有 PATCH 路由。方法错误只可能出现在第一次调用，所以把探测结果
+        缓存起来；一旦确认是 PUT 契约，后续请求不再先撞一次 405。
+        """
+        key = f"{self.base_url or ''}|{cache_scope}"
+        method = self._write_method_cache.get(key, "PATCH")
+        try:
+            data = await self._request(
+                method,
+                url,
+                action=action,
+                timeout=DEFAULT_WRITE_TIMEOUT,
+                headers=self._get_headers(),
+                json=payload,
+            )
+            return data
+        except RagFlowServiceError as e:
+            if method != "PATCH" or not self.is_method_not_allowed_error(str(e)):
+                raise
+            logger.info(
+                f"[RAGFlow] {action} 不接受 PATCH，改回 PUT 重试"
+                f"（base_url={self.base_url}）：{e}"
+            )
+
+        data = await self._request(
+            "PUT",
+            url,
+            action=action,
+            timeout=DEFAULT_WRITE_TIMEOUT,
+            headers=self._get_headers(),
+            json=payload,
+        )
+        self._write_method_cache[key] = "PUT"
+        return data
+
+    @classmethod
+    def _looks_like_dataset_contract_error(cls, message: str) -> bool:
+        msg = (message or "").lower()
+        return any(hint in msg for hint in cls._DATASET_CONTRACT_HINTS)
+
+    @classmethod
+    def _rejects_description_only(cls, message: str) -> bool:
+        """被拒的字段只有 description 时返回 True。
+
+        说明该发行版接受 ``chunk_method``、只拒 ``description``（正式版源码即
+        如此）。这种版本不该直接换成 parse_type 契约，先去掉 description 重试
+        更稳；两边都不可用时再由调用方升级契约。
+        """
+        msg = (message or "").lower()
+        if "not permitted" not in msg:
+            return False
+        return "description" in msg and "chunk_method" not in msg
 
     # 1.0 的 parser_id 合法值：general / qa / manual / table / paper / book /
     # laws / presentation / picture / one / audio / email。
@@ -475,14 +636,19 @@ class RagFlowClient:
             return await self._handle_response(resp, "Create Dataset")
 
     async def _create_dataset_with_chunk_method(
-        self, url: str, name: str, description: str, chunk_method: str
+        self,
+        url: str,
+        name: str,
+        description: str,
+        chunk_method: str,
+        *,
+        include_description: bool = True,
     ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "name": name,
-            "description": description,
-            "chunk_method": chunk_method,
-            "permission": "me",
-        }
+        payload: Dict[str, Any] = {"name": name}
+        if include_description:
+            payload["description"] = description
+        payload["chunk_method"] = chunk_method
+        payload["permission"] = "me"
 
         # If chunk_method is 'one', we don't need complex parser_config
         if chunk_method == "naive":
@@ -515,7 +681,7 @@ class RagFlowClient:
         return await self._post_create_dataset(url, payload)
 
     async def _update_dataset_description(self, dataset_id: str, description: str) -> None:
-        """1.0 建库不接受 description，但 PUT 支持部分更新，用它补写。"""
+        """建库契约不接受 description 时（1.0 / 正式版源码），用 PUT 部分更新补写。"""
         url = f"{self.base_url}/api/v1/datasets/{dataset_id}"
         try:
             async with httpx.AsyncClient(timeout=DEFAULT_METADATA_TIMEOUT) as client:
@@ -530,43 +696,98 @@ class RagFlowClient:
             )
 
     async def _fill_description(self, data: Any, description: str) -> None:
-        """建库成功后，在需要时按 1.0 的方式补写描述。"""
+        """建库成功后，在需要时用 PUT 部分更新补写描述。"""
         if not description or not isinstance(data, dict):
             return
         dataset_id = data.get("id")
         if dataset_id:
             await self._update_dataset_description(dataset_id, description)
 
+    async def _create_dataset_without_description(
+        self, url: str, name: str, description: str, chunk_method: str
+    ) -> Dict[str, Any]:
+        """阶梯 2：保留 chunk_method、去掉 description，成功后 PUT 补写描述。"""
+        data = await self._create_dataset_with_chunk_method(
+            url, name, description, chunk_method, include_description=False
+        )
+        await self._fill_description(data, description)
+        return data
+
+    async def _create_dataset_via_parse_type(
+        self, url: str, name: str, description: str, chunk_method: str
+    ) -> Dict[str, Any]:
+        """阶梯 3：parse_type + parser_id 契约，并记住探测结果。"""
+        data = await self._create_dataset_with_parse_type(url, name, chunk_method)
+        self._create_contract_cache[self.base_url] = "parse_type"
+        await self._fill_description(data, description)
+        return data
+
     async def create_dataset(self, name: str, description: str = "", chunk_method: str = "naive") -> Dict[str, Any]:
         """Create a new dataset (Knowledge Base)
 
-        自动适配两种建库契约：官方版用 ``chunk_method``，1.0 版用
-        ``parse_type`` + ``parser_id``。默认仍按官方契约请求，只有对方明确
-        拒绝这些字段时才切换，因此官方版的请求内容与次数完全不变。
+        建库契约按发行版不同，按阶梯降级，只有对方明确拒绝字段时才继续下一级：
+
+        1. ``chunk_method + description`` —— 官方 Python 版；
+        2. ``chunk_method``（去掉 description）→ PUT 补写描述 —— 接受
+           chunk_method、只拒 description 的发行版（正式版源码）；
+        3. ``parse_type + parser_id``（不带 description）→ PUT 补写描述 ——
+           Go 版 / 1.0。
+
+        判断依据是错误文案里被拒的字段名，因此匹配必须忽略大小写：rc3 返回
+        ``Extra inputs...``，正式版返回 ``extra inputs...``。默认仍先按第 1 级
+        请求，官方版的请求内容与次数完全不变。
         """
         await self._ensure_config()
         url = f"{self.base_url}/api/v1/datasets"
 
-        if self._create_contract_cache.get(self.base_url) == "parse_type":
+        contract = self._create_contract_cache.get(self.base_url)
+        if contract == "parse_type":
             data = await self._create_dataset_with_parse_type(url, name, chunk_method)
             await self._fill_description(data, description)
             return data
+
+        if contract == "chunk_method_no_description":
+            return await self._create_dataset_without_description(
+                url, name, description, chunk_method
+            )
 
         try:
             data = await self._create_dataset_with_chunk_method(
                 url, name, description, chunk_method
             )
         except RagFlowServiceError as e:
-            if not self._looks_like_parse_type_contract_error(str(e)):
+            if not self._looks_like_dataset_contract_error(str(e)):
                 raise
+
+            if self._rejects_description_only(str(e)):
+                logger.info(
+                    f"[RAGFlow] Create Dataset 不接受 description，"
+                    f"去掉该字段重试并在建库后补写（base_url={self.base_url}）：{e}"
+                )
+                try:
+                    data = await self._create_dataset_without_description(
+                        url, name, description, chunk_method
+                    )
+                except RagFlowServiceError as inner:
+                    if not self._looks_like_dataset_contract_error(str(inner)):
+                        raise
+                    logger.info(
+                        f"[RAGFlow] 去掉 description 仍被拒，"
+                        f"改用 parse_type+parser_id 重试（base_url={self.base_url}）：{inner}"
+                    )
+                    return await self._create_dataset_via_parse_type(
+                        url, name, description, chunk_method
+                    )
+                self._create_contract_cache[self.base_url] = "chunk_method_no_description"
+                return data
+
             logger.info(
                 f"[RAGFlow] Create Dataset 不接受 chunk_method 契约，"
                 f"改用 parse_type+parser_id 重试（base_url={self.base_url}）：{e}"
             )
-            data = await self._create_dataset_with_parse_type(url, name, chunk_method)
-            self._create_contract_cache[self.base_url] = "parse_type"
-            await self._fill_description(data, description)
-            return data
+            return await self._create_dataset_via_parse_type(
+                url, name, description, chunk_method
+            )
 
         self._create_contract_cache[self.base_url] = "chunk_method"
         return data
@@ -651,6 +872,161 @@ class RagFlowClient:
                 for d in documents[slice_start:slice_end]
             ]
 
+    async def list_documents_page(
+        self,
+        dataset_id: str,
+        page: int = 1,
+        page_size: int = 100,
+        name: Optional[str] = None,
+    ) -> "tuple[List[Dict[str, Any]], Optional[int]]":
+        """和 ``list_documents`` 一样取一页，但额外把 RAGFlow 的 total 带回来。
+
+        老接口只回 ``List[dict]`` 且调用方众多（system / resource_square /
+        metadata_rag / knowledge_health），改返回类型等于全线改动；这里单开一个
+        方法给需要「真实总数」的分页调用方用。
+
+        ``page_size > 100`` 时沿用 ``list_documents`` 的多页拼接逻辑（RAGFlow 单页
+        上限 100），total 取**第一次响应**里的值——拼接过程中不会再拿一次 total，
+        免得翻页途中有人上传导致分子分母对不上。
+        """
+        await self._ensure_config()
+        url = f"{self.base_url}/api/v1/datasets/{dataset_id}/documents"
+
+        if page_size <= 100:
+            params: Dict[str, Any] = {"page": page, "page_size": page_size}
+            if name:
+                params["name"] = name
+
+            async with httpx.AsyncClient(timeout=DEFAULT_METADATA_TIMEOUT) as client:
+                resp = await client.get(url, headers=self._get_headers(), params=params)
+                data = await self._handle_response(resp, "List Documents")
+            docs, total = self._extract_documents_page(data)
+            return [self._normalize_document(d) for d in docs], total
+
+        documents: List[Dict[str, Any]] = []
+        start_offset = (page - 1) * page_size
+        end_offset = start_offset + page_size
+
+        ragflow_page_size = 100
+        start_page = (start_offset // ragflow_page_size) + 1
+        end_page = ((end_offset - 1) // ragflow_page_size) + 1
+        total: Optional[int] = None
+
+        async with httpx.AsyncClient(timeout=DEFAULT_METADATA_TIMEOUT) as client:
+            for p in range(start_page, end_page + 1):
+                params = {"page": p, "page_size": ragflow_page_size}
+                if name:
+                    params["name"] = name
+                resp = await client.get(url, headers=self._get_headers(), params=params)
+                data = await self._handle_response(resp, f"List Documents Page {p}")
+                page_data, page_total = self._extract_documents_page(data)
+                if p == start_page:
+                    total = page_total
+
+                if not page_data:
+                    break
+                documents.extend(page_data)
+                if len(page_data) < ragflow_page_size:
+                    break
+
+        slice_start = start_offset - (start_page - 1) * ragflow_page_size
+        slice_end = slice_start + page_size
+        return (
+            [self._normalize_document(d) for d in documents[slice_start:slice_end]],
+            total,
+        )
+
+    async def _list_all_documents(
+        self,
+        dataset_id: str,
+        concurrency: int = 4,
+        max_pages: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """按 total 翻完某个库的所有文档，按 id 去重保序。
+
+        与 ``list_all_datasets`` 同一套策略：先取第一页拿 total，再并发取剩余页。
+        拿不到 total 时顺序翻到「不足一页」为止，用 ``max_pages`` 兜住死循环。
+        """
+        await self._ensure_config()
+        url = f"{self.base_url}/api/v1/datasets/{dataset_id}/documents"
+        page_size = 100
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+
+        async with httpx.AsyncClient(timeout=DEFAULT_METADATA_TIMEOUT) as http:
+            async def fetch(page: int) -> "tuple[List[Dict[str, Any]], Optional[int]]":
+                async with semaphore:
+                    resp = await http.get(
+                        url,
+                        headers=self._get_headers(),
+                        params={"page": page, "page_size": page_size},
+                    )
+                    data = await self._handle_response(
+                        resp, f"List Documents Page {page}"
+                    )
+                    return self._extract_documents_page(data)
+
+            first_items, total = await fetch(1)
+            items = list(first_items)
+
+            if total is None:
+                page_no = 2
+                while len(first_items) == page_size and page_no <= max_pages:
+                    first_items, _ = await fetch(page_no)
+                    items.extend(first_items)
+                    page_no += 1
+            elif total > len(first_items):
+                page_count = min(max_pages, -(-total // page_size))
+                rest = await asyncio.gather(
+                    *(fetch(p) for p in range(2, page_count + 1))
+                )
+                for page_items, _ in rest:
+                    items.extend(page_items)
+
+        seen: set[str] = set()
+        unique: List[Dict[str, Any]] = []
+        for item in items:
+            key = str(item.get("id") or "")
+            if key and key in seen:
+                continue
+            seen.add(key)
+            unique.append(self._normalize_document(item))
+        return unique
+
+    async def list_all_documents_cached(
+        self, dataset_id: str, *, refresh: bool = False
+    ) -> List[Dict[str, Any]]:
+        """带 60s TTL 与单飞锁的全量文档列表：并发请求只让一个真去打 RAGFlow。"""
+        # 缓存键含 base_url，而它要等 _ensure_config 之后才有值
+        await self._ensure_config()
+        key = f"{self.base_url or ''}|{dataset_id}"
+        if not refresh:
+            cached = _documents_cache.get(key)
+            if cached and time.monotonic() - cached[0] < DOCUMENT_LIST_TTL:
+                _documents_cache.move_to_end(key)
+                return [dict(item) for item in cached[1]]
+
+        lock = _documents_cache_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if not refresh:
+                cached = _documents_cache.get(key)
+                if cached and time.monotonic() - cached[0] < DOCUMENT_LIST_TTL:
+                    _documents_cache.move_to_end(key)
+                    return [dict(item) for item in cached[1]]
+            items = await self._list_all_documents(dataset_id)
+            _remember_documents(key, items)
+            # 浅拷贝：调用方（端点会做过滤/排序）改到 dict 也不该污染缓存
+            return [dict(item) for item in items]
+
+    @classmethod
+    def cached_documents_snapshot(
+        cls, base_url: Optional[str], dataset_id: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """降级用：不看 TTL，返回上次成功拉到的该库文档快照。"""
+        cached = _documents_cache.get(f"{base_url or ''}|{dataset_id}")
+        if not cached:
+            return None
+        return [dict(item) for item in cached[1]]
+
     async def upload_document(
         self,
         dataset_id: str,
@@ -670,6 +1046,7 @@ class RagFlowClient:
             resp = await client.post(url, headers=headers, files=files)
             # Returns a list of uploaded docs in data
             data = await self._handle_response(resp, "Upload Document")
+            clear_document_list_cache(dataset_id)
             return data[0] if isinstance(data, list) and len(data) > 0 else data
 
     async def delete_documents(self, dataset_id: str, document_ids: List[str]):
@@ -689,6 +1066,7 @@ class RagFlowClient:
             headers=self._get_headers(),
             json=payload,
         )
+        clear_document_list_cache(dataset_id)
 
     async def update_document(
         self,
@@ -702,7 +1080,8 @@ class RagFlowClient:
     ) -> Dict[str, Any]:
         """部分更新文档：改名 / 启停 / 解析配置。
 
-        RAGFlow 的 ``PUT /documents/{id}`` 只改传过去的字段，所以这里严格按
+        RAGFlow 的 ``PUT /documents/{id}``（0.24 及更早）与
+        ``PATCH /documents/{id}``（0.25+ / 1.0）只改传过去的字段，所以这里严格按
         「None = 不动」组装 payload —— 否则只想停用文档时会顺手把名字写成空。
         """
         await self._ensure_config()
@@ -710,7 +1089,13 @@ class RagFlowClient:
         if name is not None:
             payload["name"] = name
         if enabled is not None:
-            payload["enabled"] = enabled
+            # 必须发 0/1 整数，不能发 JSON 布尔：RAGFlow 1.0 的 Go 结构体是
+            # ``Enabled *int``，0.25+ 的 Pydantic ``UpdateDocumentReq.enabled`` 也是
+            # ``int``（lax 模式同样不做 bool→int），发 false 会被拒成
+            # "Field: <enabled> - Message: <Input should be a valid integer> - Value: <False>"。
+            # 0.24 及更早的 ``sdk/doc.py`` 是 ``int(req["enabled"])``，0/1 一样成立，
+            # 所以整数是唯一跨版本安全的写法。
+            payload["enabled"] = 1 if enabled else 0
         if chunk_method is not None:
             payload["chunk_method"] = chunk_method
         if parser_config is not None:
@@ -719,14 +1104,13 @@ class RagFlowClient:
             raise ValueError("update_document requires at least one field")
 
         url = f"{self.base_url}/api/v1/datasets/{dataset_id}/documents/{document_id}"
-        data = await self._request(
-            "PUT",
-            url,
+        data = await self._write_with_method_fallback(
+            cache_scope="documents",
+            url=url,
             action="Update Document",
-            timeout=DEFAULT_WRITE_TIMEOUT,
-            headers=self._get_headers(),
-            json=payload,
+            payload=payload,
         )
+        clear_document_list_cache(dataset_id)
         return data if isinstance(data, dict) else {}
 
     async def parse_documents(self, dataset_id: str, document_ids: List[str]):
@@ -743,6 +1127,7 @@ class RagFlowClient:
             headers=self._get_headers(),
             json=payload,
         )
+        clear_document_list_cache(dataset_id)
 
     async def create_chunk(
         self,
@@ -786,6 +1171,9 @@ class RagFlowClient:
         if content is not None:
             payload["content"] = content
         if available is not None:
+            # 这里与文档级 enabled 相反：``available`` 必须保持布尔。
+            # 1.0 Go 版严格 ``raw.(bool)``（发 0/1 会被拒成 "`available` must be
+            # a boolean"），0.25+ Python 版 ``_parse_available_flag`` 也吃布尔。
             payload["available"] = available
         if important_keywords is not None:
             payload["important_keywords"] = important_keywords
@@ -793,26 +1181,35 @@ class RagFlowClient:
             raise ValueError("update_chunk requires at least one field")
 
         url = f"{self.base_url}/api/v1/datasets/{dataset_id}/documents/{document_id}/chunks/{chunk_id}"
-        data = await self._request(
-            "PUT",
-            url,
+        data = await self._write_with_method_fallback(
+            cache_scope="chunks",
+            url=url,
             action="Update Chunk",
-            timeout=DEFAULT_WRITE_TIMEOUT,
-            headers=self._get_headers(),
-            json=payload,
+            payload=payload,
         )
         return data if isinstance(data, dict) else {}
 
     async def delete_chunk(self, dataset_id: str, document_id: str, chunk_id: str) -> None:
+        """删除单个切片。
+
+        注意：``DELETE /documents/{id}/chunks/{chunk_id}`` 这个路由**任何发行版
+        都没有**（0.24 把 PUT 挂在 ``chunks/{chunk_id}`` 上、0.25+/1.0 换成
+        PATCH），删除切片一律走「文档级 + chunk_ids」批量接口：
+        ``DELETE /documents/{id}/chunks`` + ``{"chunk_ids": [...]}``。
+        发旧路径只会拿到 405 ``<MethodNotAllowed>``。
+        """
         await self._ensure_config()
-        url = f"{self.base_url}/api/v1/datasets/{dataset_id}/documents/{document_id}/chunks/{chunk_id}"
+        url = f"{self.base_url}/api/v1/datasets/{dataset_id}/documents/{document_id}/chunks"
         await self._request(
             "DELETE",
             url,
             action="Delete Chunk",
             timeout=DEFAULT_WRITE_TIMEOUT,
             headers=self._get_headers(),
+            json={"chunk_ids": [chunk_id]},
         )
+        # 删除会改 chunk_count，别让文档列表在 60s 内还显示旧数量
+        clear_document_list_cache(dataset_id)
 
     async def list_document_chunks(
         self,
@@ -1183,6 +1580,82 @@ class RagFlowClient:
                 f"使用默认值 {DEFAULT_RETRIEVE_TIMEOUT:g}s: {type(e).__name__}: {e!r}"
             )
         return DEFAULT_RETRIEVE_TIMEOUT
+
+    async def open_document_stream(
+        self,
+        document_id: str,
+        *,
+        dataset_id: str | None = None,
+    ):
+        """流式下载文档，返回 ``(chunks, filename, content_type)``。
+
+        预览/下载以前是 ``resp.content`` 整块读进内存：上传上限 256MB，
+        几个人同时预览大文件就够把进程内存推上去。改成边读边发之后，
+        响应体多大都不再等于内存占用。
+
+        错误必须在返回前判掉（JSON 体说明是业务错误），否则浏览器会「下载」
+        到一个写着报错的 JSON 文件。流中途断开只能让浏览器拿到截断文件——
+        这是流式传输的固有代价，比整块 OOM 划算。
+        """
+        await self._ensure_config()
+        if dataset_id:
+            url = f"{self.base_url}/api/v1/datasets/{dataset_id}/documents/{document_id}"
+        else:
+            url = f"{self.base_url}/api/v1/document/get/{document_id}"
+
+        client = httpx.AsyncClient(timeout=60.0)
+        try:
+            request = client.build_request("GET", url, headers=self._get_headers())
+            response = await client.send(request, stream=True)
+        except Exception:
+            await client.aclose()
+            raise
+
+        try:
+            if response.status_code != 200:
+                body = (await response.aread()).decode("utf-8", "replace")
+                hint = ""
+                if not dataset_id and response.status_code == 404:
+                    hint = (
+                        "（RAGFlow 1.0 已移除 /api/v1/document/get，"
+                        "请提供 dataset_id 走数据集作用域下载接口）"
+                    )
+                raise Exception(
+                    f"RAGFlow document download failed ({response.status_code}): {body}{hint}"
+                )
+
+            content_type = response.headers.get("content-type", "application/octet-stream")
+            # 数据集下载正常返回原始字节；返回 JSON 说明是业务错误
+            if "application/json" in content_type.lower():
+                body = (await response.aread()).decode("utf-8", "replace")
+                try:
+                    payload = json.loads(body)
+                except Exception:
+                    payload = {}
+                message = payload.get("message") if isinstance(payload, dict) else None
+                raise Exception(f"RAGFlow document download failed: {message or body[:200]}")
+
+            content_disposition = response.headers.get("content-disposition", "")
+            filename = "document"
+            if "filename=" in content_disposition:
+                import urllib.parse
+
+                raw_fn = content_disposition.split("filename=")[-1].strip('"')
+                filename = urllib.parse.unquote(raw_fn)
+        except Exception:
+            await response.aclose()
+            await client.aclose()
+            raise
+
+        async def _iterate():
+            try:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+            finally:
+                await response.aclose()
+                await client.aclose()
+
+        return _iterate(), filename, content_type
 
     async def download_document(
         self,

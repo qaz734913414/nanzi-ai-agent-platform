@@ -19,7 +19,13 @@ from app.core.dependencies import (
 )
 from app.models.mcp import McpServer, McpToolCache, McpOutboundAuditLog
 from app.models.agent import AIAgent, AIAgentVersion
-from app.services.ai.tools.mcp_client import McpClientService, McpSseSession, McpSyncGuardError
+from app.services.ai.tools.tool_credentials import unresolved_credential_headers
+from app.services.ai.tools.mcp_client import (
+    McpClientService,
+    McpCredentialDeniedError,
+    McpSseSession,
+    McpSyncGuardError,
+)
 from app.services.ai.tools.mcp_factory import McpToolFactory
 from app.services.ai.tools.tool_compat import resolve_tool_invocation_result
 from app.services.mcp.curl_snippet import build_mcp_curl_snippet
@@ -38,6 +44,7 @@ from app.services.mcp.stale_tool_cleanup import (
     prune_agent_versions_by_names,
 )
 from app.services.mcp.tool_ref_health import configured_tool_names as _configured_tool_names
+from app.utils.group_name import GROUP_NAME_MAX_LEN, normalize_group_name
 from app.services.mcp.management_rate_limit import enforce_mcp_management_rate_limit
 from app.services.mcp_share_service import (
     McpShareConflictError,
@@ -93,6 +100,46 @@ def _clear_runtime_tool_cache() -> None:
 
     ToolRegistry.clear_db_tool_cache()
 
+#: 凭据能喂的参数类型。标量都算：字符串原样给，数字和布尔由注入层按 schema
+#: 转一次类型（见 injection.coerce_to_declared_type）。
+CREDENTIAL_PARAM_TYPES = ("string", "integer", "number", "boolean")
+
+
+def accepts_credential_value(spec: Any) -> bool:
+    """凭据值能否喂给这个参数。
+
+    对象和数组仍然拒绝：凭据里那段 JSON 的结构不一定符合对方的嵌套 schema，
+    硬注入只会在远端解析阶段失败，比「不让配」更难查。
+
+    曾经这里是「只允许 string」——理由是凭据值永远是字符串。但端口、超时、
+    重试次数这类**连接参数**恰好都是数字，它们既不该让模型每次猜，也不在
+    Header 里，于是「只允许 string」等于告诉用户「这个参数平台管不了」。
+    现在放开标量，由注入层负责转换，转不了就在凭据流水里报出来。
+
+    提成模块级是因为**两个入口**都要判：``PUT /credential-params``（单值页
+    直接改清单）和 ``POST /secrets/bindings`` 的批量保存（顺带写清单）。
+    各写一份的话，哪天一边放开、另一边没跟上，就会出现「这里能配、那里报错」。
+    """
+    declared = spec.get("type") if isinstance(spec, dict) else None
+    if isinstance(declared, list):
+        return any(kind in CREDENTIAL_PARAM_TYPES for kind in declared)
+    return declared is None or declared in CREDENTIAL_PARAM_TYPES
+
+
+def _normalize_mcp_server_name(value: Any) -> str:
+    """校验并返回展示名。
+
+    工具标识是 ``server_name:tool_name``，服务名本身带冒号会让运行时按第一个冒号
+    拆分时取错远端工具名。
+    """
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("服务显示名称不能为空")
+    if ":" in text:
+        raise ValueError("服务显示名称不能包含冒号（:）")
+    return text
+
+
 class McpServerBase(BaseModel):
     server_name: str = Field(..., max_length=100)
     sse_url: str = Field(..., max_length=2048)
@@ -105,18 +152,18 @@ class McpServerBase(BaseModel):
     user_assertion_audience: Optional[str] = Field(default=None, max_length=255)
     user_assertion_key_id: Optional[str] = Field(default=None, max_length=100)
     user_assertion_issuer: Optional[str] = Field(default="nanzi-platform", max_length=255)
+    # 业务分组：左栏页签与筛选用；空值表示「未分组」，不参与任何权限与出站判定
+    group_name: Optional[str] = Field(default=None, max_length=GROUP_NAME_MAX_LEN)
+
+    @field_validator("group_name", mode="before")
+    @classmethod
+    def validate_group_name(cls, value: Optional[str]) -> Optional[str]:
+        return normalize_group_name(value)
 
     @field_validator("server_name")
     @classmethod
     def validate_server_name(cls, value: str) -> str:
-        text = str(value or "").strip()
-        if not text:
-            raise ValueError("服务显示名称不能为空")
-        # 工具标识是 ``server_name:tool_name``，服务名本身带冒号会让运行时按第一个
-        # 冒号拆分时取错远端工具名。
-        if ":" in text:
-            raise ValueError("服务显示名称不能包含冒号（:）")
-        return text
+        return _normalize_mcp_server_name(value)
 
     @field_validator("sse_url")
     @classmethod
@@ -147,6 +194,7 @@ class McpServerWrite(McpServerBase):
     auth_headers: Optional[str] = Field(default="{}", max_length=20000)
     fixed_token: Optional[str] = Field(default=None, max_length=4096, exclude=True)
     authorization_enabled: Optional[bool] = None
+    auth_source: Optional[Literal["token", "credential"]] = Field(default=None, exclude=True)
     auth_headers_patch: Optional[Dict[str, Optional[str]]] = None
 
     @model_validator(mode="after")
@@ -157,9 +205,42 @@ class McpServerWrite(McpServerBase):
 
 
 class McpVerifyRequest(McpServerWrite):
-    """连接测试请求；编辑态携带 server_id，用于复用已保存的凭据。"""
+    """连接测试请求；编辑态携带 server_id，用于复用已保存的凭据。
+
+    探测不落库，展示名与探测结果无关：新建向导第 1 步还没有名字输入框（它在验证
+    成功后的第 2 步），早期版本却沿用保存期的必填规则，导致「手动填地址 → 点连接
+    并发现工具」100% 被全局 RequestValidationError 处理器翻成 400「参数校验失败」，
+    连出站请求都没发出。这里把空串/空白视为"未填"；填了就照常校验，命名问题仍在
+    第 1 步暴露，不必拖到第 2 步保存才报错。
+    """
 
     server_id: Optional[str] = None
+    server_name: Optional[str] = Field(default=None, max_length=100)
+    pending_secret_bindings: Optional[Dict[str, Dict[str, Any]]] = Field(default=None, exclude=True)
+
+    @field_validator("server_name")
+    @classmethod
+    def validate_server_name(cls, value: Optional[str]) -> Optional[str]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        return _normalize_mcp_server_name(text)
+
+
+class McpServerGroupUpdateRequest(BaseModel):
+    """只改业务分组的轻量请求。
+
+    不复用 ``McpServerWrite``：那条路径要求回传 server_name / sse_url，还会因改名迁移
+    智能体的工具名引用、因服务启用而触发一次远端 sync_tools。用户只是想归个类，
+    不该顺手打一次外部服务。
+    """
+
+    group_name: Optional[str] = Field(default=None, max_length=GROUP_NAME_MAX_LEN)
+
+    @field_validator("group_name", mode="before")
+    @classmethod
+    def validate_group_name(cls, value: Optional[str]) -> Optional[str]:
+        return normalize_group_name(value)
 
 
 def _normalized_remark(value: Optional[str]) -> Optional[str]:
@@ -191,6 +272,9 @@ class McpToolResponse(BaseModel):
     parameter_schema: str
     is_published: bool
     is_available: bool = True
+    #: 值由凭据中心提供的参数名（JSON 数组字符串）。前端据此在参数行上显示
+    #: 「凭据」标记，并把槽位暴露给绑定面板。
+    credential_params: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -306,11 +390,16 @@ async def _migrate_server_name_references(
         cached_by_name[renamed_name] = tool
         renamed_cache.append((tool.id, renamed_name))
 
-    version_result = await db.execute(select(AIAgentVersion))
-    for version in version_result.scalars().all():
-        renamed_version_tools = _rename_tool_reference(version.tools, old_name, new_name)
-        if renamed_version_tools != version.tools:
-            version.tools = renamed_version_tools
+    # 只取 (id, tools)：全字段加载会把每个版本的提示词/模型配置都读进内存。
+    version_result = await db.execute(select(AIAgentVersion.id, AIAgentVersion.tools))
+    for version_id, tools_config in version_result.all():
+        renamed_version_tools = _rename_tool_reference(tools_config, old_name, new_name)
+        if renamed_version_tools != tools_config:
+            await db.execute(
+                update(AIAgentVersion)
+                .where(AIAgentVersion.id == version_id)
+                .values(tools=renamed_version_tools)
+            )
     return renamed_cache
 
 
@@ -420,7 +509,7 @@ def _apply_mcp_auth_update(
         else:
             _set_header_case_insensitive(headers, normalized_key, str(value))
 
-    if data.authorization_enabled is False:
+    if data.authorization_enabled is False or data.auth_source == "credential":
         _remove_header_case_insensitive(headers, "Authorization")
         server.fixed_token_encrypted = None
     elif data.fixed_token is not None:
@@ -459,14 +548,41 @@ async def _load_verify_saved_server(
     return server
 
 
+def _url_origin(value: Optional[str]) -> str:
+    """取 URL 的 scheme://host:port，用于判断「是不是同一个后端」。"""
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(str(value or "").strip())
+    except ValueError:
+        return ""
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
 def _build_verify_auth_headers(
     server: Optional[McpServer],
     data: McpVerifyRequest,
 ) -> Dict[str, str]:
-    """构造探测请求的出站 Header；编辑态未改动的凭据沿用已保存配置。"""
+    """构造探测请求的出站 Header；编辑态未改动的凭据沿用已保存配置。
+
+    注意这是**刻意**的设计（见 tests/api/test_mcp_verify_saved_credentials.py）：
+    改地址后仍复用已保存 Token，避免用户每次调地址都要重填凭据。代价是「地址写错一个
+    字符，探测就会把 Token 发到别的服务器」——分享安装侧的口径相反（换源即丢凭据）。
+    这里只补一条告警日志，方便排查「凭据被发到了哪里」，不改变产品行为。
+    """
     if server is None:
         headers = _parse_auth_headers(data.auth_headers)
     else:
+        submitted_origin = _url_origin(getattr(data, "sse_url", None))
+        saved_origin = _url_origin(server.sse_url)
+        if submitted_origin and submitted_origin != saved_origin:
+            logger.info(
+                "[MCP] Verify 目标源已变更（%s → %s），仍复用已保存凭据（产品口径）",
+                saved_origin or "-",
+                submitted_origin,
+            )
         headers = resolve_mcp_auth_headers(server)
         if "auth_headers" in data.model_fields_set and data.auth_headers:
             headers.update(_parse_auth_headers(data.auth_headers))
@@ -502,6 +618,7 @@ def _build_verify_user_assertion_headers(
             status_code=400,
             detail="开启用户身份传递后需先保存 MCP 生成签名密钥，保存后再测试连接",
         )
+
     try:
         return build_mcp_user_assertion_headers(
             server,
@@ -511,6 +628,115 @@ def _build_verify_user_assertion_headers(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"用户身份传递配置无效: {exc}")
+
+
+async def _resolve_pending_verify_bindings(
+    pending_bindings: Dict[str, Dict[str, Any]],
+    *,
+    headers: Dict[str, str],
+    sse_url: Optional[str],
+    user: Dict[str, Any],
+    authorization_disabled: bool,
+) -> None:
+    """为探测请求解析向导/表单尚未落库的凭据草稿绑定。
+
+    仍完整经过可见性/授权/场景(mcp)/域名白名单校验并登记脱敏池，禁止越权借探测外泄他人凭据。
+    """
+    from datetime import datetime
+    from app.core.orm import AsyncSessionLocal
+    from app.models.secret import UserSecret
+    from app.services.secrets.injection import (
+        _get_case_insensitive,
+        _keep_auth_scheme,
+        _render_reference,
+        _set_case_insensitive,
+        denial_hint,
+        denial_text,
+        host_of,
+    )
+    from app.services.secrets.policy import SCENE_MCP, SecretContext, evaluate_secret
+    from app.services.secrets.redact import register_injected
+    from app.services.secrets.resolver import SecretResolver, _to_record
+
+    user_id = str(_get_user_id(user) or "").strip()
+    dept_code = str(user.get("dept_code") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="无法识别当前用户，无法解析凭据绑定")
+
+    target_host = host_of(sse_url)
+    now = datetime.utcnow()
+    platform_script, platform_external, _ = await SecretResolver._platform_flags()
+
+    async with AsyncSessionLocal() as session:
+        user_script = await SecretResolver._user_allows_script_env(session, user_id)
+        for slot, cfg in pending_bindings.items():
+            if not isinstance(cfg, dict) or not str(slot).startswith("header:"):
+                continue
+            header_name = str(slot).partition(":")[2].strip()
+            if not header_name:
+                continue
+            if authorization_disabled and header_name.casefold() == "authorization":
+                continue
+            secret_id = str(cfg.get("secret_id") or "").strip()
+            if not secret_id:
+                continue
+            value_path = str(cfg.get("value_path") or "").strip()
+
+            row = await session.get(UserSecret, secret_id)
+            if row is None:
+                raise HTTPException(status_code=400, detail=f"请求头 {header_name} 绑定的凭据不存在或无权使用")
+            record = _to_record(row)
+            if not record.is_system and record.owner_id != user_id:
+                raise HTTPException(status_code=400, detail=f"请求头 {header_name} 绑定的凭据不存在或无权使用")
+            if record.is_system:
+                granted = await SecretResolver._has_grant(session, record.id, user_id, dept_code or None, now)
+                if not granted:
+                    raise HTTPException(status_code=400, detail=f"请求头 {header_name} 的凭据尚未授权给你")
+
+            context = SecretContext(
+                user_id=user_id,
+                scene=SCENE_MCP,
+                target_host=target_host,
+                dept_code=dept_code or None,
+                allow_script_env=platform_script and user_script,
+                allow_external_host=platform_external,
+            )
+            denial = evaluate_secret(record, context, now=now)
+            if denial:
+                reason = denial_text(denial)
+                hint = denial_hint(denial)
+                detail = f"请求头 {header_name} 的凭据不可用（{reason}）"
+                if hint:
+                    detail += f"。{hint}"
+                raise HTTPException(status_code=400, detail=detail)
+
+            ciphertext = SecretResolver._pick_ciphertext(row, now)
+            if not ciphertext:
+                raise HTTPException(status_code=400, detail=f"请求头 {header_name} 的凭据缺少可用密文")
+            plain = SecretResolver._decrypt(ciphertext)
+            register_injected(plain)
+
+            orig = _get_case_insensitive(headers, header_name)
+            denials: dict[str, str | None] = {}
+            rendered = _render_reference(
+                orig,
+                plain,
+                secret_key=record.secret_key,
+                slot=slot,
+                denials=denials,
+                value_path=value_path,
+                value_format=row.value_format or "text",
+            )
+            if rendered is None:
+                # 回退按 value_path 取用（_render_reference 内已尝试；若存在拒绝说明直接报错）
+                why = denials.get(slot) or "reference_unresolved"
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"请求头 {header_name} 解析凭据字段失败（{denial_text(why)}）",
+                )
+            if header_name.lower() == "authorization":
+                rendered = _keep_auth_scheme(rendered, orig)
+            _set_case_insensitive(headers, header_name, rendered)
 
 
 # 连接测试是「新建」与「编辑」共用的第一步（向导第 1 步必须调它），所以 create / edit
@@ -539,6 +765,76 @@ async def verify_mcp_server(
     saved_server = await _load_verify_saved_server(db, data, user)
     auth_headers = _build_verify_auth_headers(saved_server, data)
     auth_headers.update(_build_verify_user_assertion_headers(saved_server, data, user))
+
+    # 1) 编辑态注入已持久化的凭据绑定（复用当前探测地址做域名白名单检验）
+    if saved_server is not None:
+        from types import SimpleNamespace
+        from app.services.secrets.injection import apply_mcp_bindings, denial_hint, denial_text
+
+        verify_target = SimpleNamespace(
+            id=saved_server.id,
+            server_name=data.server_name or saved_server.server_name,
+            sse_url=data.sse_url or saved_server.sse_url,
+        )
+        # 用户若显式在表单传入固定 Token 测试或关闭 Authorization，保护 Authorization 不被旧绑定反向覆写
+        explicit_auth_token = bool(data.fixed_token) and data.auth_source != "credential"
+        saved_auth_header = next(
+            (v for k, v in auth_headers.items() if str(k).strip().casefold() == "authorization"),
+            None,
+        )
+        verify_denials: dict[str, str | None] = {}
+        auth_headers = await apply_mcp_bindings(
+            verify_target,
+            auth_headers,
+            user_info=_mcp_user_context(user),
+            denials=verify_denials,
+        )
+        if data.authorization_enabled is False:
+            _remove_header_case_insensitive(auth_headers, "Authorization")
+            verify_denials.pop("header:Authorization", None)
+        elif explicit_auth_token and saved_auth_header is not None:
+            _set_header_case_insensitive(auth_headers, "Authorization", saved_auth_header)
+            verify_denials.pop("header:Authorization", None)
+
+        # 如果前端传了尚未保存的草稿绑定覆写某槽位，则先移除对应已保存拒因，交由下面草稿分支解析
+        pending_slots = set((data.pending_secret_bindings or {}).keys())
+        effective_denials = {k: v for k, v in verify_denials.items() if k not in pending_slots}
+        if effective_denials:
+            detail = "；".join(
+                f"{slot.partition(':')[2] or slot}（{denial_text(why)}）"
+                for slot, why in effective_denials.items()
+            )
+            hints: list[str] = []
+            for why in effective_denials.values():
+                hint = denial_hint(why)
+                if hint and hint not in hints:
+                    hints.append(hint)
+            message = f"凭据不可用（{detail}）"
+            if hints:
+                message += "。" + "；".join(hints)
+            raise HTTPException(status_code=400, detail=message)
+
+    # 2) 注入向导/编辑草稿中的未保存凭据绑定
+    if data.pending_secret_bindings:
+        await _resolve_pending_verify_bindings(
+            data.pending_secret_bindings,
+            headers=auth_headers,
+            sse_url=data.sse_url,
+            user=user,
+            authorization_disabled=data.authorization_enabled is False,
+        )
+
+    pending_refs = unresolved_credential_headers(auth_headers)
+    if pending_refs:
+        # 仍未解析的占位符（如手写未绑定的 ${secret:...} / ${CREDENTIAL:...}）在本地直接报错，避免原样外发
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "这些请求头里的凭据还没有被解析："
+                + "、".join(pending_refs)
+                + "。请在「来自凭据中心」选择并绑定对应凭据，或填入真实值后再测试。"
+            ),
+        )
 
     temp_id = f"verify_{uuid.uuid4().hex[:8]}"
     McpClientService._sessions[temp_id] = McpSseSession(temp_id, data.sse_url, auth_headers)
@@ -916,6 +1212,20 @@ async def create_echo_test_mcp(
             )
         ).scalar_one_or_none()
         if slow_tool is None:
+            # 与 echo 同一处理：服务被改过名之后，工具行还挂在固定主键上、名字是旧的。
+            # 只按名字查不到就新增，会撞主键直接 500。先按 tool_id 认领回来改名。
+            slow_stale = (
+                await db.execute(
+                    select(McpToolCache).where(
+                        McpToolCache.server_id == server_id,
+                        McpToolCache.id == slow_tool_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if slow_stale is not None:
+                slow_stale.tool_name = slow_tool_name
+                slow_tool = slow_stale
+        if slow_tool is None:
             db.add(
                 McpToolCache(
                     id=slow_tool_id,
@@ -944,6 +1254,72 @@ async def create_echo_test_mcp(
     response.authorization_configured, response.masked_auth_headers = mcp_auth_headers_summary(server)
     return response
 
+async def _server_response_with_counts(db: AsyncSession, server: McpServer) -> McpServerResponse:
+    """把单条服务拼成与列表一致的响应（含三个工具计数）。
+
+    分组更新只改一列，但前端拿返回值和列表项合并，计数必须照旧带上，
+    否则卡片上的「已发布 N」会在改完分组后瞬间变成 0。
+    """
+    stmt = (
+        select(
+            func.sum(case((McpToolCache.is_available.is_(True), 1), else_=0)).label("available"),
+            func.sum(case((McpToolCache.is_available.is_(False), 1), else_=0)).label("stale"),
+            func.sum(
+                case(
+                    (
+                        and_(
+                            McpToolCache.is_available.is_(True),
+                            McpToolCache.is_published.is_(True),
+                        ),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("published"),
+        )
+        .where(McpToolCache.server_id == server.id)
+    )
+    row = (await db.execute(stmt)).one()
+    item = McpServerResponse.model_validate(server)
+    item.tool_count = int(row.available or 0)
+    item.stale_tool_count = int(row.stale or 0)
+    item.published_tool_count = int(row.published or 0)
+    item.auth_headers_configured = mcp_auth_headers_configured(server)
+    item.authorization_configured, item.masked_auth_headers = mcp_auth_headers_summary(server)
+    return item
+
+
+@router.put(
+    "/servers/{server_id}/group",
+    response_model=McpServerResponse,
+    dependencies=[Depends(require_permission("element", "element:mcp_management:edit"))],
+)
+async def update_mcp_server_group(
+    server_id: str,
+    data: McpServerGroupUpdateRequest,
+    db: AsyncSession = Depends(get_db_session),
+    user: Dict = Depends(require_api_key),
+):
+    """只改业务分组。
+
+    刻意不复用 ``PUT /servers/{server_id}``：那条路会整表单覆盖、改名时迁移智能体的
+    工具名引用、服务启用时还会触发一次远端 sync_tools。分组是纯导航字段，
+    也不检查「服务是否可编辑」之外的东西——它不改变任何运行时行为。
+    """
+    server = (await db.execute(select(McpServer).where(McpServer.id == server_id))).scalar_one_or_none()
+    if not server:
+        raise HTTPException(status_code=404, detail="MCP 服务不存在")
+    if server.scope == "global" and user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="只有系统管理员才能修改平台公共 MCP 服务的分组")
+    if server.scope == "personal" and server.user_id != _get_user_id(user):
+        raise HTTPException(status_code=403, detail="无法修改其他用户的私有 MCP 服务")
+
+    server.group_name = normalize_group_name(data.group_name)
+    await db.commit()
+    await db.refresh(server)
+    return await _server_response_with_counts(db, server)
+
+
 @router.post("/servers", response_model=McpServerResponse, dependencies=[Depends(require_permission("element", "element:mcp_management:create"))])
 async def create_mcp_server(
     data: McpServerWrite,
@@ -968,7 +1344,7 @@ async def create_mcp_server(
 
     user_id = _get_user_id(user) if target_scope == "personal" else None
     server_id = str(uuid.uuid4())
-    server_data = data.model_dump(exclude={"fixed_token", "authorization_enabled", "auth_headers_patch"})
+    server_data = data.model_dump(exclude={"fixed_token", "authorization_enabled", "auth_headers_patch", "auth_source"})
     auth_headers = _parse_auth_headers(data.auth_headers)
     raw_authorization = next(
         (
@@ -978,7 +1354,7 @@ async def create_mcp_server(
         ),
         None,
     )
-    if data.authorization_enabled is False:
+    if data.authorization_enabled is False or data.auth_source == "credential":
         _remove_header_case_insensitive(auth_headers, "Authorization")
     elif data.fixed_token:
         _remove_header_case_insensitive(auth_headers, "Authorization")
@@ -990,7 +1366,7 @@ async def create_mcp_server(
     server_data["scope"] = target_scope
     server_data["user_id"] = user_id
     
-    if data.fixed_token:
+    if data.fixed_token and data.auth_source != "credential":
         server_data["fixed_token_encrypted"] = get_api_key_manager().encrypt_api_key(data.fixed_token)
     if data.user_assertion_enabled:
         server_data["user_assertion_audience"] = (
@@ -1023,6 +1399,7 @@ async def create_mcp_server(
         "enabled_status": data.enabled_status,
         "scope": target_scope,
         "remark": server_data["remark"],
+        "group_name": new_server.group_name,
         "credential_mode": data.credential_mode,
         "user_assertion_enabled": data.user_assertion_enabled,
         "user_assertion_header": data.user_assertion_header,
@@ -1067,13 +1444,11 @@ async def update_mcp_server(
     if duplicate_name:
         raise HTTPException(status_code=400, detail=f"服务显示名称 '{server_name}' 已存在，请修改名称后保存")
 
+    renamed_tools: list[tuple[str, str]] = []
+    rename_owner_id = server.user_id if server.scope == "personal" else None
     if server.server_name != server_name:
         renamed_tools = await _migrate_server_name_references(
             db, server_id, server.server_name, server_name
-        )
-        await _sync_renamed_tools_to_conversations(
-            renamed_tools,
-            owner_id=server.user_id if server.scope == "personal" else None,
         )
     server.server_name = server_name
     server.sse_url = data.sse_url
@@ -1104,8 +1479,22 @@ async def update_mcp_server(
     # 启用/禁用等局部更新可能不传 remark，避免误清空
     if "remark" in data.model_fields_set:
         server.remark = _normalized_remark(data.remark)
+    # 分组同理：版本配置、凭据面板等表单根本不带 group_name，无条件赋值会悄悄清空分组
+    if "group_name" in data.model_fields_set:
+        server.group_name = data.group_name
     await db.commit()
     _clear_runtime_tool_cache()
+
+    # 会话挂载（Redis）必须在 commit 之后同步：先改 Redis 再提交，一旦提交失败就会出现
+    # 「库里还是旧名、会话里已经是新名」的错位，且刷新页面也无法自愈。
+    if renamed_tools:
+        try:
+            await _sync_renamed_tools_to_conversations(
+                renamed_tools,
+                owner_id=rename_owner_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Syncing renamed tools to conversations failed for {server_id}: {e}")
 
     # 会话在建立时缓存了 sse_url 与解密后的 Header，唯一兜底是 300s 空闲回收；
     # 改了地址 / Token / 断言配置后必须先淘汰，否则接下来的同步与调用还在用旧连接。
@@ -1137,11 +1526,12 @@ async def update_mcp_server(
     )
     pub = (await db.execute(pub_stmt)).scalar() or 0
     
-    response_data = data.model_dump(exclude={"fixed_token", "auth_headers"})
+    response_data = data.model_dump(exclude={"fixed_token", "auth_headers", "auth_source"})
     response_data["server_name"] = server_name
     response_data["user_assertion_audience"] = server.user_assertion_audience
     response_data["user_assertion_key_id"] = server.user_assertion_key_id
     response_data["user_assertion_issuer"] = server.user_assertion_issuer
+    response_data["group_name"] = server.group_name
     response_data["auth_headers_configured"] = mcp_auth_headers_configured(server)
     response_data["authorization_configured"], response_data["masked_auth_headers"] = (
         mcp_auth_headers_summary(server)
@@ -1172,23 +1562,31 @@ async def delete_mcp_server(
     if server.scope == "personal" and server.user_id != _get_user_id(user):
         raise HTTPException(status_code=403, detail="无法删除其他用户的私有 MCP 服务")
 
-    # 先把该服务的工具名留下来：缓存行删除后，智能体版本里的旧引用就成了
-    # 「运行时解析不到、UI 里也看不到」的幽灵配置，用户连取消勾选的入口都没有。
-    tool_names = {
-        row[0]
-        for row in (
-            await db.execute(
-                select(McpToolCache.tool_name).where(McpToolCache.server_id == server_id)
+    # 先把该服务的工具名/工具 id 留下来：缓存行删除后，智能体版本里的旧引用就成了
+    # 「运行时解析不到、UI 里也看不到」的幽灵配置，用户连取消勾选的入口都没有；
+    # 会话资源里挂着的清单同理（Redis 侧，必须按 id 单独摘）。
+    cached_rows = (
+        await db.execute(
+            select(McpToolCache.id, McpToolCache.tool_name).where(
+                McpToolCache.server_id == server_id
             )
-        ).all()
-        if row[0]
-    }
+        )
+    ).all()
+    tool_names = {row[1] for row in cached_rows if row[1]}
+    tool_ids = [row[0] for row in cached_rows if row[0]]
 
     # 1. Cascade delete associated tools first
     await db.execute(delete(McpToolCache).where(McpToolCache.server_id == server_id))
     
     # 2. Delete the server itself
     await db.execute(delete(McpServer).where(McpServer.id == server_id))
+
+    # 2.1 凭据绑定是外部表、无外键，必须显式清（与工具/脚本删除同一口径）
+    from app.services.secrets import center as secret_center
+
+    await secret_center.detach_consumer(
+        db, consumer_type="mcp_server", consumer_id=server_id
+    )
 
     # 3. 同步剔除智能体版本里的死引用：与「清理远端已删除工具」同一口径，
     #    放在同一事务里，避免出现「服务没了、引用还在」的半成品状态。
@@ -1200,6 +1598,19 @@ async def delete_mcp_server(
         await McpClientService.evict_session(server_id)
     except Exception as e:
         logger.warning(f"Evicting session failed during delete for server {server_id}: {e}")
+
+    # Redis 侧的会话挂载放在 commit 之后：库已经落定，摘除失败也只是「残留可重试」，
+    # 提前摘除则可能在提交失败时把用户的挂载白丢一次。
+    try:
+        from app.services.conversation_resource_service import ConversationResourceService
+
+        await ConversationResourceService.remove_mcp_tools(
+            owner_id=server.user_id if server.scope == "personal" else None,
+            tool_ids=tool_ids,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Purge conversation mounts failed for server {server_id}: {e}")
+
     return {
         "message": "Server and associated tools deleted",
         "removed_tool_names": sorted(tool_names),
@@ -1227,7 +1638,11 @@ async def cleanup_mcp_server_stale_tools(
         raise HTTPException(status_code=404, detail="Server not found")
     _ensure_server_control_access(server, user)
 
-    result = await cleanup_stale_tools(db, server_id)
+    result = await cleanup_stale_tools(
+        db,
+        server_id,
+        owner_id=server.user_id if server.scope == "personal" else None,
+    )
     if result["removed_count"] == 0:
         return {
             "status": "success",
@@ -1279,6 +1694,8 @@ async def sync_mcp_tools(
         }
     except McpSyncGuardError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except McpCredentialDeniedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as e:
         logger.warning("MCP sync failed for server %s: %s", server_id, e, exc_info=True)
         raise HTTPException(
@@ -1434,25 +1851,68 @@ async def execute_mcp_tool(
         "issuer": None,
         "key_id": None,
     }
+    from app.utils.context import current_user_info
+
+    # 非签名分支走 McpToolFactory（只读 AgentContext / current_user_info），不设这层
+    # ContextVar 时 HTTP 测试台路由会让用户级绑定和 user.* 规则拿不到当前用户。
+    user_ctx_token = current_user_info.set(user)
     try:
+        # 凭据参数注入要在**两种分支之前**做：签名模式下走的是
+        # `call_remote_tool`，它绕过了 McpToolFactory，不注入的话
+        # 声明成凭据的参数永远是空的（测试台会看到 {"arguments": {}}）。
+        from app.services.secrets.injection import (
+            apply_mcp_arg_bindings,
+            denial_hint,
+            denial_text,
+        )
+        from app.services.secrets.locator import choice_field
+        from app.services.ai.tools.mcp_factory import credential_param_names
+
+        arguments = dict(req.arguments or {})
+        arg_denials: dict[str, str | None] = {}
+        arguments = await apply_mcp_arg_bindings(
+            tool, arguments, user_info=user, denials=arg_denials
+        )
+        # 编号字段仅供凭据定位使用，绝不能传给远端 MCP，且需在两个分支前统一剥除
+        for _name in credential_param_names(tool):
+            arguments.pop(choice_field(_name), None)
+        if arg_denials:
+            # denials 存的是**原始 code**，必须过 denial_text()——直接拼进去
+            # 会把 denied_by_host 这种内部常量抛到界面上。
+            detail = "；".join(
+                f"{slot.split(':')[-1]}（{denial_text(why)}）"
+                for slot, why in arg_denials.items()
+            )
+            hints: list[str] = []
+            for why in arg_denials.values():
+                hint = denial_hint(why)
+                if hint and hint not in hints:
+                    hints.append(hint)
+            message = f"凭据参数缺失（{detail}）"
+            if hints:
+                message += "。" + "；".join(hints)
+            raise HTTPException(status_code=400, detail=message)
+
+        test_user_info = {
+            key: user.get(key)
+            for key in (
+                "user_id",
+                "user_name",
+                "real_name",
+                "email",
+                "dept_code",
+                "org_path",
+                "extra_data",
+            )
+            if user.get(key) is not None
+        }
+        raw_tool_name = tool.tool_name.split(":", 1)[-1]
         signed_user_mode = bool(server.user_assertion_enabled)
         if signed_user_mode:
-            test_user_info = {
-                key: user.get(key)
-                for key in (
-                    "user_id",
-                    "user_name",
-                    "real_name",
-                    "dept_code",
-                    "org_path",
-                    "extra_data",
-                )
-                if user.get(key) is not None
-            }
             result = await McpClientService.call_remote_tool(
                 server_id=tool.server_id,
-                tool_name=tool.tool_name.split(":", 1)[-1],
-                arguments=req.arguments,
+                tool_name=raw_tool_name,
+                arguments=arguments,
                 user_info=test_user_info,
                 agent_info={
                     "agent_id": "mcp-tool-tester",
@@ -1469,25 +1929,45 @@ async def execute_mcp_tool(
                 "key_id": server.user_assertion_key_id,
             }
         else:
-            lc_tool = McpToolFactory.create_tool(tool)
-            result = await resolve_tool_invocation_result(
-                await lc_tool.ainvoke(req.arguments)
+            # 非签名分支同样走 call_remote_tool：前面已完成参数注入与 choice_field 剥离，
+            # 避免经由 McpToolFactory 二次执行 apply_mcp_arg_bindings 产生双倍解密与双份流水
+            result = await McpClientService.call_remote_tool(
+                server_id=tool.server_id,
+                tool_name=raw_tool_name,
+                arguments=arguments,
+                user_info=test_user_info,
+                agent_info={
+                    "agent_id": "mcp-tool-tester",
+                    "agent_name": "MCP 工具测试台",
+                },
+                request_id=str(uuid.uuid4()),
             )
         return {"status": "success", "result": result, "mcp_auth": mcp_auth}
+    except HTTPException:
+        # 凭据缺失之类的 4xx 是**我们**给的结论，别被下面的兜底改成 502
+        raise
     except Exception as e:
         # 远程执行失败必须是错误状态，不能 HTTP 200 返回 status=error：否则监控/调用方
-        # 会把失败当成功。详情限长，避免把内部堆栈/地址整段回给前端。
+        # 会把失败当成功。先脱敏再限长，避免敏感信息被截断或回传给前端。
+        from app.services.secrets.redact import redact_value
+
+        safe_error = str(redact_value(str(e), where="MCP工具执行异常"))
+        # **不打堆栈**：``safe_error`` 已经把关键信息（类型 + 脱敏后的消息）给全了，
+        # 而 ``exc_info=True`` 打的是原始异常对象的 traceback，最后一行是**未脱敏**
+        # 的异常消息。凭据中心注入的 token 可能就在那句话里，等于把脱敏白做了。
         logger.warning(
-            "MCP tool test execution failed for server %s tool %s: %s",
+            "MCP tool test execution failed for server %s tool %s: %s: %s",
             tool.server_id,
             tool.tool_name,
-            e,
-            exc_info=True,
+            type(e).__name__,
+            safe_error,
         )
         raise HTTPException(
             status_code=502,
-            detail=f"MCP 工具执行失败: {str(e)[:500]}",
+            detail=f"MCP 工具执行失败: {safe_error[:500]}",
         ) from e
+    finally:
+        current_user_info.reset(user_ctx_token)
 
 @router.get("/tools/{tool_id}/curl")
 async def get_mcp_tool_curl(
@@ -1533,6 +2013,80 @@ async def get_mcp_tool_curl(
         str(tool.tool_name).split(":", 1)[-1],
         parsed_arguments,
     )
+
+
+class ToolCredentialParamsRequest(BaseModel):
+    """声明工具上哪些参数的值由凭据中心提供。"""
+
+    params: List[str] = Field(default_factory=list)
+
+
+@router.put(
+    "/tools/{tool_id}/credential-params",
+    dependencies=[Depends(require_permission("element", "element:mcp_management:publish"))],
+)
+async def set_tool_credential_params(
+    tool_id: str,
+    payload: ToolCredentialParamsRequest,
+    db: AsyncSession = Depends(get_db_session),
+    user: Dict = Depends(require_api_key),
+) -> Dict:
+    """标记 / 取消标记「这个参数的值从凭据中心取」。
+
+    标记后该参数从**模型可见**的参数列表里消失，运行时按
+    ``arg:<短工具名>:<参数名>`` 槽位注入。所以只接受 schema 里真实存在的参数名，
+    拼错一个就等于声明了一个永远不会被填的参数。
+    """
+    tool = (
+        await db.execute(select(McpToolCache).where(McpToolCache.id == tool_id))
+    ).scalar_one_or_none()
+    if not tool:
+        raise HTTPException(status_code=404, detail="Tool not found")
+
+    server = (
+        await db.execute(select(McpServer).where(McpServer.id == tool.server_id))
+    ).scalar_one_or_none()
+    if not server:
+        raise HTTPException(status_code=404, detail="Server not found")
+    _ensure_server_control_access(server, user)
+
+    try:
+        schema = json.loads(tool.parameter_schema or "{}")
+    except ValueError:
+        schema = {}
+    props = (schema.get("properties") or {}) if isinstance(schema, dict) else {}
+
+    cleaned: List[str] = []
+    for name in payload.params:
+        name = str(name or "").strip()
+        if not name:
+            continue
+        if name not in props:
+            raise HTTPException(
+                status_code=400,
+                detail=f"参数 {name} 不在这个工具的参数定义里（远端可能改了参数名，请先同步工具）",
+            )
+        if not accepts_credential_value(props[name]):
+            declared = props[name].get("type") if isinstance(props[name], dict) else None
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"参数 {name} 的类型是 {declared}，凭据只能提供字符串、数字、布尔。"
+                    "对象/数组这类参数请让模型填，或改由 MCP 服务端固定配置。"
+                ),
+            )
+        if name not in cleaned:
+            cleaned.append(name)
+
+    await db.execute(
+        update(McpToolCache)
+        .where(McpToolCache.id == tool_id)
+        .values(credential_params=json.dumps(cleaned, ensure_ascii=False) if cleaned else None)
+    )
+    await db.commit()
+    # 工具定义变了（参数被剔除），运行时的工具缓存必须重建，否则模型还会看到旧 schema
+    _clear_runtime_tool_cache()
+    return {"status": "success", "credential_params": cleaned}
 
 
 @router.put("/tools/{tool_id}/publish", dependencies=[Depends(require_permission("element", "element:mcp_management:publish"))])
@@ -1596,7 +2150,9 @@ async def get_mcp_server_outbound_logs(
         McpOutboundAuditLog.created_at >= start_time,
     ]
     if tool_name:
-        filters.append(McpOutboundAuditLog.tool_name == tool_name)
+        # 与全平台日志同一口径：库里存的是裸工具名，但用户常按片段搜索，
+        # 精确匹配会让「输一半」看起来像没日志。
+        filters.append(McpOutboundAuditLog.tool_name.ilike(f"%{tool_name}%"))
     if status and status != "all":
         filters.append(McpOutboundAuditLog.status == status)
 

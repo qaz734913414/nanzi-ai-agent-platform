@@ -35,6 +35,13 @@ from app.services.ai.tools.parameter_schema import (
     apply_user_placeholders,
     parse_parameter_schema,
 )
+from app.services.ai.tools.user_placeholders import UserPlaceholderError
+
+from app.services.secrets.injection import (
+    apply_script_env_bindings,
+    build_env_file_content,
+)
+from app.services.secrets.redact import redact_text, redact_value
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +82,10 @@ class ScriptToolConfig:
 
     name: str
     code: str
+    # 凭据绑定的消费方 id。缺了它 `apply_script_env_bindings` 里的
+    # `getattr(config, "id", "")` 永远是空串，函数在第一道判断就 return {}，
+    # 于是 env: 绑定从来没注入过——界面上绑得好好的，脚本里读到的一直是空。
+    id: str = ""
     parameter_schema: Any = None
     requirements: tuple[str, ...] = ()
     timeout_seconds: Optional[int] = None
@@ -104,6 +115,8 @@ class ScriptRunResult:
     timed_out: bool = False
     artifacts: List[str] = field(default_factory=list)
     message: str = ""
+    #: 凭据未能写入脚本环境变量时的可读原因列表（不含任何明文）
+    credential_denials: str = ""
 
 
 def code_fingerprint(code: str) -> str:
@@ -197,6 +210,7 @@ class ScriptToolRunner:
         sandbox_root: str | None = None,
         user_info: Optional[Mapping[str, Any]] = None,
         conversation_id: str | None = None,
+        tool_timeout_seconds: float | None = None,
     ) -> None:
         self.config = config
         self.workdir = Path(workdir).expanduser().resolve()
@@ -204,6 +218,15 @@ class ScriptToolRunner:
         self.sandbox_root = sandbox_root
         self.user_info = dict(user_info or {})
         self.conversation_id = conversation_id
+        # 外层已经算好的三级超时（工具级 → 脚本自带 → 版本级 → 全局）。
+        # 内层必须用它：否则脚本自带超时会反过来压过用户配的工具级，
+        # 「版本级放大」对没自带超时的脚本也永远不生效。
+        self.tool_timeout_seconds = (
+            float(tool_timeout_seconds) if tool_timeout_seconds else None
+        )
+        # 上次解析凭据环境变量时被拒绝的原因（停用/过期/开关没开）；
+        # 只在返回 None 之后有意义，供调用方在错误信息里带出去。
+        self._credential_denials: str = ""
 
     # ------------------------------------------------------------------ 路径
 
@@ -235,17 +258,44 @@ class ScriptToolRunner:
 
     # ------------------------------------------------------------------ 参数
 
+    def _effective_user_variables(self) -> Dict[str, Any]:
+        """构造脚本运行时的用户占位符变量：优先显式 ``user_info``（如试跑），隔离跨用户污染。"""
+        ctx_vars = dict(_current_user_variables())
+        if not self.user_info:
+            return ctx_vars
+
+        from app.services.ai.tools.user_placeholders import resolve_user_variables
+
+        explicit_vars = resolve_user_variables(self.user_info)
+        explicit_uid = explicit_vars.get("user_id")
+        ctx_uid = ctx_vars.get("user_id")
+        if (
+            explicit_uid is not None
+            and ctx_uid is not None
+            and str(explicit_uid) != str(ctx_uid)
+        ):
+            return explicit_vars
+        merged = ctx_vars
+        merged.update(explicit_vars)
+        return merged
+
     def prepare_params(self, params: Mapping[str, Any]) -> Dict[str, Any]:
         _schema, properties, required = parse_parameter_schema(
             self.config.parameter_schema,
             tool_name=self.config.name,
         )
-        prepared = apply_user_placeholders(
-            self.config.parameter_schema,
-            dict(params),
-            _current_user_variables(),
-            tool_name=self.config.name,
-        )
+        try:
+            prepared = apply_user_placeholders(
+                self.config.parameter_schema,
+                dict(params),
+                self._effective_user_variables(),
+                tool_name=self.config.name,
+            )
+        except UserPlaceholderError as exc:
+            # 用户变量取不到是**配置/资料问题**，不是运行时故障。统一收敛成
+            # ScriptToolError：试跑端点（只捕获它）与工具调用层都按可读错误呈现，
+            # 而不是抛 ValueError 一路冒到框架层变成 500。
+            raise ScriptToolError(str(exc)) from exc
         missing = [
             name
             for name in sorted(required)
@@ -293,6 +343,65 @@ class ScriptToolRunner:
         if self.config.requirements:
             _write_private(requirements_path, "\n".join(self.config.requirements) + "\n")
         return script_path, params_path, requirements_path
+
+    async def materialize_secret_env(
+        self,
+        stem: str,
+        run_id: str,
+        *,
+        denials_out: Optional[List[str]] = None,
+    ) -> Optional[Path]:
+        """把绑定的凭据写成环境变量文件，返回路径；没有可注入的返回 None。
+
+        三条设计约束：
+
+        1. **值不进命令行**：``NAME=value cmd`` 形式在 ``ps aux`` 和容器进程列表里
+           都看得见，等于把凭据打印到日志里。改成写 0600 文件，命令里只出现路径。
+        2. **用单引号渲染**：shell ``. file`` 会执行命令替换，凭据值里只要出现
+           ``$(...)`` 就是一条任意命令执行通道（见 ``build_env_file_content``）。
+        3. **执行完立即删除**：留在工作区里等于给脚本（和任何能读工作区的工具）
+           一个长期可读的凭据副本。
+
+        解析失败只降级不中断：凭据取不到时脚本照常跑，只是少了那几个变量。
+        """
+        self._credential_denials = ""
+        try:
+            # 必须带上执行身份：解析要按用户过滤绑定、按用户查脚本开关，
+            # 少了它 `_current_user` 拿到空 user_id 会直接返回 {} —— 注入静默失效，
+            # 脚本里那些变量永远是空的，而且不报任何错。
+            script_denials: dict[str, str] = {}
+            env = await apply_script_env_bindings(
+                self.config, user_info=self.user_info, denials=script_denials
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("[ScriptTool] 解析凭据环境变量失败: %s", self.config.name, exc_info=True)
+            return None
+        if script_denials:
+            # 脚本里读到空值和读不到变量是两种崩法，但用户看到的都是「脚本报错了」。
+            # 把原因写进日志和结果，至少能查到是凭据过期还是开关没开。
+            # 翻成人话再拼：这些 code 是内部枚举（structured_without_path 之类），
+            # 直接透给用户等于让人去猜，日志里也不好搜。
+            from app.services.secrets.injection import denial_text
+
+            detail = "；".join(
+                f"{slot}（{denial_text(why)}）" for slot, why in script_denials.items()
+            )
+            logger.warning(
+                "[ScriptTool] %s 的凭据环境变量没有注入：%s", self.config.name, detail
+            )
+            self._credential_denials = detail
+            if denials_out is not None:
+                denials_out.append(detail)
+        if not env:
+            return None
+
+        env_path = self.workdir / SCRIPT_DIR_NAME / f"{stem}.{run_id}.env"
+        try:
+            _write_private(env_path, build_env_file_content(env))
+        except OSError:
+            logger.warning("[ScriptTool] 写入凭据环境变量文件失败: %s", env_path, exc_info=True)
+            return None
+        return env_path
 
     # ------------------------------------------------------------------ 依赖
 
@@ -386,14 +495,32 @@ class ScriptToolRunner:
         script_rel = _relative_for_command(script_path, self.workdir)
         params_rel = _relative_for_command(params_path, self.workdir)
 
+        run_denials: List[str] = []
+        secret_env = await self.materialize_secret_env(
+            stem, run_id, denials_out=run_denials
+        )
+        denial_note = run_denials[0] if run_denials else ""
+        env_prelude = ""
+        if secret_env is not None:
+            env_rel = _relative_for_command(secret_env, self.workdir)
+            # ``set -a`` 让 ``. file`` 设置的变量导出给子进程；没有它，变量只在
+            # 当前 shell 里存在，脚本的 os.environ 里看不到。
+            env_prelude = f'set -a && . "{env_rel}" && set +a && '
+
         run_command = (
-            f"PY=$(command -v python || command -v python3) && "
+            env_prelude
+            + f"PY=$(command -v python || command -v python3) && "
             f'PYTHONPATH={LIBS_DIR_NAME} "$PY" -u {script_rel} < {params_rel}'
         )
         envelope = build_envelope_command(run_command, out_file, err_file)
 
         started = time.monotonic()
-        shell_result = await self._run_shell(envelope, timeout_seconds=timeout)
+        try:
+            shell_result = await self._run_shell(envelope, timeout_seconds=timeout)
+        finally:
+            # 无论成功、失败还是超时，凭据文件都不能留在工作区
+            if secret_env is not None:
+                secret_env.unlink(missing_ok=True)
         duration_ms = int((time.monotonic() - started) * 1000)
 
         if shell_result.timed_out:
@@ -406,20 +533,30 @@ class ScriptToolRunner:
                 duration_ms=duration_ms,
                 timed_out=True,
                 message=message,
+                credential_denials=denial_note,
             )
 
         ok = shell_result.exit_code == 0
+        fail_msg = ""
+        if not ok and denial_note and not shell_result.stderr.strip():
+            fail_msg = f"凭据环境变量未注入：{denial_note}"
         result = ScriptRunResult(
             ok=ok,
             exit_code=shell_result.exit_code,
             stdout=shell_result.stdout,
             stderr=shell_result.stderr,
             duration_ms=duration_ms,
+            message=fail_msg,
+            credential_denials=denial_note,
         )
         result.artifacts = _extract_artifacts(shell_result.stdout)
         return result
 
     async def resolve_timeout(self) -> float:
+        # 优先用外层解析好的三级超时；留半秒余量让内层先超时，
+        # 从而给出「脚本执行超时」这种可读错误，而不是让外层协程被直接取消。
+        if self.tool_timeout_seconds:
+            return max(1.0, self.tool_timeout_seconds - INNER_TIMEOUT_MARGIN_SECONDS)
         if self.config.timeout_seconds:
             return max(1.0, float(self.config.timeout_seconds))
         try:
@@ -461,9 +598,12 @@ class ScriptToolRunner:
         )
         try:
             async with _sandbox_activity_heartbeat(cache_key=cache_key):
+                # 不能比外层多留余量：外层按 RuntimeToolSpec.timeout_seconds 到点就会
+                # 取消协程，内层如果更宽松，就永远轮不到它自己报「脚本执行超时」，
+                # 用户只能看到外层那句笼统的超时。这里与外层同口径（本地分支亦然）。
                 raw = await asyncio.wait_for(
                     _await_maybe(bash_tool(command=command, cwd=sandbox_cwd)),
-                    timeout=timeout_seconds + 5,
+                    timeout=timeout_seconds,
                 )
         except asyncio.TimeoutError:
             return ShellRunResult(exit_code=None, stdout="", stderr="", timed_out=True)
@@ -628,25 +768,61 @@ def _truncate(text: str, limit: int = MAX_RESULT_BYTES) -> str:
 
 
 async def render_result_for_model(result: ScriptRunResult, *, workdir: Path) -> str:
-    """把执行结果转成模型可读文本：成功给 stdout，失败给退出码 + stderr。"""
+    """把执行结果转成模型可读文本：成功给 stdout，失败给退出码 + stderr。
+
+    **先脱敏再截断**：脚本 env 一旦注入，``echo $API_KEY`` 就会把明文写进
+    stdout/stderr；若先按字节截断再脱敏，横跨 100KB 上限的凭据值会被腰斩，
+    剩余前半段无法命中精确匹配而以明文逃逸回模型上下文。
+    """
+    rendered = await _render_result(result, workdir=workdir)
+    return redact_text(rendered, where="脚本工具输出")
+
+
+async def _render_result(result: ScriptRunResult, *, workdir: Path) -> str:
     if result.timed_out:
-        return result.message or "脚本执行超时，已终止"
+        msg = result.message or "脚本执行超时，已终止"
+        if result.credential_denials:
+            msg += f"\n凭据环境变量未注入：{result.credential_denials}"
+        return redact_text(msg, where="脚本工具输出")
 
     if not result.ok:
         code = "未知" if result.exit_code is None else str(result.exit_code)
-        stderr = _truncate(result.stderr.strip() or result.message or "（无错误输出）")
+        safe_stderr = redact_text(
+            result.stderr.strip() or result.message or "（无错误输出）",
+            where="脚本工具输出",
+        )
+        stderr = _truncate(safe_stderr)
         head = f"脚本执行失败（退出码 {code}）"
+        if result.credential_denials:
+            safe_denials = redact_text(result.credential_denials, where="脚本工具输出")
+            head += f"\n凭据环境变量未注入：{safe_denials}"
         if result.stdout.strip():
-            return head + "\n--- stdout ---\n" + _truncate(result.stdout.strip()) + "\n--- stderr ---\n" + stderr
+            safe_stdout = redact_text(result.stdout.strip(), where="脚本工具输出")
+            return (
+                head
+                + "\n--- stdout ---\n"
+                + _truncate(safe_stdout)
+                + "\n--- stderr ---\n"
+                + stderr
+            )
         return head + "\n--- stderr ---\n" + stderr
 
     published = await publish_artifacts(result.artifacts, workdir=workdir) if result.artifacts else []
+    denial_suffix = (
+        f"\n注意：部分凭据环境变量未注入（{redact_text(result.credential_denials, where='脚本工具输出')}）"
+        if result.credential_denials
+        else ""
+    )
     stdout = result.stdout.strip()
     if not stdout:
-        return "脚本执行成功，没有输出。" + (
-            "\n已登记可下载文件：" + "、".join(item["filename"] or item["path"] for item in published)
-            if published
-            else ""
+        return (
+            "脚本执行成功，没有输出。"
+            + (
+                "\n已登记可下载文件：" + "、".join(item["filename"] or item["path"] for item in published)
+                if published
+                else ""
+            )
+            + denial_suffix
         )
 
     try:
@@ -654,9 +830,9 @@ async def render_result_for_model(result: ScriptRunResult, *, workdir: Path) -> 
     except (ValueError, TypeError):
         payload = None
 
-    if isinstance(payload, dict) and published:
-        payload["published_artifacts"] = published
-        return _truncate(json.dumps(payload, ensure_ascii=False))
     if isinstance(payload, dict):
-        return _truncate(json.dumps(payload, ensure_ascii=False))
-    return _truncate(stdout)
+        if published:
+            payload["published_artifacts"] = published
+        safe_payload = redact_value(payload, where="脚本工具输出")
+        return _truncate(json.dumps(safe_payload, ensure_ascii=False))
+    return _truncate(redact_text(stdout, where="脚本工具输出"))

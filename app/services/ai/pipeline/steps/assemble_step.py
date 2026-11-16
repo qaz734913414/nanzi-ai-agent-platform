@@ -126,6 +126,26 @@ class AssembleStep(BasePipelineStep):
             shared_state["request_knowledge_dataset_ids"] = request_knowledge_dataset_ids
             shared_state["configured_agent_dataset_ids"] = configured_agent_dataset_ids
 
+            # 用户手选 / 会话固定的数据集会被「工具级绑定」覆盖（见 registry 的
+            # _configure_runtime_tool_spec），但之前只写了一条 logger.warning：
+            # 用户看到自己选了数据集、结果查的却是另一批，完全无从判断。
+            # 这里提前算好差异，交给 execution_step 随 meta 事件推到前端展示。
+            from app.services.ai.metadata_dataset_scope import (
+                extract_bound_metadata_dataset_ids,
+            )
+
+            _bound_metadata_ids = extract_bound_metadata_dataset_ids(
+                getattr(agent_config, "tools", None)
+            )
+            _mounted_metadata_ids = [
+                str(item).strip() for item in (context.metadata_dataset_ids or []) if str(item).strip()
+            ]
+            if _bound_metadata_ids and _mounted_metadata_ids and set(_bound_metadata_ids) != set(_mounted_metadata_ids):
+                shared_state["metadata_scope_override"] = {
+                    "mounted": _mounted_metadata_ids,
+                    "bound": _bound_metadata_ids,
+                }
+
             runtime_model_info = shared_state.get("runtime_model_info")
             runtime_context_metadata = None
             if self.agent_service and hasattr(self.agent_service, "_runtime_context_metadata"):
@@ -153,6 +173,7 @@ class AssembleStep(BasePipelineStep):
                 knowledge_dataset_ids=request_knowledge_dataset_ids,
                 agent_dataset_ids=configured_agent_dataset_ids,
                 metadata_dataset_ids=context.metadata_dataset_ids,
+                bound_metadata_dataset_ids=_bound_metadata_ids,
                 authorized_attachment_paths=authorized_paths,
                 current_turn_attachment_paths=current_turn_paths,
                 trace_buffer=context.trace_buffer,

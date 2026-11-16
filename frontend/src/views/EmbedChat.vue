@@ -550,12 +550,20 @@
         :welcome-cards="welcomeCards"
         :personal-resources="welcomePersonalResources"
         :personal-resources-refreshing="workbenchHomeRefreshing"
+        :recent-conversations="welcomeRecentConversations"
+        :recommendations="welcomeRecommendations"
+        :recommendations-loading="welcomeRecommendationsLoading"
+        :recommendation-source="welcomeRecommendationSource"
+        :recommendations-error="welcomeRecommendationsError"
         @quick-question="handleQuickQuestion"
+        @fill-question="handleQuickQuestion($event, 'fill')"
         @open-data-portal="openPortalDrawer"
         @open-personal-resources="openPersonalResources"
         @refresh-personal-resources="refreshWelcomePersonalResources"
         @select-knowledge-base="openKnowledgePortal"
         @open-workspace="openWorkspaceDrawer"
+        @generate-recommendations="generateWelcomeRecommendations"
+        @open-recent-conversation="openWelcomeRecentConversation"
       />
       <!-- 小程序宿主：已授权智能体为空时的兜底（浏览器/iframe 既有行为不受影响） -->
       <p
@@ -885,6 +893,7 @@
                 :is-thinking="msg.isThinking"
                 :has-answer="Boolean(visibleStreamBody(msg))"
                 :expand-thoughts="config.expandThoughts"
+                :reasoning-density="config.reasoningDensity"
                 :thinking-text="msg.thinkingText"
                 :duration="msg.thoughtDuration"
                 :prompt-tokens="msg.prompt_tokens"
@@ -1010,6 +1019,29 @@
                   <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
                 </button>
                                                                 <AgentHandoffNotice v-if="msg.agentHandoff" :handoff="msg.agentHandoff" />
+                                                                <div
+                                                                  v-if="msg.omittedColumns?.length"
+                                                                  class="mb-2 inline-flex max-w-full items-start gap-1.5 rounded-lg border border-amber-200 bg-amber-50/80 px-2.5 py-1.5 text-[11px] font-medium leading-relaxed text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300"
+                                                                >
+                                                                  <svg class="mt-0.5 h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                                                  </svg>
+                                                                  <span>
+                                                                    以下字段你没有查看权限，结果中已省略：
+                                                                    <b class="font-mono">{{ msg.omittedColumns.join('、') }}</b>
+                                                                  </span>
+                                                                </div>
+                                                                <div
+                                                                  v-if="msg.metadataScopeNotice"
+                                                                  class="mb-2 inline-flex max-w-full items-start gap-1.5 rounded-lg border border-amber-200 bg-amber-50/80 px-2.5 py-1.5 text-[11px] font-medium leading-relaxed text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300"
+                                                                >
+                                                                  <svg class="mt-0.5 h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M4.515 19h14.97a1 1 0 00.864-1.503l-7.485-12.97a1 1 0 00-1.728 0L3.651 17.497A1 1 0 004.515 19z" />
+                                                                  </svg>
+                                                                  <span>
+                                                                    {{ msg.metadataScopeNotice.message || '你选择的数据集已被该智能体绑定的数据集覆盖，本次查询使用的是绑定范围。' }}
+                                                                  </span>
+                                                                </div>
                                                                 <div
                                                                   v-if="msg.permissionNotice?.row_filter_applied && !msg.chatbiInsight"
                                                                   class="mb-2 inline-flex max-w-full items-start gap-1.5 rounded-lg border border-emerald-100 bg-emerald-50/70 px-2.5 py-1.5 text-[11px] font-medium leading-relaxed text-emerald-700 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300"
@@ -1684,6 +1716,7 @@
       @refresh="fetchDatasets"
       @toggle-pin="toggleDatasetPinned"
       @load-documents="fetchDatasetDocuments"
+      @load-more-documents="loadMoreDatasetDocuments"
       @load-document-recommendations="fetchDocumentRecommendations"
     />
 
@@ -2692,6 +2725,7 @@ import { isSkillEnabled } from '@/utils/skillEnabled'
 import {
   evaluateHostMessageTrust,
   resolveHostTargetOrigin,
+  parseOrigin,
 } from '@/utils/embedHostTrust'
 
 // 已加载失败的候选头像地址，避免「全局形象也坏了」时在两层兜底之间来回触发 error 死循环。
@@ -2809,6 +2843,7 @@ import {
   applyStreamErrorMessage,
   type StreamErrorDetail,
 } from "@/utils/streamErrorPresentation";
+import { normalizeReasoningDensity } from "@/utils/reasoningDensity";
 import RagPreviewDrawer from "@/components/RagPreviewDrawer.vue";
 import ChatHistorySidebar from "@/components/ChatHistorySidebar.vue";
 import ShareConversationDialog from "@/components/ShareConversationDialog.vue";
@@ -2977,6 +3012,8 @@ interface LogEntry {
   model?: string;
   temperature?: number;
   tool_result_state?: string;
+  /** 本次工具调用真实的超时秒数（三级解析后的生效值），降级路径也要带上。 */
+  timeout_seconds?: number | null;
   file_metadata?: import("@/utils/processTimeline").FileToolMetadata;
   resolution_status?: 'disabled' | 'missing' | 'filtered';
   execution_time_ms?: number | null;
@@ -3138,6 +3175,14 @@ interface Message {
   toolResultData?: Record<string, Array<{ block_id?: string; media_type?: string; data?: unknown; url?: string | null }>>;
   datasetNavigation?: DatasetNavigationPayload;
   permissionNotice?: PermissionNotice;
+  /** 字段级权限：SELECT 里被剔除的字段（后端 permission_notice.omitted_columns）。 */
+  omittedColumns?: string[];
+  /** 用户手选的数据集被智能体绑定覆盖时的提示（后端 meta 事件下发）。 */
+  metadataScopeNotice?: {
+    mounted: string[];
+    bound: string[];
+    message?: string;
+  };
   groundingBlocked?: GroundingBlockedPayload;
   reusableResultStatus?: {
     status: "saved" | "reused" | "fallback" | string;
@@ -4242,7 +4287,8 @@ const config = reactive({
   enableSqlPlan: false,
   enableGrounding: false, // Embed 默认关闭反幻觉校验，由用户在右上角设置中主动开启
   groundingBlockMode: "strict_buffer" as "strict_buffer" | "stream_with_retraction",
-  expandThoughts: true, // 思考过程默认展示开关
+  expandThoughts: true, // 思考过程默认展示开关（旧字段：链路级展开，密度三档会同步它）
+  reasoningDensity: "standard" as "detailed" | "standard" | "compact" | "off", // 思考密度：详细 / 标准 / 精简 / 关闭
   markdownTheme: "default" as "default" | "minimal" | "academic" | "apple" | "warm" | "compact",
   hideMessageBorder: true,
   /** 隐藏聊天头像开关：关掉后气泡吃掉头像占的左右各 40px，用于显示更多内容 */
@@ -4459,6 +4505,25 @@ const thinkingEnableOverride = ref<boolean | null>(null);
 const reasoningEffortOverride = ref<ReasoningEffort | null>(null);
 const temperatureOverride = ref<number | null>(null);
 const welcomeCards = ref<Array<{ icon: string; title: string; subtitle: string; prompt: string }>>([]);
+interface WelcomeRecentConversation {
+  conversation_id: string;
+  title: string;
+  subtitle?: string;
+  occurred_at?: string;
+  agent_id?: string;
+}
+interface WelcomeRecommendationCard {
+  icon: string;
+  title: string;
+  subtitle: string;
+  prompt: string;
+  source?: string;
+}
+const welcomeRecentConversations = ref<WelcomeRecentConversation[]>([]);
+const welcomeRecommendations = ref<WelcomeRecommendationCard[]>([]);
+const welcomeRecommendationsLoading = ref(false);
+const welcomeRecommendationSource = ref("");
+const welcomeRecommendationsError = ref("");
 const showPersonalResources = ref(false);
 const personalResourcesTab = ref<PersonalResourceTab>("tokens");
 const portalInboxRef = ref<{ open: () => void | Promise<void> } | null>(null);
@@ -4523,8 +4588,76 @@ const handlePersonalResourceOpenQuestion = (payload: {
   void handleQuickQuestion(payload?.query, payload?.action === "fill" ? "fill" : "send");
 };
 
+const resetWelcomeRecommendations = () => {
+  welcomeRecommendations.value = [];
+  welcomeRecommendationSource.value = "";
+  welcomeRecommendationsError.value = "";
+};
+
+// `config.token` 在 setup 早期就可能到位，而 `embedAuthHeaders` 声明得更靠后；
+// 欢迎页上下文 watch 的 immediate 调用不能碰后者，否则会踩 TDZ。
+const welcomeApiHeaders = (): Record<string, string> | undefined => {
+  if (!config.token) return undefined;
+  return {
+    Authorization: `Bearer ${config.token}`,
+    "X-API-Key": config.token,
+  };
+};
+
+const loadWelcomeHomeContext = async () => {
+  try {
+    const response = await axios.get('/api/v1/chat/home-context', {
+      params: { limit: 1 },
+      headers: welcomeApiHeaders(),
+    });
+    const items = response.data?.items;
+    welcomeRecentConversations.value = Array.isArray(items)
+      ? items.filter((item: any) => item?.conversation_id && item?.title).slice(0, 1)
+      : [];
+  } catch (error) {
+    // 欢迎页的“继续”是增强信息，失败时静默隐藏，不阻断首屏。
+    console.warn('Failed to load welcome recent conversations', error);
+    welcomeRecentConversations.value = [];
+  }
+};
+
+const generateWelcomeRecommendations = async () => {
+  if (welcomeRecommendationsLoading.value) return;
+  welcomeRecommendationsLoading.value = true;
+  welcomeRecommendationsError.value = "";
+  try {
+    const response = await axios.post('/api/v1/chat/home-recommendations', {
+      variation: String(Date.now()),
+      days: 3,
+    }, { headers: welcomeApiHeaders() });
+    const cards = response.data?.cards;
+    const normalized = Array.isArray(cards)
+      ? cards.filter((card: any) => card?.title && card?.subtitle && card?.prompt).slice(0, 3)
+      : [];
+    if (normalized.length !== 3) {
+      resetWelcomeRecommendations();
+      welcomeRecommendationsError.value = "最近 3 天还没有可参考的会话";
+      return;
+    }
+    welcomeRecommendations.value = normalized;
+    welcomeRecommendationSource.value = `已读取近 3 天 · ${Number(response.data?.source_count || 0)} 段会话`;
+  } catch (error: any) {
+    // 生成失败只在卡片下方就地提示，不弹 toast，避免打断首页浏览。
+    welcomeRecommendationsError.value = String(error?.response?.data?.detail || "生成推荐失败，请稍后重试");
+  } finally {
+    welcomeRecommendationsLoading.value = false;
+  }
+};
+
+const openWelcomeRecentConversation = (conversationId: string) => {
+  if (!conversationId) return;
+  void handleHistoryClick({ conversation_id: conversationId });
+};
+
 const loadWelcomeCards = async (agentId?: string) => {
   const id = String(agentId || '').trim();
+  resetWelcomeRecommendations();
+  void loadWelcomeHomeContext();
   if (!id) {
     welcomeCards.value = [];
     return;
@@ -4717,6 +4850,7 @@ const saveRoutingSettings = () => {
     writeConfigValue("yovole_approval_mode", config.approvalMode || "ask");
     writeConfigValue("yovole_embed_theme", config.theme || "light");
     writeConfigValue("yovole_expand_thoughts", config.expandThoughts ? "1" : "0");
+    writeConfigValue("yovole_reasoning_density", config.reasoningDensity || "standard");
     writeConfigValue("yovole_grounding_block_mode", config.groundingBlockMode || "strict_buffer");
     writeConfigValue("yovole_markdown_theme", config.markdownTheme || "default");
     writeConfigValue("yovole_hide_message_border", config.hideMessageBorder ? "1" : "0");
@@ -7248,9 +7382,10 @@ watch(() => config.token, (newToken) => {
 
 // 非 URL 深链的专家切换也需要同步刷新版本级欢迎卡片。
 watch(effectiveEmbedChatAgentId, (agentId) => {
-    if (config.token) {
-        void loadWelcomeCards(agentId);
-    }
+    // 门户 iframe 走 Cookie 时 config.token 可能为空；欢迎页的“继续”和
+    // 版本欢迎卡不能只等 token 分支，否则会一直不加载。无鉴权时请求会失败，
+    // 后续 token 到位仍会由上面的 token watch 再补一次。
+    void loadWelcomeCards(agentId);
 }, { immediate: true });
 
 // 监听当前激活的智能体变更，自动应用其配置的推荐排版风格
@@ -8310,7 +8445,15 @@ const truncateServerHistory = async (keepCount: number): Promise<boolean> => {
     return response.data?.data?.success !== false;
   } catch (e) {
     console.warn("Failed to truncate server history before resend", e);
-    showToast("同步会话历史失败，请稍后重试", "error");
+    // 后端在会话仍在生成时会返回 409：这是「稍等就好」，不是真失败，
+    // 沿用通用文案会让人以为历史同步坏了。
+    const status = (e as { response?: { status?: number } })?.response?.status;
+    showToast(
+      status === 409
+        ? "上一轮回答仍在生成，请等它结束后再编辑"
+        : "同步会话历史失败，请稍后重试",
+      "error",
+    );
     return false;
   }
 };
@@ -9689,6 +9832,25 @@ const applyInitConfigPayload = (data: Record<string, any>) => {
  * 直接把排查方向带偏。
  */
 const ticketExchangeFailureReason = ref<"" | "origin_not_allowed" | "ticket_invalid">("");
+const lastHostMessageOrigin = ref("");
+
+/** 解析当前挂件的真实宿主来源，用于 Ticket 兑换时进行白名单防盗链校验。 */
+const resolveCurrentHostOrigin = (explicitOrigin?: string): string => {
+  const explicit = parseOrigin(explicitOrigin || "");
+  if (explicit) return explicit;
+  if (lastHostMessageOrigin.value) {
+    const fromMsg = parseOrigin(lastHostMessageOrigin.value);
+    if (fromMsg) return fromMsg;
+  }
+  if (typeof document !== "undefined" && document.referrer) {
+    const fromReferrer = parseOrigin(document.referrer);
+    if (fromReferrer) return fromReferrer;
+  }
+  if (typeof window !== "undefined" && window.location?.origin) {
+    return parseOrigin(window.location.origin);
+  }
+  return "";
+};
 
 /** 把 ticket 兑换的失败原因映射为界面/宿主可区分的失败原因。
  *
@@ -9699,10 +9861,15 @@ const resolveTicketFailureReason = (): AuthFailureReason =>
     ? "origin_not_allowed"
     : "invalid_ticket";
 
-const exchangeTicketAndApply = async (ticket: string): Promise<boolean> => {
+const exchangeTicketAndApply = async (ticket: string, hostOrigin?: string): Promise<boolean> => {
   ticketExchangeFailureReason.value = "";
   try {
-    const res = await axios.post("/api/v1/embed/tickets/exchange", { ticket: ticket.trim() });
+    const resolvedOrigin = resolveCurrentHostOrigin(hostOrigin);
+    const payload: { ticket: string; host_origin?: string } = { ticket: ticket.trim() };
+    if (resolvedOrigin) {
+      payload.host_origin = resolvedOrigin;
+    }
+    const res = await axios.post("/api/v1/embed/tickets/exchange", payload);
     if (res.data && res.data.code === 200 && res.data.data?.session_token) {
       const sessionData = res.data.data;
       // 走统一入口：既设置内存中的 config.token 与 axios 默认头，也把会话令牌持久化到
@@ -9746,14 +9913,14 @@ const exchangeTicketAndApply = async (ticket: string): Promise<boolean> => {
  */
 const inflightTicketExchanges = new Map<string, Promise<boolean>>();
 const consumedTicketValues = new Set<string>();
-const exchangeTicketOnce = (ticket: string): Promise<boolean> => {
+const exchangeTicketOnce = (ticket: string, hostOrigin?: string): Promise<boolean> => {
   const key = (ticket || "").trim();
   if (!key) return Promise.resolve(false);
   if (consumedTicketValues.has(key)) return Promise.resolve(true);
   const existing = inflightTicketExchanges.get(key);
   if (existing) return existing;
 
-  const pending = exchangeTicketAndApply(key)
+  const pending = exchangeTicketAndApply(key, hostOrigin)
     .then((ok) => {
       if (ok) consumedTicketValues.add(key);
       return ok;
@@ -9817,7 +9984,7 @@ const applyHostInitConfig = async (data: Record<string, any>) => {
 
   // 1. 优先使用临时 Ticket 换票
   if (data.ticket) {
-    const ticketOk = await exchangeTicketOnce(String(data.ticket));
+    const ticketOk = await exchangeTicketOnce(String(data.ticket), lastHostMessageOrigin.value);
     if (!ticketOk) {
       authFailureReason.value = resolveTicketFailureReason();
       hasPermission.value = false;
@@ -9875,13 +10042,16 @@ const applyHostInitConfig = async (data: Record<string, any>) => {
   hasPermission.value = true;
   applyInitConfigPayload(data);
   postInitSuccess();
-  initChat();
+  await initChat();
 };
 const handlePostMessage = (event: MessageEvent) => {
   // 来源校验必须早于任何字段读取：这条消息可能带着 token / ticket / business_context。
   if (!isTrustedHostMessage(event)) {
     console.warn("[Embed] 已忽略不可信来源的 postMessage:", event.origin);
     return;
+  }
+  if (event.origin) {
+    lastHostMessageOrigin.value = event.origin;
   }
   const data = event.data;
   if (!data || typeof data !== "object") return;
@@ -9980,7 +10150,7 @@ const resetSession = async (newToken?: string, ticket?: string) => {
   config.enableGrounding = false; // 新会话恢复默认关闭
   generateNewConversation();
   if (ticket) {
-    const ticketOk = await exchangeTicketOnce(ticket);
+    const ticketOk = await exchangeTicketOnce(ticket, lastHostMessageOrigin.value);
     if (!ticketOk) {
       authFailureReason.value = resolveTicketFailureReason();
       hasPermission.value = false;
@@ -11634,6 +11804,7 @@ const {
   documentRecommendations,
   toggleDatasetPinned,
   fetchDatasetDocuments,
+  loadMoreDatasetDocuments,
   fetchDocumentRecommendations,
   fetchDatasets,
   fetchRecommendations,
@@ -11943,6 +12114,10 @@ const addEmbedLogFromStream = (msg: Message, data: any) => {
       model: data.model ?? currentLog.model,
       temperature: data.temperature ?? currentLog.temperature,
       tool_result_state: data.tool_result_state ?? currentLog.tool_result_state,
+      // 降级路径（buildLegacyProcessTimeline 读 msg.logs）也要拿到这条调用的真实超时，
+      // 少了它只剩版本级快照，工具级收紧在界面上就看不出来。
+      timeout_seconds:
+        (data.timeout_seconds as number | undefined) ?? currentLog.timeout_seconds,
       file_metadata: data.file_metadata ?? currentLog.file_metadata,
       resolution_status: data.resolution_status ?? currentLog.resolution_status,
       rowFilterApplied: data.row_filter_applied === true || currentLog.rowFilterApplied,
@@ -11990,6 +12165,9 @@ const addEmbedLogFromStream = (msg: Message, data: any) => {
     model: data.model,
     temperature: data.temperature,
     tool_result_state: data.tool_result_state,
+    // 首次推入就是「调用工具」的 pending 态，分母只有这里有；漏写就退回版本级快照
+    timeout_seconds:
+      (data.timeout_seconds as number | undefined) ?? null,
     file_metadata: data.file_metadata,
     resolution_status: data.resolution_status,
     rowFilterApplied: data.row_filter_applied === true,
@@ -12026,6 +12204,10 @@ const applyPermissionStreamEvent = (
   // 里含 run_status 终态帧（后端先发该帧、之后才落库），若重放也调 markOutputCompleted
   // 就会在恢复器启动后 1 秒内把它自断，界面永久停在草稿。
   const replay = options?.replay === true;
+  if (data?.type === "keepalive") {
+    if (!replay) resetStallTimer();
+    return;
+  }
   applyStreamTraceId(msg, data);
   if (data.agent_name && !msg.agentName) msg.agentName = data.agent_name;
   if (data.agent_display_name && !msg.agentDisplayName) msg.agentDisplayName = data.agent_display_name;
@@ -12135,7 +12317,13 @@ const applyPermissionStreamEvent = (
     if (data.prompt_tokens !== undefined) msg.prompt_tokens = data.prompt_tokens;
     if (data.completion_tokens !== undefined) msg.completion_tokens = data.completion_tokens;
     if (data.has_data_output) msg.hasDataOutput = true;
-    if (data.permission_notice) msg.permissionNotice = data.permission_notice;
+    if (data.permission_notice) {
+      msg.permissionNotice = data.permission_notice;
+      if (Array.isArray(data.permission_notice?.omitted_columns)) {
+        msg.omittedColumns = data.permission_notice.omitted_columns;
+      }
+    }
+    if (data.metadata_scope_notice) msg.metadataScopeNotice = data.metadata_scope_notice;
   } else if (data.type === "error") {
     if (msg.pendingPermission) msg.pendingPermission.status = "error";
     msg.isThinking = false;
@@ -12178,9 +12366,12 @@ const submitPendingExternalExecution = async (msg: Message) => {
   }
   streamInFlight = true;
   isProcessing.value = true;
-  // 恢复流没有 AbortSignal：finally 只能复位「自己这一次」的锁态。令牌在此刻自增后，
-  // 只要期间切了会话或被新的流接管，后来者的令牌就不是它，收尾时必须让位——否则会把
-  // 新会话的 streamInFlight 清掉（SSE 与续显再次同写，重复输出借道回归）。
+  // 恢复流绑定当前会话 AbortController（支持主动停止、切会话与卸载取消），同时保留 liveWriterToken 防并发串台。
+  const resumeAbort = new AbortController();
+  if (abortController) {
+    abortController.abort();
+  }
+  abortController = resumeAbort;
   const resumeToken = ++liveWriterToken;
   msg.isThinking = true;
   startThoughtTimer(msg);
@@ -12195,16 +12386,25 @@ const submitPendingExternalExecution = async (msg: Message) => {
       output: pending.outputDraft || "(empty external result)",
       headers: embedAuthHeaders() || {},
       credentials: "include",
+      signal: resumeAbort.signal,
       onEvent: (data) => {
         applyPermissionStreamEvent(msg, data);
-        // 恢复流没有后台 producer，刷新/断流后只能靠本地快照；按 1.5s 节流把增量落盘。
         maybePersistStreamSnapshot();
       },
     });
   } catch (error: any) {
-    pending.status = "error";
-    msg.content += `\n[外部执行恢复失败: ${error.message || "Unknown error"}]`;
+    if (error?.name === "AbortError") {
+      if (!embedUnmounted) {
+        msg.content += "\n[已取消提交外部执行结果]";
+      }
+    } else {
+      pending.status = "error";
+      msg.content += `\n[外部执行恢复失败: ${error.message || "Unknown error"}]`;
+    }
   } finally {
+    if (abortController === resumeAbort) {
+      abortController = null;
+    }
     pending.isSubmitting = false;
     // 刻意**不**在这里 finishRecoveredTurn：恢复流没有后台 producer，客户端读流中断时
     // 后端可能既不落库也不写审计，提前清快照会让这一轮在刷新后永久消失。收尾统一交给
@@ -12348,9 +12548,12 @@ const confirmPendingPermission = async (
   }
   streamInFlight = true;
   isProcessing.value = true;
-  // 恢复流没有 AbortSignal：finally 只能复位「自己这一次」的锁态。令牌在此刻自增后，
-  // 只要期间切了会话或被新的流接管，后来者的令牌就不是它，收尾时必须让位——否则会把
-  // 新会话的 streamInFlight 清掉（SSE 与续显再次同写，重复输出借道回归）。
+  // 恢复流绑定当前会话 AbortController（支持主动停止、切会话与卸载取消），同时保留 liveWriterToken 防并发串台。
+  const resumeAbort = new AbortController();
+  if (abortController) {
+    abortController.abort();
+  }
+  abortController = resumeAbort;
   const resumeToken = ++liveWriterToken;
   if (confirmed) {
     msg.isThinking = true;
@@ -12368,6 +12571,7 @@ const confirmPendingPermission = async (
         ...(embedAuthHeaders() || {}),
       },
       body: JSON.stringify({ confirmed, scope }),
+      signal: resumeAbort.signal,
       credentials: "include",
     });
     if (!response.ok) throw new Error(await parseFetchErrorMessage(response));
@@ -12391,9 +12595,12 @@ const confirmPendingPermission = async (
           isPermissionStreamDone = true;
           break;
         }
-        applyPermissionStreamEvent(msg, JSON.parse(dataStr));
-        // 恢复流没有后台 producer，刷新/断流后只能靠本地快照；按 1.5s 节流把增量落盘。
-        maybePersistStreamSnapshot();
+        try {
+          applyPermissionStreamEvent(msg, JSON.parse(dataStr));
+          maybePersistStreamSnapshot();
+        } catch (parseErr) {
+          console.warn("Failed to parse permission SSE event:", dataStr, parseErr);
+        }
       }
       scrollToBottom();
       if (isPermissionStreamDone) {
@@ -12407,13 +12614,26 @@ const confirmPendingPermission = async (
     }
     for (const dataStr of parser.flush()) {
       if (dataStr === "[DONE]") continue;
-      applyPermissionStreamEvent(msg, JSON.parse(dataStr));
-      maybePersistStreamSnapshot();
+      try {
+        applyPermissionStreamEvent(msg, JSON.parse(dataStr));
+        maybePersistStreamSnapshot();
+      } catch (parseErr) {
+        console.warn("Failed to parse final permission SSE event:", dataStr, parseErr);
+      }
     }
   } catch (error: any) {
-    pending.status = "error";
-    msg.content += `\n[工具确认失败: ${error.message || "Unknown error"}]`;
+    if (error?.name === "AbortError") {
+      if (!embedUnmounted) {
+        msg.content += "\n[已终止工具确认流]";
+      }
+    } else {
+      pending.status = "error";
+      msg.content += `\n[工具确认失败: ${error.message || "Unknown error"}]`;
+    }
   } finally {
+    if (abortController === resumeAbort) {
+      abortController = null;
+    }
     pending.isSubmitting = false;
     // 与外部执行恢复同理：不在这里 finishRecoveredTurn，收尾交给落库终态同步。
     if (liveWriterToken === resumeToken) {
@@ -12895,6 +13115,7 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
     const sseLineParser = createSseLineParser();
 
     let isChatStreamDone = false;
+    let receivedDuplicateRequest = false;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -12933,6 +13154,7 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
           if (handleBufferedBodyEvent(data)) {
             // 已进入正文缓冲。
           } else if (data.type === "duplicate_request") {
+            receivedDuplicateRequest = true;
             flushContentBuffer();
             agentMsg.value.isThinking = false;
             (agentMsg.value as any).status = "duplicate_request";
@@ -13034,6 +13256,9 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
             if (data.permission_notice) {
               agentMsg.value.permissionNotice = data.permission_notice;
             }
+            if (data.metadata_scope_notice) {
+              agentMsg.value.metadataScopeNotice = data.metadata_scope_notice;
+            }
             if (data.ltm_applied && data.ltm_data) {
               if (!ltmAlertedInSession.value) {
                 activeLtmPreference.value = data.ltm_data;
@@ -13107,12 +13332,15 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
     // 误判为断线在途——既误弹恢复提示，又白拉一次事件日志。
     // 收尾副作用限定在本轮自己的会话：切走后草稿槽已被换绑，此刻再落定时间线会落到
     // 当前会话的消息上（`currentStreamAgentMessage` 的兜底是「列表最后一条」）。
-    if (conversationId.value === streamConversationId) {
-      activeStreamDraft = null;
-      // 本轮的输出已经完整落到界面，恢复卡片转入完成态。
-      recoveryCardTerminalApplied.value = true;
-      settleRecoveredTimeline();
-      clearStreamReplayTimer();
+    // 收到 duplicate_request 仅代表本次并发请求被拒，原有后台任务仍在运行，不可提前清草稿与续显计时器。
+    if (!receivedDuplicateRequest) {
+      if (conversationId.value === streamConversationId) {
+        activeStreamDraft = null;
+        // 本轮的输出已经完整落到界面，恢复卡片转入完成态。
+        recoveryCardTerminalApplied.value = true;
+        settleRecoveredTimeline();
+        clearStreamReplayTimer();
+      }
     }
   } catch (e: any) {
     flushContentBuffer();
@@ -13454,6 +13682,13 @@ onMounted(() => {
   }
   const savedExpandThoughts = readConfigValue("yovole_expand_thoughts");
   if (savedExpandThoughts !== null) config.expandThoughts = savedExpandThoughts === "1";
+  // 老用户只存过布尔的 expandThoughts：按 normalize 映射成三档，不硬塞一个默认值。
+  const savedDensity = readConfigValue("yovole_reasoning_density");
+  config.reasoningDensity = normalizeReasoningDensity(
+    savedDensity ?? (savedExpandThoughts === null ? null : savedExpandThoughts === "1"),
+  );
+  // 同 ChatSettings：只有「关闭」档收起整条链路，其余三档保持展开。
+  config.expandThoughts = config.reasoningDensity !== "off";
   const savedGroundingBlockMode = readConfigValue("yovole_grounding_block_mode");
   if (savedGroundingBlockMode === "strict_buffer" || savedGroundingBlockMode === "stream_with_retraction") {
     config.groundingBlockMode = savedGroundingBlockMode;

@@ -69,14 +69,11 @@
           </span>
         </button>
 
-        <!-- 界面模式：两枚胶囊，选中态打勾；这是本菜单的核心，放第一屏 -->
+        <!-- 界面模式：两枚胶囊常显。被角色禁用的那枚置灰不可点——直接藏起来会让用户
+             以为平台没有这个模式，也找不到该找谁。 -->
         <div class="px-1 pb-1 pt-0.5">
-          <div class="flex items-center justify-between px-1.5 pb-1.5">
+          <div class="flex items-center px-1.5 pb-1.5">
             <span class="text-[10.5px] font-medium tracking-wide" :class="mutedClass">界面模式</span>
-            <span
-              class="rounded-full px-1.5 py-0.5 text-[9.5px] font-semibold"
-              :class="lightTheme ? 'bg-primary/10 text-primary' : 'bg-primary/20 text-blue-300'"
-            >一步切换</span>
           </div>
           <div class="grid grid-cols-2 gap-1.5">
             <button
@@ -85,16 +82,11 @@
               type="button"
               role="menuitemradio"
               :aria-checked="mode === option.value"
-              class="relative flex flex-col gap-0.5 rounded-[11px] border px-2.5 py-2 text-left transition-colors"
-              :class="[
-                mode === option.value
-                  ? lightTheme
-                    ? 'border-primary/40 bg-primary/[0.08]'
-                    : 'border-primary/45 bg-primary/15'
-                  : lightTheme
-                    ? 'border-gray-200 hover:bg-gray-50'
-                    : 'border-white/10 hover:bg-white/[0.05]',
-              ]"
+              :aria-disabled="isModeAllowed(option.value) ? undefined : 'true'"
+              :disabled="!isModeAllowed(option.value)"
+              :title="isModeAllowed(option.value) ? undefined : modeBlockedReason"
+              class="relative"
+              :class="modeCardClass(option.value)"
               @click="emit('switch-mode', option.value)"
             >
               <span class="flex items-center gap-1.5 text-[12.5px] font-semibold" :class="lightTheme ? 'text-gray-900' : 'text-slate-100'">
@@ -104,13 +96,25 @@
                 {{ option.label }}
               </span>
               <span class="text-[10.5px] leading-tight" :class="mutedClass">{{ option.desc }}</span>
+              <!-- 当前模式：打勾；被禁用：挂锁，鼠标悬停看原因 -->
               <span
-                v-if="mode === option.value"
+                v-if="mode === option.value && isModeAllowed(option.value)"
                 class="absolute right-1.5 top-1.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-primary text-white"
                 aria-hidden="true"
               >
                 <svg class="h-2 w-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5">
                   <path stroke-linecap="round" stroke-linejoin="round" d="M20 6L9 17l-5-5" />
+                </svg>
+              </span>
+              <span
+                v-else-if="!isModeAllowed(option.value)"
+                class="absolute right-1.5 top-1.5 flex h-3.5 w-3.5 items-center justify-center"
+                :class="lightTheme ? 'text-gray-400' : 'text-slate-500'"
+                aria-hidden="true"
+              >
+                <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="4" y="10" width="16" height="10" rx="2" />
+                  <path d="M8 10V7a4 4 0 018 0v3" />
                 </svg>
               </span>
             </button>
@@ -130,6 +134,12 @@
             <svg class="h-[17px] w-[17px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" :class="iconClass"><path d="M12 3l7 3v6c0 4.4-3 7.6-7 9-4-1.4-7-4.6-7-9V6z" /><path d="M9 12l2 2 4-4" /></svg>
             我的权限
             <span class="ml-auto text-[11px]" :class="mutedClass">菜单与功能</span>
+            <Chevron />
+          </button>
+          <button type="button" role="menuitem" class="account-menu-item" :class="itemClass" @click="go('/dashboard/personal?tab=secrets')">
+            <svg class="h-[17px] w-[17px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" :class="iconClass"><rect x="4" y="10.5" width="16" height="9.5" rx="2.2" /><path d="M8 10.5V7.2a4 4 0 018 0v3.3" /><path d="M12 14.4v2.2" /></svg>
+            我的凭据
+            <span class="ml-auto text-[11px]" :class="mutedClass">密钥与令牌</span>
             <Chevron />
           </button>
           <button type="button" role="menuitem" class="account-menu-item" :class="itemClass" @click="go('/dashboard/personal?tab=tokens')">
@@ -210,7 +220,15 @@
               class="mt-0.5 inline-block font-medium underline underline-offset-2"
               :class="lightTheme ? 'text-primary' : 'text-blue-300'"
             >代码仓库</a>
-            <p class="mt-0.5 opacity-80">更新日志：后续版本提供。</p>
+            <p v-if="repoUrl" class="mt-0.5">
+              <a
+                :href="changelogUrl"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="font-medium underline underline-offset-2"
+                :class="lightTheme ? 'text-primary' : 'text-blue-300'"
+              >更新日志：{{ changelogLabel }} ↗</a>
+            </p>
           </div>
         </div>
 
@@ -256,9 +274,15 @@ const props = withDefaults(defineProps<{
   version: string
   repoUrl?: string
   mobile?: boolean
+  // 角色级黑名单：被禁用的模式进不来。默认两种都能用
+  allowedModes?: Array<"user" | "pro">
+  // 禁用来源角色名，用于说明「是谁固定的」
+  blockedBy?: string[]
 }>(), {
   repoUrl: "",
   mobile: false,
+  allowedModes: () => ["user", "pro"],
+  blockedBy: () => [],
 })
 
 const emit = defineEmits<{
@@ -279,6 +303,38 @@ const roleLabel = computed(() =>
   String(props.role || "").toLowerCase() === "admin" ? "管理员" : "普通用户",
 )
 
+/**
+ * 「更新日志」指向 GitHub Releases。
+ *
+ * 版本号是四段（1.0.22.0），最后一段是构建号，而 Release tag 只到三段（1.0.22）——
+ * 取错段会拼出 /releases/tag/1.0 这种必然 404 的地址。
+ *
+ * 开发版（dev）与残缺版本号没有对应的 tag，但不该因此把入口藏起来：落到 Releases
+ * 列表页，想看日志的人照样能找到路。用 repoUrl 拼接而不是硬编码 GitHub 前缀，
+ * 白标部署换了仓库地址也能跟着走。
+ */
+const changelogTag = computed(() => {
+  const raw = String(props.version || "").trim().replace(/^v/i, "")
+  if (!raw || /^dev/i.test(raw)) return ""
+  const parts = raw.split(".")
+  if (parts.length < 2) return ""
+  const core = parts.length > 3 ? parts.slice(0, 3) : parts
+  if (!core.every((part) => /^\d+$/.test(part))) return ""
+  return core.join(".")
+})
+const changelogLabel = computed(() => (changelogTag.value ? `v${changelogTag.value}` : "查看全部版本"))
+const changelogUrl = computed(() => {
+  if (!props.repoUrl) return ""
+  const base = props.repoUrl.replace(/\/+$/, "")
+  return changelogTag.value ? `${base}/releases/tag/${changelogTag.value}` : `${base}/releases`
+})
+
+/** 当前账号能用的模式；字段缺失时按「两种都能用」兜底（旧登录快照） */
+const usableModes = computed<Array<"user" | "pro">>(() =>
+  props.allowedModes.length > 0 ? props.allowedModes : ["user", "pro"],
+)
+const isModeAllowed = (value: "user" | "pro") => usableModes.value.includes(value)
+
 const modeOptions: Array<{ value: "user" | "pro"; label: string; desc: string; icon: string[] }> = [
   {
     value: "user",
@@ -298,6 +354,30 @@ const modeOptions: Array<{ value: "user" | "pro"; label: string; desc: string; i
     icon: ["M3 5h18v14H3z", "M3 9.5h18", "M9 9.5V19"],
   },
 ]
+
+/** 被禁用时的悬停说明：讲清「谁关的、找谁开」，不占菜单版面 */
+const modeBlockedReason = computed(() => {
+  const who = props.blockedBy.length ? `角色「${props.blockedBy[0]}」` : "管理员统一设置"
+  return `由${who}关闭，需要恢复请联系管理员`
+})
+
+/** 卡片三态：可用 / 当前选中 / 被禁用；禁用态用虚线框 + 降透明，且不再响应 hover */
+const modeCardClass = (value: "user" | "pro"): string => {
+  const base = "flex flex-col gap-0.5 rounded-[11px] border px-2.5 py-2 text-left transition-colors"
+  if (!isModeAllowed(value)) {
+    return `${base} cursor-not-allowed border-dashed opacity-[0.55] ${
+      props.lightTheme ? "border-gray-200 bg-gray-50/60" : "border-white/[0.08] bg-white/[0.02]"
+    }`
+  }
+  if (props.mode === value) {
+    return `${base} ${
+      props.lightTheme ? "border-primary/40 bg-primary/[0.08]" : "border-primary/45 bg-primary/15"
+    }`
+  }
+  return `${base} ${
+    props.lightTheme ? "border-gray-200 hover:bg-gray-50" : "border-white/10 hover:bg-white/[0.05]"
+  }`
+}
 
 const themeOptions: Array<{ value: "light" | "dark"; label: string; icon: string[] }> = [
   {

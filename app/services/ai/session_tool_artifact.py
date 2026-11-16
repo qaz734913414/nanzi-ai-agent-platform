@@ -53,6 +53,10 @@ REUSABLE_RESULT_ACQUISITION_TOOLS = frozenset(
     }
 )
 
+# 「把停下来的子代理接着跑完」的工具。它们跟事实获取工具不同：不重查数据，
+# 而是唤醒上一轮被 ask_user_question 暂停的子代理。系统回执场景必须保留。
+RESUME_CAPABLE_TOOLS = frozenset({"sub_agent_call", "sub_agent_batch_call"})
+
 # 不参与快照：时钟、检索碎片、ChatBI 专用、纯编排、知识库（有独立短路）
 _EXCLUDED_TOOL_NAMES = frozenset(
     {
@@ -92,6 +96,21 @@ _WEAK_CONTEXT_REF = re.compile(
     r"(这个|这些|这份|上面|上述|刚才|刚刚|之前|上一|前述|同样|继续|that|this|above|previous)",
     re.I,
 )
+
+#: 结果指代：弱指代必须和它同时出现才算「就着上一轮结果追问」。
+#: 只靠弱指代太宽：「把这个链接的内容总结一下 https://…」「这份 PDF 里的条款有什么
+#: 风险」里的「这个 / 这份」指向的是**新证据**，不是上一轮结果。``_has_reuse_intent``
+#: （reusable_result.py）用的是同一套共现条件，两处必须同口径。
+_RESULT_REFERENCE = re.compile(
+    r"(结果|数据|回复|内容|报告|快照|result|data|response|report|snapshot)",
+    re.IGNORECASE,
+)
+
+#: 句子里带链接意味着要新抓取——哪怕同时提到「内容/总结」，也不是复用旧结果。
+_NEW_SOURCE_URL = re.compile(r"https?://", re.IGNORECASE)
+
+#: 以「继续 / 接着」开头本身就是「把上一轮的动作做下去」，不需要结果指代配对。
+_LEADING_CONTINUE = re.compile(r"^\s*(继续|接着|再接着|continue\b|go\s+on\b)", re.IGNORECASE)
 
 
 def _normalize_tool_output(tool_output: Any) -> tuple[str, Any]:
@@ -261,6 +280,32 @@ def consider_turn_artifact_candidate(
         turn_state["best"] = payload
 
 
+def is_system_receipt_message(text: str | None) -> bool:
+    """是否为系统注入的回执：提问卡回答、业务确认卡的确定或取消。
+
+    这些消息都带「……继续……」字样，语义却是「把暂停的流程做完」，与「就着上一轮
+    结果追问」正相反。判定集中在这里，避免提示词侧与运行时侧各写一份而漂移。
+    """
+    from app.services.ai.business_confirmation import (
+        is_business_confirmation_receipt_message,
+    )
+    from app.services.ai.user_question import is_user_question_receipt_message
+
+    return is_user_question_receipt_message(text) or (
+        is_business_confirmation_receipt_message(text)
+    )
+
+
+def _receipt_supplementary_text(text: str | None) -> str:
+    """取提问回执里用户亲手写的「补充说明」，业务确认回执没有这一项。"""
+    from app.services.ai.user_question import parse_user_question_receipt
+
+    receipt = parse_user_question_receipt(text)
+    if not receipt:
+        return ""
+    return str(receipt.get("custom_input") or "").strip()
+
+
 def should_inject_session_artifact(
     user_question: str,
     artifact: Dict[str, Any] | None,
@@ -275,6 +320,22 @@ def should_inject_session_artifact(
     has_structured = bool(artifact.get("structured"))
     if not has_text and not has_structured:
         return False
+    # 系统回执必须优先于「复用结果」：它是把被暂停的流程接着做完，而不是就着上一轮
+    # 结果追问。提问卡回执的固定尾句「请根据以上用户回答继续处理原问题」、业务确认卡
+    # 的「请根据以下已确认字段继续执行」里的「继续」都会命中下面的弱上下文引用判定；
+    # 一旦判成复用模式，sub_agent_call 会被 REUSABLE_RESULT_ACQUISITION_TOOLS 整类
+    # 移除，主助手再也无法用 resume=True 恢复那个停下来的子代理——用户看到的是
+    # 「我当前工具集中没有 sub_agent_call」。
+    if is_system_receipt_message(user_question):
+        # 回执本身要豁免，但用户在「补充说明」里可能顺手追加新诉求
+        # （「顺便把刚才结果画成柱状图」）。那部分仍算对旧结果的追问，不能一起豁免，
+        # 否则该裁不裁，模型会重新查一遍数据来画图。
+        extra = _receipt_supplementary_text(user_question)
+        if extra and (
+            looks_like_pure_result_followup(extra) or looks_like_context_action(extra)
+        ):
+            return True
+        return False
     if force_reuse:
         return True
     q = str(user_question or "").strip()
@@ -283,11 +344,17 @@ def should_inject_session_artifact(
     if CLICKED_REPLY_MARKER.lower() in q.lower():
         # 客户端附带的旧回复可能自己提到“最新数据”，只能检查按钮动作文本。
         return not _FRESH_DATA_PATTERN.search(extract_reusable_action_query(q))
-    if _FRESH_DATA_PATTERN.search(q):
+    if _FRESH_DATA_PATTERN.search(q) or _NEW_SOURCE_URL.search(q):
         return False
     if looks_like_pure_result_followup(q) or looks_like_context_action(q):
         return True
-    if _WEAK_CONTEXT_REF.search(q) and not looks_like_strong_business_data_request(q):
+    if _LEADING_CONTINUE.search(q):
+        return True
+    if (
+        _WEAK_CONTEXT_REF.search(q)
+        and _RESULT_REFERENCE.search(q)
+        and not looks_like_strong_business_data_request(q)
+    ):
         return True
     return False
 
@@ -401,6 +468,38 @@ def append_session_tool_artifact_to_system_prompt(
     return str(system_content or "")
 
 
+def reusable_result_removal_names(
+    user_question: str | None,
+    artifact: Dict[str, Any] | None,
+    *,
+    force_reuse: bool = False,
+) -> frozenset[str]:
+    """本轮应当从工具清单里移除的工具名。**提示词与运行时共用这一处判定。**
+
+    两边各写一套的下场是：提示词列着 ``sub_agent_call``，运行时却把它拔掉，
+    模型只会回一句「我当前工具集中没有 sub_agent_call」，用户看到的是续聊失败。
+    """
+    if is_system_receipt_message(user_question):
+        # 回执 = 把被暂停的流程接着做完，本身要豁免（否则 resume 工具没了）。
+        # 只有补充说明里追加了新诉求（「顺便画个图」）才裁，且只裁事实获取工具：
+        # sub_agent_call 是唤醒子代理的唯一途径，裁掉它父代理再也 resume 不了。
+        if not should_inject_session_artifact(
+            user_question, artifact, force_reuse=force_reuse
+        ):
+            return frozenset()
+        return REUSABLE_RESULT_ACQUISITION_TOOLS - RESUME_CAPABLE_TOOLS
+
+    # 非回执：force_reuse 是上层已经定好的「本轮就吃上一轮结果」，即使没有快照
+    # 也要裁 —— should_inject_session_artifact 在没有 artifact 时直接返回 False，
+    # 不能用它代替这个短路。
+    if force_reuse or should_inject_session_artifact(
+        user_question, artifact, force_reuse=force_reuse
+    ):
+        return REUSABLE_RESULT_ACQUISITION_TOOLS
+
+    return frozenset()
+
+
 def filter_tools_for_reusable_result(
     tools: list[Any],
     *,
@@ -408,19 +507,23 @@ def filter_tools_for_reusable_result(
     artifact: Dict[str, Any] | None,
     force_reuse: bool = False,
 ) -> list[Any]:
-    """命中可复用快照时移除事实获取工具，避免模型再次执行原查询。"""
-    if not should_inject_session_artifact(
+    """命中可复用快照时移除事实获取工具，避免模型再次执行原查询。
+
+    移除哪些由 :func:`reusable_result_removal_names` 决定，与提示词侧同源。
+    """
+    removal = reusable_result_removal_names(
         user_question,
         artifact,
         force_reuse=force_reuse,
-    ):
+    )
+    if not removal:
         return tools
     filtered = []
     for tool in tools or []:
         name = str(getattr(tool, "name", None) or getattr(tool, "tool_name", None) or "")
         if isinstance(tool, dict):
             name = str(tool.get("name") or tool.get("tool_name") or name)
-        if name in REUSABLE_RESULT_ACQUISITION_TOOLS:
+        if name in removal:
             continue
         filtered.append(tool)
     return filtered

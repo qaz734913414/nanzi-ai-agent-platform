@@ -6,6 +6,8 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+from app.utils.group_name import GROUP_NAME_MAX_LEN, normalize_group_name
+
 logger = logging.getLogger(__name__)
 
 USER_MESSAGE_CONTEXT_DIVIDER = "\n\n---\n\n"
@@ -36,67 +38,226 @@ def is_skill_enabled(meta: Optional[Dict[str, Any]], default: bool = True) -> bo
     return str(raw).strip().lower() in _TRUTHY_FLAGS
 
 
-def parse_skill_frontmatter(skill_id: str, skill_md_path: str) -> Dict[str, str]:
-    """从 SKILL.md 顶部 YAML Frontmatter 提取 name / description 等元数据。"""
-    meta: Dict[str, str] = {"id": skill_id, "name": skill_id, "description": "", "enabled": "true"}
-    if not os.path.exists(skill_md_path):
-        return meta
-    try:
-        with open(skill_md_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read(8192)
-        # 容忍 UTF-8 BOM：zip 导入不会剥掉它，而 ^--- 匹配不到 BOM 开头的文件，会让
-        # enabled 静默回落成 "true"（技能永远显示启用）。
-        content = content.lstrip("\ufeff")
-        match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
-        if match:
-            for line in match.group(1).splitlines():
-                if ":" in line:
-                    key, value = line.split(":", 1)
-                    meta[key.strip().lower()] = value.strip().strip('"').strip("'")
-    except Exception:
-        pass
+#: SKILL.md 顶部 YAML Frontmatter 的**唯一**匹配口径（解析与改写共用）。
+#:
+#: 必须容忍两种尾部写法，否则「文件看起来有 frontmatter，但平台认不出来」：
+#:
+#: * 闭合分隔符后还有正文（常规写法）；
+#: * 闭合分隔符就是文件结尾、后面没有换行——手写 SKILL.md 的常见形态。旧正则要求
+#:   闭合符后必须跟着换行，于是这类文件被当成「没有 frontmatter」：列表里按
+#:   ``enabled: true`` 显示、点「禁用」却返回 400，永远禁不掉。
+_FRONTMATTER_RE = re.compile(
+    r"^---[ \t]*\r?\n(.*?)(?:\r?\n)?---[ \t]*(?:\r?\n|$)",
+    re.DOTALL,
+)
+
+#: 需要对 frontmatter **原文/偏移量**做改写（而不是只读字段）的调用方复用它，
+#: 别各自再抄一份正则——抄出来的每一份都曾把「闭合符在文件末尾」判成「没有 frontmatter」。
+SKILL_FRONTMATTER_PATTERN = _FRONTMATTER_RE
+
+
+def parse_skill_frontmatter_text(skill_id: str, content: str) -> Dict[str, str]:
+    """从 SKILL.md **文本**解析 frontmatter（与 :func:`parse_skill_frontmatter` 同一口径）。
+
+    单独暴露出来是给「内容已读进内存」的调用方用（沙箱预铺、收录前检查、发布快照预览）：
+    它们此前各自复制了一份更严格的正则，于是同一条 SKILL.md 在平台解析里「有 frontmatter」、
+    在预铺里却「缺 name/description」被丢弃。
+    """
+    meta: Dict[str, str] = {
+        "id": skill_id,
+        "name": skill_id,
+        "description": "",
+        "enabled": "true",
+    }
+    text = str(content or "").lstrip("\ufeff")
+    match = _FRONTMATTER_RE.match(text)
+    if match:
+        for line in match.group(1).splitlines():
+            if ":" in line:
+                key, value = line.split(":", 1)
+                meta[key.strip().lower()] = value.strip().strip('"').strip("'")
     if "enabled" not in meta:
         meta["enabled"] = "true"
     return meta
 
 
+def parse_skill_frontmatter(skill_id: str, skill_md_path: str) -> Dict[str, str]:
+    """从 SKILL.md 顶部 YAML Frontmatter 提取 name / description 等元数据。"""
+    if not os.path.exists(skill_md_path):
+        return parse_skill_frontmatter_text(skill_id, "")
+    try:
+        with open(skill_md_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read(8192)
+        return parse_skill_frontmatter_text(skill_id, content)
+    except Exception:
+        return parse_skill_frontmatter_text(skill_id, "")
+
+
 def toggle_skill_enabled_in_file(skill_md_path: str, enabled: bool) -> bool:
-    """在 SKILL.md 的 YAML Frontmatter 中修改或插入 enabled 状态。"""
+    """在 SKILL.md 的 YAML Frontmatter 中修改或插入 enabled 状态。
+
+    没有 frontmatter 时**补一份**而不是失败：``parse_skill_frontmatter`` 在所有情况下
+    都给出 ``enabled``（缺省 ``"true"``），也就是说第三方导入 / 手写的纯 Markdown 技能
+    在列表里就是「已启用」。旧实现在这里返回 ``False``，调用方只能报 400，于是那种技能
+    **永远禁不掉**——列表说启用、按钮点不动，且没有任何别的入口能改。
+    """
     if not os.path.exists(skill_md_path):
         return False
     try:
         with open(skill_md_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
-        # 与 parse_skill_frontmatter 同样的 BOM 容忍：这里若匹配不到 frontmatter 会
-        # 直接 return False，调用方（toggle 端点）就把「禁不掉」报成 500。
+        # 与 parse_skill_frontmatter 同样的 BOM 容忍：BOM 留在原处会让 ^--- 匹配失败，
+        # 从而把「有 frontmatter」误判成「没有」并再补一份重复的块。
         content = content.lstrip("\ufeff")
+        enabled_line = f"enabled: {str(bool(enabled)).lower()}"
 
-        match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+        match = _FRONTMATTER_RE.match(content)
         if match:
             yaml_block = match.group(1)
             rest_content = content[match.end():]
-            
+
             new_lines = []
             has_enabled = False
             for line in yaml_block.splitlines():
                 if line.strip().lower().startswith("enabled:"):
-                    new_lines.append(f"enabled: {str(enabled).lower()}")
+                    new_lines.append(enabled_line)
                     has_enabled = True
                 else:
                     new_lines.append(line)
-            
+
             if not has_enabled:
-                new_lines.append(f"enabled: {str(enabled).lower()}")
-                
+                new_lines.append(enabled_line)
+
             new_yaml_block = "\n".join(new_lines)
             new_content = f"---\n{new_yaml_block}\n---\n{rest_content}"
-            
-            with open(skill_md_path, "w", encoding="utf-8") as f:
-                f.write(new_content)
-            return True
+        else:
+            # 纯 Markdown / 无 frontmatter：整份正文原样保留，只补一个最小 frontmatter。
+            body = content.lstrip("\n")
+            new_content = f"---\n{enabled_line}\n---\n\n{body}"
+
+        with open(skill_md_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        return True
     except Exception:
         pass
     return False
+
+
+#: 业务分组在 SKILL.md frontmatter 里的键名。
+#:
+#: 为什么分组存**文件**而不是建表：技能本体就是目录 + SKILL.md（列表由扫目录解析得出），
+#: 它能被直接编辑、导入导出、分享给同事、发布成平台版本。这些路径都会搬运文件，却不会
+#: 顺带更新数据库——分组一旦落在库里，搬运一次就丢一次，双源必然漂移。写进 frontmatter
+#: 则复制/分享/发布天然带着走，且解析层是通用键值，连迁移都不需要。
+SKILL_GROUP_KEY = "group"
+
+#: 分组名长度上限。与 `meta_datasets.group_name` 的 VARCHAR(64) 对齐，避免同一套「业务
+#: 分组」在两类资源上长度口径不同；frontmatter 本身不限长，超长直接截断而不是报错。
+SKILL_GROUP_MAX_LEN = GROUP_NAME_MAX_LEN
+
+
+def normalize_skill_group(raw: Any) -> Optional[str]:
+    """分组名归一：直接复用 `app/utils/group_name.py` 的同一份实现。
+
+    技能这边只多一层顾虑——换行必须折掉：值会被原样写进 frontmatter，而 frontmatter 是
+    逐行 ``key: value`` 解析的，带换行的值会把后面半行变成新的键，等于把文件写坏。
+    统一实现里 `str.split()` 已经把所有空白（含换行、制表符、连续空格）折成单个空格，
+    比原先只折 ``[\r\n]+`` 更严；否则「研发效能\tA」会带着制表符进页签。
+    """
+    return normalize_group_name(raw)
+
+
+def get_skill_group(meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    """从解析后的 frontmatter 取业务分组（缺失 / 空白 → ``None``）。"""
+    if not meta:
+        return None
+    return normalize_skill_group(meta.get(SKILL_GROUP_KEY))
+
+
+def build_default_skill_md(
+    name: str,
+    description: str,
+    group: Optional[str] = None,
+) -> str:
+    """新建技能时的默认 SKILL.md（平台技能与个人技能**共用这一份**）。
+
+    此前两个接口各拼一份完全相同的字符串，加字段就得改两处、漏一处就是「个人技能能填
+    分组、平台技能填了丢」。分组为空时输出与历史模板逐字一致，不需要回填旧文件。
+    """
+    safe_name = " ".join(str(name or "").split())
+    safe_desc = " ".join(str(description or "").split())
+    lines = [
+        "---",
+        f"name: {safe_name}",
+        f"description: {safe_desc}",
+    ]
+    normalized = normalize_skill_group(group)
+    if normalized:
+        lines.append(f"{SKILL_GROUP_KEY}: {normalized}")
+    lines.extend(
+        [
+            "---",
+            "",
+            f"# {safe_name}",
+            "",
+            "在此处编写该技能的具体战术规范、操作流程与 <HARD-GATE> 红线守则。",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def set_skill_group_in_file(skill_md_path: str, group: Optional[str]) -> bool:
+    """在 SKILL.md 的 frontmatter 里设置（或清除）业务分组，返回是否写成功。
+
+    与 :func:`toggle_skill_enabled_in_file` 同一套做法：只动 frontmatter 里那一行，
+    正文一个字节都不碰。**不做整文件覆盖**——调用方拿着列表数据覆盖 SKILL.md，
+    稍有时序差（期间有人在网页编辑器里改过）就会把用户的正文冲掉。
+
+    ``group`` 传空/空白表示清除该行（回到「未分组」）；文件没有 frontmatter 时按需补一份。
+    """
+    if not os.path.exists(skill_md_path):
+        return False
+    try:
+        with open(skill_md_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        # 与解析侧同样的 BOM 容忍：BOM 留在原处会让 ^--- 匹配失败，从而误判「没有
+        # frontmatter」并再补一份重复的块。
+        content = content.lstrip("\ufeff")
+        normalized = normalize_skill_group(group)
+
+        match = _FRONTMATTER_RE.match(content)
+        if match:
+            yaml_block = match.group(1)
+            rest_content = content[match.end():]
+
+            new_lines: List[str] = []
+            has_group = False
+            for line in yaml_block.splitlines():
+                if line.strip().lower().startswith(f"{SKILL_GROUP_KEY}:"):
+                    has_group = True
+                    if normalized:
+                        new_lines.append(f"{SKILL_GROUP_KEY}: {normalized}")
+                    # 归一为空 = 删除这一行，不写 `group:`（空值会被解析成空串而非缺失）
+                    continue
+                new_lines.append(line)
+
+            if not has_group and normalized:
+                new_lines.append(f"{SKILL_GROUP_KEY}: {normalized}")
+
+            new_content = f"---\n" + "\n".join(new_lines) + f"\n---\n{rest_content}"
+        else:
+            if not normalized:
+                # 没有 frontmatter 也就没有分组可改：直接视为成功，避免前端报「保存失败」
+                return True
+            body = content.lstrip("\n")
+            new_content = f"---\n{SKILL_GROUP_KEY}: {normalized}\n---\n\n{body}"
+
+        with open(skill_md_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        return True
+    except Exception:
+        logger.warning("[SkillGroup] 写入技能分组失败：%s", skill_md_path, exc_info=True)
+        return False
 
 
 def format_skill_meta_text(meta: Dict[str, str]) -> str:

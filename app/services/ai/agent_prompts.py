@@ -225,14 +225,14 @@ class AgentServicePrompts:
     # marker: "has_all" 需工具全部可见才输出；"always" 无条件输出（fetch 未绑定时兜底）。
     # 行顺序即输出顺序，勿随意调整。
     _PLATFORM_KNOWLEDGE_LOOKUP_ROWS: Tuple[Tuple[Tuple[object, str], str], ...] = (
-        (("sub_agent_call", "has_all"), "| 明确需要查询内部业务数据库/结构化指标，或明确需要检索内部知识库/企业文档/制度手册，且你自身没有绑定对应工具时 | **必须调用 sub_agent_call** 委派给相应的子智能体获取结果（严禁编造）；**只能调用「可委派子智能体清单」中列出的标识**，清单外的名字一律不可调用、也不要用相近名字猜测；普通公网信息、编程概念、文本处理、生活常识或仅靠泛化关键词无法确认内部来源的问题，不要委派 |"),
+        (("sub_agent_call", "has_all"), "| 明确需要查询内部业务数据库/结构化指标，或明确需要检索内部知识库/企业文档/制度手册，且你自身没有绑定对应工具时 | **必须调用 sub_agent_call** 委派给相应的子智能体获取结果（严禁编造）；**只能调用「可委派子智能体清单」中列出的标识**，清单外的名字一律不可调用、也不要用相近名字猜测；普通公网信息、编程概念、文本处理、生活常识或仅靠泛化关键词无法确认内部来源的问题，不要委派；需要在该子智能体上一轮结果上追问或补充条件时，用 **sub_agent_call(resume=true)** 复用它的会话，不要重开一轮（重开会让它忘记上一轮查过什么，两次结论口径容易打架） |"),
         (("sub_agent_batch_call", "has_all"), "| 需要同时处理多个彼此独立的内部任务 | 调用 **sub_agent_batch_call** 并行委派，结果按请求顺序返回（每个目标同样受「可委派子智能体清单」约束）；存在前后依赖时改用 **sub_agent_call** 串行委派 |"),
         (("todo_write", "has_all"), "| 请求包含多个执行步骤、多个工具或子代理、明显前后依赖，或需要生成文件 | 先调用 **todo_write** 建立完整任务清单；每完成、失败或取消一个阶段都更新清单；单步问答、单次检索和单次查询不要调用 |"),
         (("__publish__", "special"), "__PUBLISH__"),
         (("memory_search", "has_all"), "| 「今天/上次/最近聊了啥」「回顾历史对话」 | 调用 **memory_search**（scope=summary，query 填关键词；要原文明细再 scope=history + conversation_id） |"),
         (("list_accessible_directories", "has_all"), "| 「我能访问哪些目录」「文件存在哪」「工作区目录结构」「查看可写目录」「查找公共手册/FAQ/文档路径」「文件读写报错排查可用目录与权限」 | 调用 **list_accessible_directories**（获取 docs/、sessions/、uploads/、公共 data/docs/、skills/ 等完整目录清单、权限及推荐用途） |"),
         (("directory_tree_navigator", "has_all"), "| 「列出这个已知目录的文件树」「查看目录下有哪些文件」「按后缀或文件名筛选目录内容」 | 调用 **directory_tree_navigator**（只查看已知目录的树形元数据；不用于查询权限、目录映射或文件内容） |"),
-        (("list_accessible_datasets", "has_all"), "| 「我有哪些数据集」「能查哪些数据」「数据集列表」 | 调用 **list_accessible_datasets**（仅已启用、目录级 id/名称/备注，不含表结构） |"),
+        (("list_accessible_datasets", "has_all"), "| 「我有哪些数据集」「能查哪些数据」「数据集列表」 | 调用 **list_accessible_datasets**（仅已启用、目录级；带 `permission` 摘要——无该字段=无收窄，`tables.visible`<`total`=只授权部分表、`visible=0`=该库无可查表、`row=deny_all`=实际查不到数据要先解释、`expires_at`=到期时间；不含表结构）。数据集多时用 `keyword` 收窄或直接给 `dataset_id`，别整份拉进上下文；`truncated=true` 说明还有未展示条目；`note` 解释了空结果/截断/失效授权（区分「没授权」「授权指向的数据集已删除或停用」「关键字没命中」），**必须转述给用户**，不要笼统答成「你没有数据集」；展示名重复时按 `id` 区分 |"),
         (("list_accessible_knowledge_bases", "has_all"), "| 「我有哪些知识库」「能检索哪些文档库」「知识库列表」 | 调用 **list_accessible_knowledge_bases**（仅目录级信息；正文检索用 search_knowledge_base） |"),
         (("list_available_agents", "has_all"), "| 「我有哪些智能体」「能调用哪些专家」「可用智能体列表」，或准备委派子任务前需确认智能体标识 | 调用 **list_available_agents**：`items` 是当前可直接调用的，`blocked` 是用户有权限但当前不可委派的（带 blocked_reason）；问「我有那些智能体权限」看 `accessible_count` 与 `blocked`，问「我能委派哪些」看 `items` 与 `delegable_count`，两个问题不要混答；`delegation_available=false` 时如实说「当前无法委派」，但**不要**答成「你没有任何智能体」 |"),
         (("get_myinfo", "has_all"), "| 「我的用户信息」「我的部门/角色/权限」「查看我的资料」 | 调用 **get_myinfo**（只读取当前上下文中的本人，不接受 userid 或其他参数） |"),
@@ -250,7 +250,7 @@ class AgentServicePrompts:
         "memory_search": "跨会话摘要/历史对话检索",
         "list_accessible_directories": "列出当前可访问的文件目录清单、读写权限（只读/可写）与推荐用途说明（不确定路径时优先调用）",
         "directory_tree_navigator": "已知目录后列出目录树、文件名和大小（不用于查询权限或路径映射）",
-        "list_accessible_datasets": "列出当前用户有权限且已启用的数据集目录",
+        "list_accessible_datasets": "列出当前用户有权限且已启用的数据集目录（含表/字段/行级收窄与到期摘要；支持 keyword/dataset_id 收窄、limit 上限，note 解释空结果成因）",
         "list_accessible_knowledge_bases": "列出当前用户有权限的知识库目录",
         "list_available_agents": "列出当前用户有权限且可运行的智能体/专家目录",
         "get_myinfo": "读取当前用户本人的基本信息（含邮箱）、扩展信息、详情信息、角色与权限",
@@ -786,10 +786,10 @@ class AgentServicePrompts:
                     if "publish_generated_file" in tool_names:
                         if office_write_tools:
                             table_rows.append(
-                                f"| 用户要求保存、交付、导出或下载已生成文件 | 普通文件工具生成文件后才调用 `publish_generated_file(path=...)`；{office_write_label} 的 `*_write` 已经登记 artifact 并返回 `artifact.download_url`，不要再次调用 publish_generated_file；只有拿到真实 `download_url` 才能向用户提供下载地址 |"
+                                f"| 用户要求保存、交付、导出或下载已生成文件 | 普通文件工具生成文件后才调用 `publish_generated_file(path=...)`；{office_write_label} 的 `*_write` 已经登记 artifact 并返回 `artifact.download_url`，不要再次调用 publish_generated_file；子代理委派产生的产物已自动登记到本会话并在 `deliverables/` 留副本，**不要再次发布**；只有拿到真实 `download_url` 才能向用户提供下载地址 |"
                             )
                         else:
-                            table_rows.append("| 用户要求保存、交付、导出或下载已生成文件 | 文件写入/生成完成后必须调用 **publish_generated_file(path=...)**；只有返回 `status=ok` 且包含 `download_url` 才能声称已生成下载地址；最终必须原样复制 `download_url`，不得返回物理路径或臆造链接 |")
+                            table_rows.append("| 用户要求保存、交付、导出或下载已生成文件 | 文件写入/生成完成后必须调用 **publish_generated_file(path=...)**；只有返回 `status=ok` 且包含 `download_url` 才能声称已生成下载地址；子代理返回值里的 `parent_workspace_path` / `download_url` 已经是本会话可见产物，**不要再次发布**；最终必须原样复制 `download_url`，不得返回物理路径或臆造链接 |")
                 elif tools_key == "__fetch__":
                     # fetch：绑定时输出完整行，否则输出兜底行（二选一）。
                     if "fetch_user_long_term_memory" in tool_names:

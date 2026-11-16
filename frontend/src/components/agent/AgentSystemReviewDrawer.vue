@@ -39,7 +39,8 @@ const visibleItems = computed(() => {
     list = list.filter(
       (item) =>
         (item.agent_name || '').toLowerCase().includes(text) ||
-        (item.agent_identifier || '').toLowerCase().includes(text),
+        (item.agent_identifier || '').toLowerCase().includes(text) ||
+        (item.requested_by_name || '').toLowerCase().includes(text),
     )
   }
   if (sortMode.value === 'newest') {
@@ -66,6 +67,10 @@ const formatTime = (value?: string | null) => {
   return date.toLocaleString('zh-CN', { hour12: false })
 }
 
+/** 窄屏是单栏布局，列表和详情不能同时在场 */
+const isNarrowScreen = () =>
+  typeof window !== 'undefined' && !window.matchMedia('(min-width: 768px)').matches
+
 const loadList = async () => {
   loadingList.value = true
   // 刷新成功时不清旧错误，会让「加载待审列表失败」一直挂在详情下方
@@ -75,7 +80,9 @@ const loadList = async () => {
     items.value = res.data || []
     if (items.value.length) {
       const stillThere = items.value.some((item) => item.id === selectedId.value)
-      if (!stillThere) await select(items.value[0].id)
+      const firstId = items.value[0]?.id
+      // 窄屏别自动选第一条：一进来就跳进详情，用户看不到队列里还有别的
+      if (!stillThere && firstId && !isNarrowScreen()) await select(firstId)
     } else {
       selectedId.value = ''
       detail.value = null
@@ -138,6 +145,24 @@ const approveHint = computed(() =>
 )
 const approveButtonLabel = computed(() => (isVersionRelease.value ? '通过并上线' : '通过并发布'))
 
+const formatReviewError = (error: any, fallback: string) => {
+  const payload = error?.response?.data
+  const readiness = payload?.data
+  if (readiness?.code === 'AGENT_NOT_READY') {
+    const labels: Record<string, string> = {
+      published_version: '发布版本',
+      primary_capability: '主类型能力',
+      dataset_binding: '数据集绑定',
+      data_query_tool: '查数工具',
+      knowledge_base_binding: '知识库绑定',
+      knowledge_base_tool: '知识库检索工具',
+    }
+    const missing = Array.isArray(readiness.missing) ? readiness.missing : []
+    return `尚未就绪：${missing.map((item: string) => labels[item] || item).join('、')}`
+  }
+  return typeof payload?.detail === 'string' ? payload.detail : fallback
+}
+
 const approve = async () => {
   if (!detail.value || submitting.value) return
   submitting.value = true
@@ -151,7 +176,7 @@ const approve = async () => {
     emit('changed')
     await loadList()
   } catch (error: any) {
-    errorMessage.value = error?.response?.data?.detail || '审核失败，请稍后重试'
+    errorMessage.value = formatReviewError(error, '审核失败，请稍后重试')
   } finally {
     submitting.value = false
   }
@@ -198,9 +223,14 @@ const reject = async () => {
           </button>
         </div>
 
+        <!-- 窄屏是单栏：列表 ↔ 详情互相让位。
+             两栏固定并排在 375px 下右栏只剩 ~87px，快照内容直接被裁成一条。 -->
         <div class="flex min-h-0 flex-1">
           <!-- 左：待审队列 -->
-          <div class="flex w-72 shrink-0 flex-col border-r border-slate-200 bg-slate-50">
+          <div
+            class="min-h-0 w-full shrink-0 flex-col border-r border-slate-200 bg-slate-50 md:flex md:w-72"
+            :class="selectedId ? 'hidden' : 'flex'"
+          >
             <div class="space-y-2 border-b border-slate-200 bg-white px-3 py-2.5">
               <input
                 v-model="keyword"
@@ -276,15 +306,28 @@ const reject = async () => {
           </div>
 
           <!-- 右：只读快照 + 审核动作 -->
-          <div class="flex min-h-0 flex-1 flex-col">
-            <div class="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+          <div
+            class="min-h-0 min-w-0 flex-1 flex-col"
+            :class="selectedId ? 'flex' : 'hidden md:flex'"
+          >
+            <div class="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-5">
               <p v-if="loadingDetail" class="text-xs text-slate-400">加载详情…</p>
               <p v-else-if="!detail" class="text-xs text-slate-400">从左侧选择一条申请。</p>
 
               <div v-else class="space-y-3">
                 <div class="flex items-start gap-3">
-                  <div>
-                    <p class="text-lg font-semibold text-slate-900">{{ detail.agent_name }}</p>
+                  <button
+                    type="button"
+                    class="-ml-1 shrink-0 rounded-md px-1.5 py-1 text-slate-500 transition-colors hover:bg-slate-100 md:hidden"
+                    aria-label="返回待审列表"
+                    @click="selectedId = ''"
+                  >
+                    <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+                    </svg>
+                  </button>
+                  <div class="min-w-0">
+                    <p class="truncate text-lg font-semibold text-slate-900">{{ detail.agent_name }}</p>
                     <p class="mt-1 text-xs text-slate-500">
                       申请人 {{ detail.requested_by_name || '—' }} ·
                       提交于 {{ formatTime(detail.requested_at) }} ·
@@ -389,9 +432,9 @@ const reject = async () => {
 
             <div
               v-if="detail"
-              class="flex items-center gap-2 border-t border-slate-200 bg-white px-5 py-3"
+              class="flex flex-wrap items-center gap-2 border-t border-slate-200 bg-white px-4 py-3 sm:px-5"
             >
-              <span class="mr-auto text-[11px] text-slate-400">
+              <span class="mr-auto basis-full text-[11px] leading-relaxed text-slate-400 sm:basis-auto">
                 <template v-if="detail.agent_missing">
                   对应智能体已删除，这条申请只能驳回关闭
                 </template>
@@ -400,7 +443,7 @@ const reject = async () => {
                 </template>
               </span>
               <button
-                class="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                class="flex-1 rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50 sm:flex-none"
                 :disabled="submitting"
                 @click="reject"
               >
@@ -408,7 +451,7 @@ const reject = async () => {
               </button>
               <button
                 v-if="!detail.agent_missing"
-                class="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-white hover:bg-primary-hover disabled:opacity-50"
+                class="flex-1 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-white hover:bg-primary-hover disabled:opacity-50 sm:flex-none"
                 :disabled="submitting"
                 @click="approve"
               >

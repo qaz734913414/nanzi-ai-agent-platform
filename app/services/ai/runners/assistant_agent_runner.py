@@ -26,6 +26,10 @@ from app.services.ai.temperature import (
     resolve_effective_temperature,
     session_temperature_override,
 )
+from app.services.ai.model_override import (
+    resolve_effective_model_name,
+    session_model_override,
+)
 from app.services.ai.executors.base import BaseExecutor
 from app.services.ai.grounding.ledger import EvidenceLedger
 from app.services.ai.grounding.models import EvidenceType, FactFreshness
@@ -489,6 +493,16 @@ class AssistantAgentRunner(BaseExecutor):
         self._build_total_ms: float = 0.0
         self._build_finished_at: float | None = None
         self._first_model_call_wait_logged: bool = False
+
+    def _runtime_is_delegated_sub_agent(self) -> bool:
+        """当前 runner 是否跑在委派子代理里。"""
+        from app.core.context import execution_options_context
+
+        options = execution_options_context.get() or {}
+        value = options.get("delegated_sub_agent")
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
     def _runtime_user_id(self) -> str | None:
         if not self.user_info:
@@ -1200,6 +1214,87 @@ class AssistantAgentRunner(BaseExecutor):
                 )
         return requirement
 
+    async def _merge_agent_context_event_stream(
+        self,
+        core_stream: AsyncGenerator[Dict[str, Any], None],
+        ctx: Any,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """合并主执行流与 ctx.event_queue 旁路事件流，并保证尾部队列事件无损排空。"""
+        from app.core.context import set_agent_context
+
+        event_queue: asyncio.Queue = asyncio.Queue()
+        # 记下原来的队列，收尾时归还。知识库 runner 每次反思重试都会再合并一层，
+        # 若把 ctx.event_queue 永久留在自己的局部队列上，合并结束后才投递的旁路事件
+        # （沙箱进度、todo 快照、后台任务）会进一个再没人消费的队列，永久丢失。
+        previous_event_queue = getattr(ctx, "event_queue", None) if ctx is not None else None
+        if ctx is not None:
+            ctx.event_queue = event_queue
+        out_queue: asyncio.Queue = asyncio.Queue()
+
+        async def read_core() -> None:
+            if ctx:
+                set_agent_context(ctx)
+            try:
+                async for chunk in core_stream:
+                    await out_queue.put(("core", chunk))
+            except asyncio.CancelledError:
+                await out_queue.put(("cancelled", None))
+                raise
+            except Exception as exc:
+                await out_queue.put(("error", exc))
+            finally:
+                await out_queue.put(("core_done", None))
+
+        async def read_queue() -> None:
+            try:
+                while True:
+                    item = await event_queue.get()
+                    if item == "DONE":
+                        event_queue.task_done()
+                        break
+                    await out_queue.put(("queue", item))
+                    event_queue.task_done()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    out_queue.put_nowait(("queue_done", None))
+
+        t1 = asyncio.create_task(read_core())
+        t2 = asyncio.create_task(read_queue())
+
+        core_done = False
+        queue_done = False
+        try:
+            while not (core_done and queue_done) or not out_queue.empty():
+                tag, val = await out_queue.get()
+                if tag == "core":
+                    yield val
+                elif tag == "queue":
+                    yield val
+                elif tag == "cancelled":
+                    raise asyncio.CancelledError()
+                elif tag == "core_done":
+                    core_done = True
+                    # 主流已结束，向 event_queue 发送排空哨兵，让 read_queue 将队列内
+                    # 剩余子代理/工具日志全部转入 out_queue 后再自然收尾，避免固定超时竞态丢事件。
+                    event_queue.put_nowait("DONE")
+                elif tag == "queue_done":
+                    queue_done = True
+                elif tag == "error":
+                    raise val
+                out_queue.task_done()
+        finally:
+            t1.cancel()
+            t2.cancel()
+            for pending in (t1, t2):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pending
+            with contextlib.suppress(Exception):
+                event_queue.put_nowait("DONE")
+            if ctx is not None:
+                ctx.event_queue = previous_event_queue
+
     async def execute(
         self,
         history: List[Dict[str, str]],
@@ -1262,73 +1357,8 @@ class AssistantAgentRunner(BaseExecutor):
         )
 
         from app.core.context import set_agent_context
-        import asyncio
 
-        event_queue = asyncio.Queue()
-        ctx.event_queue = event_queue
-
-        async def merge_streams(core_stream):
-            out_queue = asyncio.Queue()
-
-            async def read_core():
-                if ctx:
-                    set_agent_context(ctx)
-                try:
-                    async for chunk in core_stream:
-                        await out_queue.put(("core", chunk))
-                except asyncio.CancelledError:
-                    await out_queue.put(("cancelled", None))
-                    raise
-                except Exception as e:
-                    await out_queue.put(("error", e))
-                finally:
-                    await out_queue.put(("core_done", None))
-
-            async def read_queue():
-                try:
-                    while True:
-                        item = await event_queue.get()
-                        if item == "DONE":
-                            break
-                        await out_queue.put(("queue", item))
-                        event_queue.task_done()
-                except asyncio.CancelledError:
-                    pass
-
-            t1 = asyncio.create_task(read_core())
-            t2 = asyncio.create_task(read_queue())
-
-            core_done = False
-            try:
-                while not core_done or not out_queue.empty():
-                    try:
-                        tag, val = await asyncio.wait_for(out_queue.get(), timeout=0.05)
-                        if tag == "core":
-                            yield val
-                        elif tag == "queue":
-                            yield val
-                        elif tag == "cancelled":
-                            raise asyncio.CancelledError()
-                        elif tag == "core_done":
-                            core_done = True
-                        elif tag == "error":
-                            raise val
-                        out_queue.task_done()
-                    except asyncio.TimeoutError:
-                        if core_done and out_queue.empty():
-                            break
-            finally:
-                t1.cancel()
-                t2.cancel()
-                for pending in (t1, t2):
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await pending
-                try:
-                    await event_queue.put("DONE")
-                except Exception:
-                    pass
-
-        async for chunk in merge_streams(self._execute_core(history)):
+        async for chunk in self._merge_agent_context_event_stream(self._execute_core(history), ctx):
             if is_interrupt_sse_chunk(chunk):
                 interrupted = True
 
@@ -1505,9 +1535,7 @@ class AssistantAgentRunner(BaseExecutor):
                     grounding_decision=grounding_decision,
                     contracts_reason=contracts_reason,
                 )
-            return
-
-        if should_intercept:
+        elif should_intercept:
             logger.warning(
                 f"[AssistantAgentRunner] Potential hallucination retained with risk warning. "
                 f"run_data_guard={run_data_guard}, has_attempted_tool={has_attempted_tool}. "
@@ -1594,16 +1622,17 @@ class AssistantAgentRunner(BaseExecutor):
         history: List[Dict[str, str]]
     ) -> AsyncGenerator[Dict[str, Any], None]:
         from app.services.ai.multimodal_support import (
-            resolve_runtime_model_name,
+            resolve_gate_model_names,
             run_multimodal_gate,
         )
 
         user_query = self._current_user_query(history)
 
-        model_name = resolve_runtime_model_name(self.config, prefer_synthesis=True)
+        # 主链路与合成模型都可能收到这批图片，闸门按两者的合集判定。
+        gate_models = resolve_gate_model_names(self.config)
         async for chunk in run_multimodal_gate(
             history,
-            model_name,
+            gate_models,
             user_id=self._runtime_user_id(),
             conversation_id=self.conversation_id,
         ):
@@ -1737,6 +1766,7 @@ class AssistantAgentRunner(BaseExecutor):
             # Use Synthesizer for simple mode
             llm = await AgentConfigProvider.get_synthesis_llm(streaming=True, config=self.config)
             self._record_effective_temperature(llm)
+            self._record_effective_model(llm)
 
             full_content = ""
             content_emitted = False
@@ -1788,7 +1818,14 @@ class AssistantAgentRunner(BaseExecutor):
                 step_number=self.step_counter,
                 event_type="synthesis",
                 agent_name=self.config.agent_name,
-                model=self.config.model_name,
+                # 合成阶段用的是 get_synthesis_llm 的句柄，它已含会话覆盖与合成覆盖；
+                # 读版本配置会让审计轨迹记成另一个模型。
+                model=resolve_effective_model_name(
+                    recorded_model=getattr(llm, "model", None)
+                    or getattr(llm, "model_name", None),
+                    session_model=session_model_override(),
+                    config_model=self.config.model_name,
+                ),
                 temperature=self._effective_temperature_for_trace(),
                 tool_output={"content": full_content},
                 raw_log=full_content,
@@ -2136,6 +2173,7 @@ class AssistantAgentRunner(BaseExecutor):
         ):
             native_model_handle = await AgentConfigProvider.get_configured_llm(streaming=True, config=self.config)
             self._record_effective_temperature(native_model_handle)
+            self._record_effective_model(native_model_handle)
             native_model = getattr(native_model_handle, "native_model", None)
             if native_model is not None:
                 async for chunk in self._execute_with_agentscope_native_agent(
@@ -2362,33 +2400,84 @@ class AssistantAgentRunner(BaseExecutor):
                     from app.services.ai.session_tool_artifact import persist_turn_artifact_candidate
                     from app.services.ai.reusable_result import build_reusable_result_status_event
 
-                    saved_meta = await persist_turn_artifact_candidate(
-                        user_id=self._runtime_user_id(),
-                        conversation_id=self.conversation_id,
-                        turn_state=getattr(self, "_session_artifact_turn", None),
-                        clear_if_empty=not interrupted,
-                    )
-                    if saved_meta:
-                        yield build_reusable_result_status_event(
-                            status="saved",
-                            payload=saved_meta,
+                    if getattr(self, "_defer_native_state_save", False):
+                        # 门禁还没放行的轮次不能把可复用结果落库：知识库幻觉重试时这一轮的
+                        # 答案会被丢掉，但它的查询结果一旦落盘就变成「可用结果」，
+                        # 下一轮会直接拿被驳回的数据去答。暂存到 flush 时点统一落。
+                        self._pending_turn_artifact = {
+                            "user_id": self._runtime_user_id(),
+                            "conversation_id": self.conversation_id,
+                            "turn_state": getattr(self, "_session_artifact_turn", None),
+                            "clear_if_empty": not interrupted,
+                        }
+                    else:
+                        saved_meta = await persist_turn_artifact_candidate(
+                            user_id=self._runtime_user_id(),
+                            conversation_id=self.conversation_id,
+                            turn_state=getattr(self, "_session_artifact_turn", None),
+                            clear_if_empty=not interrupted,
                         )
+                        if saved_meta:
+                            yield build_reusable_result_status_event(
+                                status="saved",
+                                payload=saved_meta,
+                            )
                 if not interrupted and self.conversation_id:
-                    await agent_state_store.save(
-                        user_id=self._runtime_user_id(),
-                        conversation_id=self.conversation_id,
-                        agent_name=agent_name,
-                        agent_version=self.config.agent_version,
-                        tools_fingerprint=tools_fingerprint,
-                        model_name=str(model_name) if model_name else None,
-                        state=agent.state,
-                    )
+                    if getattr(self, "_defer_native_state_save", False):
+                        self._pending_native_state_save = {
+                            "user_id": self._runtime_user_id(),
+                            "conversation_id": self.conversation_id,
+                            "agent_name": agent_name,
+                            "agent_version": self.config.agent_version,
+                            "tools_fingerprint": tools_fingerprint,
+                            "model_name": str(model_name) if model_name else None,
+                            "state": agent.state,
+                        }
+                    else:
+                        await agent_state_store.save(
+                            user_id=self._runtime_user_id(),
+                            conversation_id=self.conversation_id,
+                            agent_name=agent_name,
+                            agent_version=self.config.agent_version,
+                            tools_fingerprint=tools_fingerprint,
+                            model_name=str(model_name) if model_name else None,
+                            state=agent.state,
+                        )
         except SessionLockTimeout:
             yield {
                 "type": "error",
                 "status": "error",
                 "content": "当前会话正在处理中，请稍后再试。",
             }
+
+    async def _flush_pending_native_state_save(self) -> Optional[Dict[str, Any]]:
+        """在确认本轮回答已通过上层门禁后落盘暂存的 AgentState 与本轮可复用结果。
+
+        返回可复用结果的元数据（若落了），调用方负责把它转成 `reusable_result_status`
+        事件发给客户端——flush 发生在生成器末尾，仍可 yield。
+        """
+        artifact_payload = getattr(self, "_pending_turn_artifact", None)
+        self._pending_turn_artifact = None
+        saved_meta: Optional[Dict[str, Any]] = None
+        if isinstance(artifact_payload, dict):
+            try:
+                from app.services.ai.session_tool_artifact import persist_turn_artifact_candidate
+
+                saved_meta = await persist_turn_artifact_candidate(**artifact_payload)
+            except Exception as exc:  # noqa: BLE001 - 结果落盘失败不该影响回答
+                logger.warning("[TurnArtifact] deferred persist failed: %s", exc)
+
+        payload = getattr(self, "_pending_native_state_save", None)
+        self._pending_native_state_save = None
+        if not isinstance(payload, dict) or not payload.get("conversation_id"):
+            return saved_meta
+        # 这一轮的回答已经生成好了，state 落盘失败只影响下一轮的记忆连续性，
+        # 不该把用户已经看到的内容变成错误轮。
+        try:
+            await agent_state_store.save(**payload)
+        except Exception as exc:  # noqa: BLE001 - 落盘失败降级为告警
+            logger.warning("[NativeStateSave] flush failed: %s", exc)
+        return saved_meta
 
     #: 工作区准备进度卡的固定 id。
     #: 刻意与 ``workspace:sandbox``（沙箱容器拉起，由 LazySandboxWorkspaceProxy.
@@ -2802,20 +2891,25 @@ class AssistantAgentRunner(BaseExecutor):
                 from app.services.ai.user_question import persist_user_question_event
 
                 question_event = result["user_question"]
-                try:
-                    await persist_user_question_event(
-                        event=question_event,
-                        user_id=self._runtime_user_id(),
-                        conversation_id=self.conversation_id or "",
-                    )
-                except Exception:
-                    logger.exception("Failed to persist pending user question")
-                    yield {
-                        "type": "error",
-                        "status": "error",
-                        "content": "无法保存待回答问题，请稍后重试。",
-                    }
-                    return
+                # 委派子代理不在这里登记：它的会话 id 是 child_session_xxx，写进去是一条
+                # 永远没人能回答的 pending（用户看到、可点击的卡在父会话下）。父侧
+                # _persist_delegated_user_question 会把它登记到真正的会话里；
+                # 这里再写一次还有反作用——写失败会把整条提问退化成 error。
+                if not self._runtime_is_delegated_sub_agent():
+                    try:
+                        await persist_user_question_event(
+                            event=question_event,
+                            user_id=self._runtime_user_id(),
+                            conversation_id=self.conversation_id or "",
+                        )
+                    except Exception:
+                        logger.exception("Failed to persist pending user question")
+                        yield {
+                            "type": "error",
+                            "status": "error",
+                            "content": "无法保存待回答问题，请稍后重试。",
+                        }
+                        return
                 yield question_event
             if result.get("citation"):
                 yield result["citation"]
@@ -3101,6 +3195,7 @@ class AssistantAgentRunner(BaseExecutor):
         try:
             llm = await AgentConfigProvider.get_synthesis_llm(streaming=True, config=self.config)
             self._record_effective_temperature(llm)
+            self._record_effective_model(llm)
             messages = normalize_messages_for_llm([
                 SystemMessage(content=str(state.get("system_content") or self.config.system_prompt or "")),
                 HumanMessage(
@@ -3190,6 +3285,7 @@ class AssistantAgentRunner(BaseExecutor):
         try:
             llm = await AgentConfigProvider.get_synthesis_llm(streaming=True, config=self.config)
             self._record_effective_temperature(llm)
+            self._record_effective_model(llm)
             messages = normalize_messages_for_llm([
                 SystemMessage(content=str(state.get("system_content") or self.config.system_prompt or "")),
                 HumanMessage(
@@ -3267,6 +3363,7 @@ class AssistantAgentRunner(BaseExecutor):
             config=self.config,
         )
         self._record_effective_temperature(native_model_handle)
+        self._record_effective_model(native_model_handle)
         native_model = getattr(native_model_handle, "native_model", None)
         if native_model is None:
             raise RuntimeError("当前模型适配器未提供 AgentScope native_model，无法恢复挂起执行。")
@@ -3326,11 +3423,13 @@ class AssistantAgentRunner(BaseExecutor):
         self._last_tool_resolution = resolved
         from app.services.ai.runtime.agentscope.tool_timeout import (
             apply_configured_agent_tool_timeout,
+            collect_tool_timeouts,
         )
 
         tools = await apply_configured_agent_tool_timeout(
             resolved.specs,
             agent_timeout=getattr(self.config, "toolcall_timeout_seconds", None),
+            tool_timeouts=collect_tool_timeouts(configured_tools),
         )
         from app.core.context import get_current_agent_context
         from app.services.ai.tools.session_status import runtime_tool_capability_from_spec
@@ -3571,6 +3670,14 @@ class AssistantAgentRunner(BaseExecutor):
                     ):
                         yield chunk
                     self._last_turn_tool_meta = state
+                    async for tail_chunk in self._finalize_resume_turn_artifacts_and_state(
+                        agent=agent,
+                        tools=tools,
+                        native_model=native_model,
+                        agent_name=agent_name,
+                        interrupted=interrupted,
+                    ):
+                        yield tail_chunk
                     return
 
                 # Resume 也必须更新同一份最终工具元数据；否则保存点可能继续
@@ -3685,8 +3792,7 @@ class AssistantAgentRunner(BaseExecutor):
                                 grounding_decision=decision,
                                 contracts_reason=contracts_reason,
                             )
-                        return
-                    if grounding_audit.should_warn:
+                    elif grounding_audit.should_warn:
                         for buffered_chunk in buffered_content:
                             yield buffered_chunk
                         yield {
@@ -3705,38 +3811,57 @@ class AssistantAgentRunner(BaseExecutor):
                         for buffered_chunk in buffered_content:
                             yield buffered_chunk
 
-                if self.conversation_id:
-                    from app.services.ai.session_tool_artifact import persist_turn_artifact_candidate
-                    from app.services.ai.reusable_result import build_reusable_result_status_event
-
-                    saved_meta = await persist_turn_artifact_candidate(
-                        user_id=self._runtime_user_id(),
-                        conversation_id=self.conversation_id,
-                        turn_state=getattr(self, "_session_artifact_turn", None),
-                        clear_if_empty=not interrupted,
-                    )
-                    if saved_meta:
-                        yield build_reusable_result_status_event(
-                            status="saved",
-                            payload=saved_meta,
-                        )
-                if not interrupted and self.conversation_id:
-                    tools_fingerprint = build_tools_fingerprint(self.config, tools)
-                    await agent_state_store.save(
-                        user_id=self._runtime_user_id(),
-                        conversation_id=self.conversation_id,
-                        agent_name=agent_name,
-                        agent_version=self.config.agent_version,
-                        tools_fingerprint=tools_fingerprint,
-                        model_name=str(getattr(native_model, "model", self.config.model_name) or ""),
-                        state=agent.state,
-                    )
+                async for tail_chunk in self._finalize_resume_turn_artifacts_and_state(
+                    agent=agent,
+                    tools=tools,
+                    native_model=native_model,
+                    agent_name=agent_name,
+                    interrupted=interrupted,
+                ):
+                    yield tail_chunk
         except SessionLockTimeout:
             yield {
                 "type": "error",
                 "status": "error",
                 "content": "当前会话正在处理中，请稍后再试。",
             }
+
+    async def _finalize_resume_turn_artifacts_and_state(
+        self,
+        *,
+        agent: Any,
+        tools: List[Any],
+        native_model: Any,
+        agent_name: str,
+        interrupted: bool,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """恢复执行收敛后统一持久化会话产物与 AgentScope 状态，避免提前 return 跳过落库。"""
+        if self.conversation_id:
+            from app.services.ai.session_tool_artifact import persist_turn_artifact_candidate
+            from app.services.ai.reusable_result import build_reusable_result_status_event
+
+            saved_meta = await persist_turn_artifact_candidate(
+                user_id=self._runtime_user_id(),
+                conversation_id=self.conversation_id,
+                turn_state=getattr(self, "_session_artifact_turn", None),
+                clear_if_empty=not interrupted,
+            )
+            if saved_meta:
+                yield build_reusable_result_status_event(
+                    status="saved",
+                    payload=saved_meta,
+                )
+        if not interrupted and self.conversation_id:
+            tools_fingerprint = build_tools_fingerprint(self.config, tools)
+            await agent_state_store.save(
+                user_id=self._runtime_user_id(),
+                conversation_id=self.conversation_id,
+                agent_name=agent_name,
+                agent_version=self.config.agent_version,
+                tools_fingerprint=tools_fingerprint,
+                model_name=str(getattr(native_model, "model", self.config.model_name) or ""),
+                state=agent.state,
+            )
 
     async def _is_session_grant_auto_allowed(
         self,
@@ -3872,14 +3997,18 @@ class AssistantAgentRunner(BaseExecutor):
                 permission_scope=str(getattr(target_tool, "permission_scope", "ask")),
             )
 
-        runtime_cfg = getattr(target_tool, "_runtime_config", None)
-        t_model = getattr(runtime_cfg, "model_name", self.config.model_name)
-        # 卡片与审计轨迹必须报「真实下发」的温度：工具级覆盖 > 会话覆盖 > 版本温度。
+        # 卡片与审计轨迹必须报「真实下发」的模型：会话覆盖（输入框选的）> 版本配置。
+        # 工具级模型覆盖已下架（AgentScope 无按工具换模型的落点），这里不再读它。
+        t_model = resolve_effective_model_name(
+            recorded_model=getattr(self, "_session_effective_model", None),
+            session_model=session_model_override(),
+            config_model=getattr(self.config, "model_name", None),
+        )
+        # 卡片与审计轨迹必须报「真实下发」的温度：会话覆盖 > 版本温度。
         recorded_session_temp = coerce_temperature(
             getattr(self, "_session_effective_temperature", None)
         )
         t_temp = resolve_effective_temperature(
-            tool_temperature=getattr(runtime_cfg, "temperature", None),
             session_temperature=(
                 recorded_session_temp
                 if recorded_session_temp is not None
@@ -3887,15 +4016,24 @@ class AssistantAgentRunner(BaseExecutor):
             ),
             config_temperature=getattr(self.config, "temperature", None),
         )
+        # 超时同样要报真实值：三级解析后的 spec.timeout_seconds，来源说明是谁定的。
+        t_timeout = getattr(target_tool, "timeout_seconds", None)
+        t_timeout_source = getattr(target_tool, "timeout_source", None)
 
         # Ensure types for AgentExecutionStep validation (especially when using Mocks in tests)
-        if not isinstance(t_model, str): t_model = str(self.config.model_name)
+        if not isinstance(t_model, str) or not t_model.strip():
+            t_model = str(self.config.model_name or "")
 
         trace_step = AgentExecutionStep(
             step_number=self._increment_step(), event_type="tool_call", agent_name=self.config.agent_name,
             model=t_model, temperature=t_temp, tool_name=tool_name, tool_input=tool_args,
             tool_output=tool_output if isinstance(tool_output, (dict, list)) else {"raw": str(tool_output)},
             execution_time_ms=duration_tool, status="success" if not is_error else "error",
+            meta_info=(
+                {"timeout_seconds": t_timeout, "timeout_source": t_timeout_source}
+                if t_timeout is not None
+                else None
+            ),
             timestamp=datetime.fromtimestamp(time.time() - duration_tool / 1000)
         )
 
@@ -3919,6 +4057,9 @@ class AssistantAgentRunner(BaseExecutor):
             "model": t_model,
             "temperature": t_temp,
         }
+        if t_timeout is not None:
+            log_event["timeout_seconds"] = t_timeout
+            log_event["timeout_source"] = t_timeout_source
         # 工具入参单独承载（Bash 即命令原文），不占用 details 的输出截断预算。
         display_args = format_tool_args_for_display(tool_args, tool_name=tool_name)
         if display_args:

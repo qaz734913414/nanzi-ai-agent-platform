@@ -23,6 +23,7 @@ from app.services.ai.turn_decision import TurnDecision
 from app.services.ai.runtime.agentscope.stream_reconcile import truncate_for_display
 from app.services.metadata_rag_service import MetadataRagService
 from app.services.ai.runtime.agentscope.compat import HumanMessage, SystemMessage, AIMessage
+from app.services.ai.runtime.agentscope.event_stream import is_interrupt_sse_chunk
 from app.services.ai.runtime.agentscope.tools import (
     RuntimeToolSpec,
     runtime_tool_spec_from_legacy_tool,
@@ -274,11 +275,14 @@ class KnowledgeAgentRunner(AssistantAgentRunner):
         self._last_tool_resolution = resolved
         from app.services.ai.runtime.agentscope.tool_timeout import (
             apply_configured_agent_tool_timeout,
+            collect_tool_timeouts,
         )
 
         return await apply_configured_agent_tool_timeout(
             resolved.specs,
             agent_timeout=getattr(self.config, "toolcall_timeout_seconds", None),
+            # 知识库智能体的版本同样带工具级配置，漏传会让「配了不生效」再次出现。
+            tool_timeouts=collect_tool_timeouts(configured_tools),
         )
 
     async def _maybe_open_scope_gate(
@@ -721,6 +725,78 @@ class KnowledgeAgentRunner(AssistantAgentRunner):
             logger.warning("[KnowledgeAgentRunner] Restore scope from reply failed: %s", exc)
             return []
 
+    async def _authorize_restored_scope(self, dataset_ids: List[str]) -> List[str]:
+        """复核门禁回执还原出的范围：权限（与 ``search_knowledge_base`` 同口径）+ 存活。
+
+        ``pending_scope_gate`` 是服务端写进会话快照的（不是前端回传的 ID 列表），
+        但卡片弹出到用户点下去之间可能隔很久（快照随会话保留）：期间库被删除、
+        授权被收回都不会自动反映到快照里。不复核就等于把「当时可访问」当成
+        「现在可访问」。
+        """
+        if not dataset_ids:
+            return []
+        from app.core.context import get_current_agent_context
+        from app.core.orm import AsyncSessionLocal
+        from app.services.ai.knowledge_utils import filter_alive_knowledge_dataset_ids
+        from app.services.permission_service import PermissionService
+
+        authorized = list(dataset_ids)
+        ctx = get_current_agent_context() or self._ensure_agent_context()
+        if (
+            ctx is not None
+            and getattr(ctx, "user_id", None)
+            and not getattr(ctx, "is_admin", False)
+        ):
+            user_name = (ctx.user_dimensions or {}).get("user_name")
+            try:
+                user_id = int(ctx.user_id)
+                async with AsyncSessionLocal() as session:
+                    perm = PermissionService(session)
+                    # 与 search_knowledge_base 的判定逐字同源：智能体绑定的库对使用者
+                    # 放行（作者已决定其知识范围），但「个人私有且非本人」不跟代理放行，
+                    # 其余回落到用户自身权限——两边口径一旦分叉，就会出现
+                    # 「门禁放行、工具拒绝」的自相矛盾。
+                    agent_granted = set(ctx.agent_dataset_ids or [])
+                    agent_granted -= await perm.find_private_datasets_not_owned(
+                        agent_granted,
+                        user_name,
+                        user_id=user_id,
+                    )
+                    restricted = [
+                        dataset_id
+                        for dataset_id in dataset_ids
+                        if dataset_id not in agent_granted
+                    ]
+                    allowed_restricted = set(
+                        await perm.filter_knowledge_dataset_ids(
+                            user_id, user_name, restricted
+                        )
+                    )
+                kept = [
+                    dataset_id
+                    for dataset_id in dataset_ids
+                    if dataset_id in agent_granted or dataset_id in allowed_restricted
+                ]
+                dropped = [
+                    dataset_id
+                    for dataset_id in dataset_ids
+                    if dataset_id not in agent_granted
+                    and dataset_id not in allowed_restricted
+                ]
+                if dropped:
+                    logger.warning(
+                        "[KnowledgeAgentRunner] Dropped restored datasets without permission: %s",
+                        dropped,
+                    )
+                authorized = kept
+            except Exception as exc:  # noqa: BLE001 - 复核失败不收缩范围
+                # 权限查询失败不等于没权限：此时整段丢弃会让用户的选择变成「什么都搜不到」，
+                # 而工具层还会再过滤一次，放行不比现有行为更危险。
+                logger.warning(
+                    "[KnowledgeAgentRunner] Restored scope permission check failed: %s", exc
+                )
+        return await filter_alive_knowledge_dataset_ids(authorized)
+
     async def _auto_invoke_search_knowledge_base(
         self,
         *,
@@ -1027,7 +1103,7 @@ class KnowledgeAgentRunner(AssistantAgentRunner):
         if CLICKED_REPLY_MARKER.lower() in raw_current_question.lower():
             self.current_user_query = cleaned_question
         from app.services.ai.multimodal_support import (
-            resolve_runtime_model_name,
+            resolve_gate_model_names,
             run_multimodal_gate,
         )
         from app.services.config_service import ConfigService
@@ -1043,10 +1119,10 @@ class KnowledgeAgentRunner(AssistantAgentRunner):
             }
             return
 
-        model_name = resolve_runtime_model_name(self.config, prefer_synthesis=True)
+        gate_models = resolve_gate_model_names(self.config)
         async for chunk in run_multimodal_gate(
             history,
-            model_name,
+            gate_models,
             user_id=self._runtime_user_id(),
             conversation_id=self.conversation_id,
         ):
@@ -1212,17 +1288,15 @@ class KnowledgeAgentRunner(AssistantAgentRunner):
             # 再判断本轮的检索范围是否需要用户先确认。
             restored_dataset_ids = await self._restore_scope_from_reply()
             if restored_dataset_ids:
-                # 卡片弹出到用户点下去之间库可能已被删除或收回，这里要跟正常路径
-                # 一样做存活校验，否则会拿着死 ID 去打 RAGFlow。
-                from app.services.ai.knowledge_utils import filter_alive_knowledge_dataset_ids
-
-                resolved_dataset_ids = await filter_alive_knowledge_dataset_ids(
+                # 卡片弹出到用户点下去之间库可能已被删除、收回权限或授权变更，
+                # 这里跟正常路径一样做「权限 + 存活」复核，不能整体信任会话里的快照。
+                resolved_dataset_ids = await self._authorize_restored_scope(
                     list(restored_dataset_ids)
                 )
                 dataset_error = (
                     None
                     if resolved_dataset_ids
-                    else "⚠️ 已确认的知识库在 RAGFlow 侧已失联或不存在，本次知识库问答已终止。"
+                    else "⚠️ 已确认的知识库在 RAGFlow 侧已失联、不存在或已无权访问，本次知识库问答已终止。"
                 )
                 # 回执轮的检索词不能是【用户回答】全文，换回触发门禁的原始提问。
                 user_question = self._original_query_before_receipt(history) or user_question
@@ -1263,10 +1337,12 @@ class KnowledgeAgentRunner(AssistantAgentRunner):
                         dataset_ids=list(resolved_dataset_ids or []),
                         ctx=get_current_agent_context() or self._ensure_agent_context(),
                     )
-                # 最终范围必须写回上下文：模型随后自己调用 search_knowledge_base 时
-                # 走 resolve_bound_dataset_ids(ctx.dataset_ids)，不写回就变成
-                # 「预检索收窄了、二次检索仍全量」，用户确认的范围只兑现一半。
-                self._apply_scope_to_context(list(resolved_dataset_ids or []))
+            # 最终范围必须写回上下文：模型随后自己调用 search_knowledge_base 时
+            # 走 resolve_bound_dataset_ids(ctx.dataset_ids)，不写回就变成
+            # 「预检索收窄了、二次检索仍全量」，用户确认的范围只兑现一半。
+            # 放在 if/else 之外：恢复分支（用户刚点了范围卡）同样要写回，
+            # 否则门禁只对预检索生效，ReAct 里的二次检索又回到全量。
+            self._apply_scope_to_context(list(resolved_dataset_ids or []))
             if dataset_error and not resolved_dataset_ids:
                 async for chunk in self._yield_knowledge_no_dataset_abort():
                     yield chunk
@@ -1444,6 +1520,7 @@ class KnowledgeAgentRunner(AssistantAgentRunner):
             config=self.config,
         )
         self._record_effective_temperature(native_model_handle)
+        self._record_effective_model(native_model_handle)
         native_model = getattr(native_model_handle, "native_model", None)
         if native_model is None:
             yield {
@@ -1463,127 +1540,190 @@ class KnowledgeAgentRunner(AssistantAgentRunner):
         
         current_system_content = native_system_content
         current_messages = list(runtime_messages)
+        from app.core.context import get_current_agent_context
 
-        while retry_count <= max_retries:
-            chunks_buffer = []
-            full_text = ""
-            # 终止信号标志位：error chunk 不再进缓冲区，无法靠扫缓冲区识别。
-            saw_error = False
-            
-            execute_kwargs = {
-                "native_model": native_model,
-                "tools": react_tools,
-                "system_content": current_system_content,
-                "runtime_messages": current_messages,
-                "max_steps": max_steps,
-            }
-            if initial_tool_choice is not None:
-                execute_kwargs["initial_tool_choice"] = initial_tool_choice
+        ctx = (
+            self._ensure_agent_context()
+            if getattr(self, "config", None) is not None
+            else get_current_agent_context()
+        )
+        prev_defer_state_save = getattr(self, "_defer_native_state_save", False)
+        self._defer_native_state_save = True
+        self._pending_native_state_save = None
+        saw_error = False
+        saw_interrupt = False
 
-            async for chunk in self._execute_with_agentscope_native_agent(**execute_kwargs):
-                # 错误事件可能是安全拦截，且**携带 content**；若只在不带 content 的
-                # 分支里识别，这类错误会被漏判而进入幻觉评估，把拦截误判成幻觉。
-                if chunk.get("type") == "error":
-                    saw_error = True
-                if "content" in chunk:
-                    content = str(chunk.get("content") or "")
-                    if self._valid_citation_ids:
-                        content = filter_invalid_citation_markers(content, self._valid_citation_ids)
-                    full_text += content
-                    chunk = dict(chunk)
-                    chunk["content"] = content
-                    chunks_buffer.append(chunk)
-                    if synthesis_pending:
-                        # 首个正文 chunk 到达即收尾：此时 model_call 的 pending 项已经
-                        # 实时转发出来，卡片能无缝接上「模型调用: <模型名> · 进行中」；
-                        # 若等 flush 才收尾，中间会出现「状态项已完成 + 模型调用已完成
-                        # + 正文未到达」的空档，卡片会再次停住。
-                        synthesis_pending = False
-                        yield self._knowledge_synthesis_event(
-                            status="success",
-                            details=knowledge_synthesis_details,
-                        )
-                else:
-                    # 过程性事件（model_call / log / reasoning_content / meta 等）实时转发。
-                    # 此前它们与正文一起进缓冲区，用户在模型生成期间收不到任何事件，
-                    # 思考卡片停在「工具完成: search_knowledge_base」上，看起来像卡死。
-                    yield chunk
+        try:
+            while retry_count <= max_retries:
+                chunks_buffer = []
+                full_text = ""
+                # 终止信号标志位：error / interrupt chunk 实时透传且不得进入幻觉评估/反思重试。
+                saw_error = False
+                saw_interrupt = False
+                self._pending_native_state_save = None
 
-            if saw_error:
-                # 错误事件是终止信号，不能进入知识库事实评估/反思循环，
-                # 否则会把安全拦截误判成幻觉并覆盖原始错误。
-                for chunk in chunks_buffer:
-                    yield chunk
-                return
-
-            if self._knowledge_retrieval_succeeded:
-                sanitized_full_text = self._sanitize_knowledge_tool_binding_notice(
-                    full_text,
-                    retrieval_succeeded=True,
-                )
-                if sanitized_full_text != full_text:
-                    content_chunks = [
-                        chunk for chunk in chunks_buffer if "content" in chunk
-                    ]
-                    if content_chunks:
-                        content_chunks[0]["content"] = sanitized_full_text
-                        for chunk in content_chunks[1:]:
-                            chunk["content"] = ""
-                    full_text = sanitized_full_text
-
-            if not grounding_enabled:
-                passed_guard = True
-                break
-
-            # 评估是否含有幻觉（受会话开关控制）
-            evaluation = await HallucinationEvaluator.evaluate(
-                query=user_question,
-                context=prefetched_knowledge_output or "",
-                response=full_text,
-                enabled=hallucination_check_enabled,
-            )
-
-            is_hallucinated = evaluation.get("is_hallucinated", False)
-            if not is_hallucinated:
-                # 兜底原有的规则：如果 RAG 为空但模型编造了答案，或召回非空但缺少引用
-                if self._rag_empty:
-                    is_hallucinated = self._is_hallucinated_knowledge_reply(full_text)
-                else:
-                    is_hallucinated = self._is_hallucinated_with_rag_reply(full_text)
-
-            if not is_hallucinated:
-                passed_guard = True
-                break
-
-            retry_count += 1
-            reason = evaluation.get("reason") or "回答中存在无依据的幻觉陈述或缺少必要引用"
-            last_guard_reason = reason
-            logger.warning(
-                f"[KnowledgeAgentRunner] Hallucination detected! Attempt {retry_count} failed. "
-                f"Reason: {reason}. Model output: {full_text[:150]}..."
-            )
-
-            if retry_count <= max_retries:
-                # 发送拦截 log 事件告知前端
-                yield {
-                    "type": "log",
-                    "id": f"kb_reflection_{uuid.uuid4().hex[:8]}",
-                    "title": f"检测到无依据表述 (反思修正中 {retry_count}/{max_retries})",
-                    "details": f"回答中发现与事实文献不符的描述（原因: {reason}），安全网关已拦截并命令其重写纠正。",
-                    "status": "warning",
+                execute_kwargs = {
+                    "native_model": native_model,
+                    "tools": react_tools,
+                    "system_content": current_system_content,
+                    "runtime_messages": current_messages,
+                    "max_steps": max_steps,
                 }
-                
-                # 重新追加 messages 进行反思自纠偏
-                current_messages.append(AIMessage(content=full_text))
-                reflection_prompt = (
-                    f"【网关安全警报】\n"
-                    f"你刚才生成的回答被事实一致性网关拦截退回。原因：{reason}。\n"
-                    f"请务必吸取教训，重新审查问题和提供的事实文献，绝对不允许包含文献中没有明确说明的外部假设、新参数或隐藏规则。\n"
-                    f"请重新进行一次高度客观且无任何幻觉的严谨回答："
+                if initial_tool_choice is not None:
+                    execute_kwargs["initial_tool_choice"] = initial_tool_choice
+
+                raw_stream = self._execute_with_agentscope_native_agent(**execute_kwargs)
+                merged_stream = (
+                    self._merge_agent_context_event_stream(raw_stream, ctx)
+                    if hasattr(self, "_merge_agent_context_event_stream")
+                    else raw_stream
                 )
-                current_messages.append(HumanMessage(content=reflection_prompt))
-            else:
-                break
+                async for chunk in merged_stream:
+                    chunk_type = str(chunk.get("type") or "")
+                    # 单步 tool/log 失败会携带 type="log" 且 status="error"，不应误判为整轮终止信号。
+                    is_error_chunk = chunk_type == "error" or (
+                        not chunk_type and chunk.get("status") == "error"
+                    )
+                    is_interrupt = is_interrupt_sse_chunk(chunk) and chunk_type != "error"
+                    if is_error_chunk:
+                        saw_error = True
+                    if is_interrupt:
+                        saw_interrupt = True
+
+                    # 仅缓冲纯回答正文；error、中断以及思考/过程事件必须实时透传且不可混入 full_text。
+                    is_answer_text_chunk = (
+                        "content" in chunk
+                        and not is_error_chunk
+                        and not is_interrupt
+                        and chunk_type in {"", "answer", "answer_delta"}
+                    )
+                    if is_answer_text_chunk:
+                        content = str(chunk.get("content") or "")
+                        if self._valid_citation_ids:
+                            content = filter_invalid_citation_markers(content, self._valid_citation_ids)
+                        full_text += content
+                        chunk = dict(chunk)
+                        chunk["content"] = content
+                        chunks_buffer.append(chunk)
+                        if synthesis_pending:
+                            # 首个正文 chunk 到达即收尾：此时 model_call 的 pending 项已经
+                            # 实时转发出来，卡片能无缝接上「模型调用: <模型名> · 进行中」；
+                            # 若等 flush 才收尾，中间会出现「状态项已完成 + 模型调用已完成
+                            # + 正文未到达」的空档，卡片会再次停住。
+                            synthesis_pending = False
+                            yield self._knowledge_synthesis_event(
+                                status="success",
+                                details=knowledge_synthesis_details,
+                            )
+                    else:
+                        if (is_error_chunk or is_interrupt) and chunks_buffer:
+                            for buffered in chunks_buffer:
+                                yield buffered
+                            chunks_buffer.clear()
+                        # 过程性事件（model_call / log / reasoning_content / meta / interrupt / error 等）实时转发。
+                        yield chunk
+
+                if saw_error or saw_interrupt:
+                    # 错误或人机中断是终止信号，不能进入知识库事实评估/反思循环，也不能刷新完整回合 State。
+                    self._pending_native_state_save = None
+                    for chunk in chunks_buffer:
+                        yield chunk
+                    return
+
+                if self._knowledge_retrieval_succeeded:
+                    sanitized_full_text = self._sanitize_knowledge_tool_binding_notice(
+                        full_text,
+                        retrieval_succeeded=True,
+                    )
+                    if sanitized_full_text != full_text:
+                        content_chunks = [
+                            chunk for chunk in chunks_buffer if "content" in chunk
+                        ]
+                        if content_chunks:
+                            content_chunks[0]["content"] = sanitized_full_text
+                            for chunk in content_chunks[1:]:
+                                chunk["content"] = ""
+                        full_text = sanitized_full_text
+
+                if not grounding_enabled:
+                    passed_guard = True
+                    break
+
+                # 评估是否含有幻觉（受会话开关控制）
+                evaluation = await HallucinationEvaluator.evaluate(
+                    query=user_question,
+                    context=prefetched_knowledge_output or "",
+                    response=full_text,
+                    enabled=hallucination_check_enabled,
+                )
+
+                is_hallucinated = evaluation.get("is_hallucinated", False)
+                if not is_hallucinated:
+                    # 兜底原有的规则：如果 RAG 为空但模型编造了答案，或召回非空但缺少引用
+                    if self._rag_empty:
+                        is_hallucinated = self._is_hallucinated_knowledge_reply(full_text)
+                    else:
+                        is_hallucinated = self._is_hallucinated_with_rag_reply(full_text)
+
+                if not is_hallucinated:
+                    passed_guard = True
+                    break
+
+                retry_count += 1
+                reason = evaluation.get("reason") or "回答中存在无依据的幻觉陈述或缺少必要引用"
+                last_guard_reason = reason
+                logger.warning(
+                    f"[KnowledgeAgentRunner] Hallucination detected! Attempt {retry_count} failed. "
+                    f"Reason: {reason}. Model output: {full_text[:150]}..."
+                )
+
+                if retry_count <= max_retries:
+                    # 重试前丢弃前一次被拦截尝试的待保存 State，防止幻觉回答污染历史会话状态
+                    self._pending_native_state_save = None
+                    # 发送拦截 log 事件告知前端
+                    yield {
+                        "type": "log",
+                        "id": f"kb_reflection_{uuid.uuid4().hex[:8]}",
+                        "title": f"检测到无依据表述 (反思修正中 {retry_count}/{max_retries})",
+                        "details": f"回答中发现与事实文献不符的描述（原因: {reason}），安全网关已拦截并命令其重写纠正。",
+                        "status": "warning",
+                    }
+
+                    # 重新追加 messages 进行反思自纠偏
+                    current_messages.append(AIMessage(content=full_text))
+                    reflection_prompt = (
+                        f"【网关安全警报】\n"
+                        f"你刚才生成的回答被事实一致性网关拦截退回。原因：{reason}。\n"
+                        f"请务必吸取教训，重新审查问题和提供的事实文献，绝对不允许包含文献中没有明确说明的外部假设、新参数或隐藏规则。\n"
+                        f"请重新进行一次高度客观且无任何幻觉的严谨回答："
+                    )
+                    current_messages.append(HumanMessage(content=reflection_prompt))
+                else:
+                    break
+
+            # 仅在最终确定要输出给用户的回合（无 error/interrupt）才持久化 AgentState
+            if hasattr(self, "_flush_pending_native_state_save"):
+                saved_meta = await self._flush_pending_native_state_save()
+                if saved_meta:
+                    from app.services.ai.reusable_result import (
+                        build_reusable_result_status_event,
+                    )
+
+                    yield build_reusable_result_status_event(
+                        status="saved",
+                        payload=saved_meta,
+                    )
+        finally:
+            # 正常路径已在上面 flush、报错/中断路径已显式清空，走到这里仍有 pending
+            # 说明是异常或取消打断的——此时状态本身是有效的，兜底落一次，
+            # 免得辛苦跑出来的工具结果与记忆被静默丢弃。
+            if getattr(self, "_pending_native_state_save", None) is not None:
+                try:
+                    await self._flush_pending_native_state_save()
+                except Exception as exc:  # noqa: BLE001 - 兜底路径不改变主异常
+                    logger.warning("[KnowledgeStateSave] trailing flush failed: %s", exc)
+            self._defer_native_state_save = prev_defer_state_save
+            self._pending_native_state_save = None
 
         # 引用量统计与「回答是否通过事实一致性网关」解耦。
         #
