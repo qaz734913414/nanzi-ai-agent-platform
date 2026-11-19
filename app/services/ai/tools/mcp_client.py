@@ -10,6 +10,11 @@ import httpx
 import httpx2
 import anyio
 from mcp import ClientSession, types
+
+try:  # pragma: no cover - mcp 1.x 没有该类型，占位成空元组让 isinstance 恒为 False
+    from mcp.shared.exceptions import MCPError as _MCPError
+except Exception:  # noqa: BLE001 - 老版本 SDK 缺这个模块时不应影响导入
+    _MCPError = ()
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from app.core.orm import AsyncSessionLocal
@@ -71,6 +76,29 @@ _AUDIT_TASKS: set[asyncio.Task] = set()
 # ``streamable_http_client`` 内的 ``anyio.create_task_group``）。
 _ANYIO_SCOPE_CANCEL_MARKER = "cancel scope"
 
+#: mcp 2.x 在**本地写流已关闭**时用的 JSON-RPC 错误码（``mcp_types.CONNECTION_CLOSED``）。
+#: 只认这一个码：``-32601`` / ``-32602`` / ``-32603`` 是工具自身的协议/业务错误，
+#: 当成断线重试会把写操作重发一遍，还会引发重连风暴。
+_MCP_CONNECTION_CLOSED_CODE = -32000
+
+#: 单个 SSE event 的字节上限，传给 mcp SDK 的 ``streamable_http_client``。
+#:
+#: mcp 2.x 默认只给 1 MiB（``DEFAULT_MAX_SSE_EVENT_SIZE``，最终落在 httpx2 的
+#: ``EventSource`` 上），而把二进制内联成 base64 的工具（图像生成、文件下载等）
+#: 会把整份结果塞进**一个** SSE event 的 ``data`` 字段：一张 1024×1024 的 PNG
+#: base64 后就有 2～5 MB，1 MiB 必然打成「Server-sent event exceeded the
+#: 1048576 byte limit」。该报错经 ``MCP tool call failed:`` 回显给模型和用户，
+#: 看起来像传输故障，实际是结果体积超限，排查方向完全跑偏（DashScope
+#: ``text_generate_image`` 就是这样被打爆的）。
+#:
+#: 取 32 MiB 而不是 ``None``：``None`` 等于关掉上限，异常远端可以让单个 event
+#: 无限缓冲、把进程内存撑爆；32 MiB 覆盖常规图片/gzip 类结果，又不至于让一次
+#: 恶意响应就吃掉整个 worker 的内存。
+#:
+#: 注意：老 SSE 传输（``sse_client``）的 SDK 签名里没有这个参数，内部
+#: ``sse_within_origin`` 写死 ``1024 * 1024``，因此仍受 1 MiB 限制。
+DEFAULT_MCP_MAX_SSE_EVENT_SIZE = 32 * 1024 * 1024
+
 
 class McpToolCallTimeout(TimeoutError):
     """单次 ``tools/call`` 等不到结果（远端业务执行太慢），**不是**传输断开。
@@ -118,6 +146,26 @@ def _strip_platform_schema_extensions(value: Any) -> Any:
     return value
 
 
+def _is_mcp_connection_closed(err: BaseException) -> bool:
+    """``MCPError(-32000, "Connection closed")`` 是**传输断开**，不是工具业务失败。
+
+    mcp 2.x 的客户端在写流已被关闭时统一抛这个错误（见 SDK 里的
+    ``jsonrpc_dispatcher.send_raw_request``：写请求时撞到 ``BrokenResourceError``
+    / ``ClosedResourceError`` 就转成 ``CONNECTION_CLOSED``）。而 ``MCPError`` 只
+    继承 ``Exception``，既不在 ``OSError`` 体系里，也不属于 httpx/anyio 的任何一族。
+
+    漏判的后果不是「这次调用失败」，而是**永不恢复**：不重连、不淘汰缓存会话，
+    ``get_session`` 的幂等短路之后每次调用都撞在同一条死流上——用户侧看到的就是
+    「前面一次调用报错，后面所有请求直接报错」。
+
+    这条判定不能扩大到整个 ``MCPError``：工具不存在（-32601）、参数错（-32602）、
+    远端内部错误（-32603）都会以同一个异常类型回来，重连对它们毫无用处。
+    """
+    if not isinstance(err, _MCPError):
+        return False
+    return getattr(err, "code", None) == _MCP_CONNECTION_CLOSED_CODE
+
+
 def _is_transport_error(err: BaseException) -> bool:
     """判断异常是否属于「传输断开」，需要重连后重试。
 
@@ -126,6 +174,8 @@ def _is_transport_error(err: BaseException) -> bool:
     """
     if isinstance(err, McpToolCallTimeout):
         return False
+    if _is_mcp_connection_closed(err):
+        return True
     if isinstance(err, _TRANSPORT_ERROR_TYPES):
         return True
     if isinstance(err, BaseExceptionGroup):
@@ -283,6 +333,23 @@ class McpSseSession:
         self._rpc_id_counter += 1
         return self._rpc_id_counter
 
+    def mark_request_start(self) -> None:
+        """登记一次在途请求（SSE 与 Direct HTTP 都要登记）。
+
+        空闲回收原来只看 ``last_used_at``，而 ``text_generate_image`` 这类工具
+        一次能跑好几分钟，期间不会有新调用刷新它。SSE 路径不计在途数时，
+        回收线程会在生成中途把连接关掉，调用方拿到的正是
+        ``MCPError(-32000, "Connection closed")``——看起来像远端断流，
+        实际是自己关的。
+        """
+        self._active_requests += 1
+        self._active_requests_changed.clear()
+
+    def mark_request_end(self) -> None:
+        self._active_requests = max(0, self._active_requests - 1)
+        if self._active_requests == 0:
+            self._active_requests_changed.set()
+
     async def _looks_like_sse_endpoint(self) -> bool:
         """Quick probe: skip SSE when the gateway clearly speaks JSON/HTTP."""
         try:
@@ -320,7 +387,11 @@ class McpSseSession:
             _create_no_redirect_mcp_http_client(headers=self.auth_headers)
         )
         read_stream, write_stream = await self._exit_stack.enter_async_context(
-            streamable_http_client(self.sse_url, http_client=http_client)
+            streamable_http_client(
+                self.sse_url,
+                http_client=http_client,
+                max_sse_event_size=DEFAULT_MCP_MAX_SSE_EVENT_SIZE,
+            )
         )
         session = await self._exit_stack.enter_async_context(
             ClientSession(read_stream, write_stream)
@@ -565,7 +636,16 @@ class McpSseSession:
             if exit_stack:
                 try:
                     await exit_stack.aclose()
-                except Exception as exc:
+                except BaseException as exc:  # noqa: BLE001 - 清理阶段不挑异常类型
+                    # anyio 的传输在**另一个 task** 里建立时，退出抛的是
+                    # CancelledError("Cancelled via cancel scope ...") 或
+                    # RuntimeError("different task")。前者是基类异常，用
+                    # ``except Exception`` 接不住——它会直接冲出 close()，把调用它的
+                    # 空闲回收循环整条带走，之后死会话再也没人清。
+                    if isinstance(exc, asyncio.CancelledError):
+                        if not _is_anyio_scope_cancellation(exc):
+                            raise
+                        self._clear_internal_cancellation()
                     logger.warning(
                         "[MCP] Transport cleanup failed for %s; cached state was cleared: %s",
                         self.server_id,
@@ -642,6 +722,20 @@ class McpClientService:
             raise
         session.update_activity()
         return session
+
+    @classmethod
+    def _evict_cached_session(cls, cache_key: str, session_mgr: "McpSseSession") -> None:
+        """把不可用的会话移出共享缓存（只移「还是这个对象」的那一格）。
+
+        只移对象一致的那一格：并发的另一次调用可能已经重建了同 key 的新会话，
+        无条件 ``pop`` 会把别人刚建好的连接一起丢掉。
+        """
+        if cls._sessions.get(cache_key) is session_mgr:
+            cls._sessions.pop(cache_key, None)
+            logger.warning(
+                "[MCP] Evicted unusable session for %s; next call will reconnect",
+                cache_key,
+            )
 
     @staticmethod
     def _remote_tool_name(tool: Any) -> Optional[str]:
@@ -880,6 +974,38 @@ class McpClientService:
             await cls._initialize_direct_http(session_mgr)
             session_mgr._direct_initialized = True
 
+    @staticmethod
+    async def _call_tool_tracked(
+        session_mgr: "McpSseSession",
+        session: ClientSession,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        *,
+        progress_callback: Optional[McpProgressCallback] = None,
+        timeout_seconds: Optional[float] = None,
+    ):
+        """带在途计数的单次 ``tools/call``。
+
+        回收线程（``_sweep_idle_sessions``）只看 ``last_used_at`` 与在途计数，
+        而这次调用期间不会有任何新请求刷新活跃时间。不登记的话，一次跑几分钟的
+        图像生成会被自己人关掉，错误恰好伪装成远端断流（Connection closed）。
+        """
+        # 计数是加固手段，不是调用前提：测试替身与历史上按鸭子类型传进来的
+        # 会话对象不一定带这两个方法，缺了也必须照常执行工具。
+        if hasattr(session_mgr, "mark_request_start"):
+            session_mgr.mark_request_start()
+        try:
+            return await _call_tool_with_progress(
+                session,
+                tool_name,
+                arguments,
+                progress_callback=progress_callback,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            if hasattr(session_mgr, "mark_request_end"):
+                session_mgr.mark_request_end()
+
     @classmethod
     async def call_remote_tool(
         cls,
@@ -984,7 +1110,8 @@ class McpClientService:
                         # 建连；否则会一直拿到同一个空会话。
                         await session_mgr.close()
                         raise RuntimeError("MCP SSE session is unavailable")
-                    response = await _call_tool_with_progress(
+                    response = await cls._call_tool_tracked(
+                        session_mgr,
                         session,
                         tool_name,
                         arguments,
@@ -1025,7 +1152,8 @@ class McpClientService:
                             if session is None:
                                 await session_mgr.close()
                                 raise RuntimeError("MCP SSE session is unavailable after reconnect")
-                            response = await _call_tool_with_progress(
+                            response = await cls._call_tool_tracked(
+                                session_mgr,
                                 session,
                                 tool_name,
                                 arguments,
@@ -1046,6 +1174,10 @@ class McpClientService:
                     # 用户的连接并触发重连风暴。
                     if transport_broken and not ephemeral_session:
                         await session_mgr.close()
+                        # 只 close 不淘汰是不够的：``get_session`` 的幂等短路会继续把
+                        # 这条已经不可用的会话发出去，下一次调用照旧失败。远端长时间
+                        # 没恢复时，「关掉 + 移出缓存」才是唯一能自愈的出口。
+                        cls._evict_cached_session(session_key or server_id, session_mgr)
                     raise RuntimeError(
                         redact_value(
                             f"MCP tool '{tool_name}' failed: {e}",
@@ -1182,8 +1314,9 @@ class McpClientService:
 
         logger.debug(f"[MCP-Direct] Request: {method} to {session_mgr.sse_url} | RPC ID: {rpc_id} | Headers keys: {list(headers.keys())}")
         client = session_mgr.get_http_client()
-        session_mgr._active_requests = getattr(session_mgr, "_active_requests", 0) + 1
-        session_mgr._active_requests_changed.clear()
+        # 同理：计数是加固手段，鸭子类型传进来的会话对象缺这两个方法时照常执行。
+        if hasattr(session_mgr, "mark_request_start"):
+            session_mgr.mark_request_start()
         try:
             # per-request timeout：共享 client 的默认值不能成为工具超时的第二套口径。
             resp = await client.post(
@@ -1200,9 +1333,8 @@ class McpClientService:
                 f"MCP HTTP request failed for {method}: {redacted_err}"
             ) from None
         finally:
-            session_mgr._active_requests = max(0, getattr(session_mgr, "_active_requests", 1) - 1)
-            if session_mgr._active_requests == 0:
-                session_mgr._active_requests_changed.set()
+            if hasattr(session_mgr, "mark_request_end"):
+                session_mgr.mark_request_end()
 
         # Capture Session ID from initialization
         if method == "initialize" and resp.status_code == 200:
@@ -1569,22 +1701,49 @@ class McpClientService:
             cls._sessions.pop(key, None)
 
     @classmethod
+    async def _sweep_idle_sessions(cls, idle_seconds: float = 300.0) -> int:
+        """回收一轮空闲会话，返回成功关闭的数量。
+
+        每一格会话单独兜异常：一条连接关不掉（跨 task 退出 anyio scope 会抛
+        RuntimeError）不能连累整轮回收，更不能让它留在缓存里继续被复用。
+        """
+        now = time.time()
+        expired: list[tuple[str, "McpSseSession"]] = []
+        for sid, session in list(cls._sessions.items()):
+            # 不能再用「有没有 session/session_id」当条件：无状态 Direct HTTP
+            # 网关两者都为空，那样这条会话永远不会被回收。进行中的请求仍然跳过，
+            # 否则会把正在用的传输关掉（SSE 长任务现在也会登记在途数）。
+            if getattr(session, "_active_requests", 0) > 0:
+                continue
+            if now - session.last_used_at > idle_seconds:
+                expired.append((sid, session))
+
+        closed = 0
+        for sid, session in expired:
+            try:
+                await session.close()
+                closed += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 单条会话的清理失败不扩散
+                logger.warning("[MCP] Idle close failed for %s; evicting anyway: %s", sid, exc)
+            finally:
+                # 关不掉也要移出缓存：留在里面等于「永远复用一条坏连接」。
+                if cls._sessions.get(sid) is session:
+                    cls._sessions.pop(sid, None)
+        return closed
+
+    @classmethod
     async def _idle_cleanup_loop(cls):
         while True:
             await asyncio.sleep(60)
-            now = time.time()
-            expired_keys = []
-            for sid, session in list(cls._sessions.items()):
-                # 不能再用「有没有 session/session_id」当条件：无状态 Direct HTTP
-                # 网关两者都为空，那样这条会话永远不会被回收。进行中的请求仍然跳过，
-                # 否则会把正在用的传输关掉。
-                if getattr(session, "_active_requests", 0) > 0:
-                    continue
-                if now - session.last_used_at > 300:
-                    await session.close()
-                    expired_keys.append(sid)
-            for sid in expired_keys:
-                cls._sessions.pop(sid, None)
+            try:
+                await cls._sweep_idle_sessions()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 回收循环必须活得比故障久
+                # 循环一挂，死会话就再也没人淘汰，只能等进程重启——比丢一轮更糟。
+                logger.warning("[MCP] Idle cleanup sweep failed; continuing: %s", exc)
 
     @classmethod
     async def shutdown(cls):

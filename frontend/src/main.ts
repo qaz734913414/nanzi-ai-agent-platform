@@ -5,6 +5,8 @@ import App from '@/App.vue'
 import router from '@/router'
 import { tooltip } from '@/directives/tooltip'
 import { clearUserScopedStorage } from './utils/sessionCleanup'
+import { recoverFromChunkError } from './utils/chunkLoadRecovery'
+import { installScrollbarReveal } from './utils/scrollbarReveal'
 
 import axios from 'axios'
 
@@ -93,6 +95,18 @@ app.directive('has-perm', {
     }
   }
 })
+
+// Vite 预加载静态资源失败（典型于重新部署后旧 chunk 已被替换）：若成功触发重载恢复，则阻止默认抛错
+window.addEventListener('vite:preloadError', (event) => {
+  if (recoverFromChunkError()) {
+    event.preventDefault()
+  }
+})
+
+// 滚动条「滚动时才出现」：样式在 style.css 的 .custom-scrollbar，显隐靠
+// scroll 事件给容器打 data-scroll-active（纯 CSS 没有「正在滚动」这个状态）。
+// 文档级只挂这一处，别在组件里重复安装。
+installScrollbarReveal()
 
 app.mount('#app')
 
