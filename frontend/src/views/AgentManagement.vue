@@ -2316,6 +2316,20 @@ const availableTools: Array<{ name: string; description: string; isSystem: boole
     isSystem: true,
   },
   {
+    // 出图工具：默认不勾选（每张计费）。平台总开关 image_generation_enabled 关闭时，
+    // 这里勾了后端也不会下发——所以描述里点明前置条件，别让人对着「勾了不生效」猜。
+    name: "generate_image",
+    description: "按文字描述生成图片（文生图），出图保存为平台产物；需先在「系统设置 → 图像生成」开启",
+    isSystem: true,
+  },
+  {
+    // 改图工具：与 generate_image 分开一项，权限可以单独给。同样默认不勾选、按次计费。
+    // 它还多一道前置：接口格式必须是聊天接口，否则后端根本不下发这个工具。
+    name: "edit_image",
+    description: "按指令修改已有图片（图生图/改图），保留主体只改指定部分；同样需先在「系统设置 → 图像生成」开启聊天接口",
+    isSystem: true,
+  },
+  {
     name: "search_qa_examples",
     description: "检索已验证的历史问答优质案例及 SQL",
     isSystem: true,

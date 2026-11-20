@@ -55,7 +55,8 @@ import {
   DocumentDuplicateIcon,
   ChartBarSquareIcon,
   EnvelopeIcon,
-  MegaphoneIcon
+  MegaphoneIcon,
+  PhotoIcon
 } from '@heroicons/vue/24/outline'
 
 const router = useRouter()
@@ -812,7 +813,9 @@ const sandboxSshHasSshCli = computed(() => {
 })
 const orderedCategories = computed(() => {
   if (!configGroups.value) return []
-  const order = ['general', 'agent_context', 'agent', 'metadata', 'data_api', 'knowledge', 'sandbox', 'other', 'email']
+  // 'security' 与 'image' 显式列在末尾：不写进 order 的会落到 localeCompare 兜底分支，
+  // 顺序就取决于分组名字母序 —— 「图像」必须固定在最末（其他参数之后）。
+  const order = ['general', 'agent_context', 'agent', 'metadata', 'data_api', 'knowledge', 'sandbox', 'other', 'email', 'security', 'image']
   const keys = Object.keys(configGroups.value)
   return keys.sort((a, b) => {
     const idxA = order.indexOf(a)
@@ -903,6 +906,7 @@ const getGroupSubtitle = (cat: string) => {
     'sandbox': 'Docker / K8s 沙箱执行环境',
     'other': '其余系统参数',
     'email': '配置平台统一的邮件发送服务（SMTP），用于审核结果通知等系统邮件',
+    'image': '文生图模型接入：地址、密钥、分辨率白名单与出图行为',
   }
   return map[cat] || '系统参数集合'
 }
@@ -1474,9 +1478,32 @@ const fetchConfigs = async () => {
   }
 }
 
+/**
+ * 尺寸写法归一。
+ *
+ * 后端把尺寸归一成「宽x高」再跟白名单比字符串，而白名单本身是按原样存的。
+ * 管理员若把某一档写成 1024*1024 / 1024X1024，工具侧归一后是 1024x1024，
+ * 两边就永远对不上，表现为「白名单里有这个尺寸，却报不在允许范围内」。
+ */
+const normalizeImageSizeText = (text: string) =>
+  text
+    .split(',')
+    .map((x) => x.trim().replace(/[*×X]/g, 'x'))
+    .filter(Boolean)
+    .join(',')
+
+const normalizeImageSizeItems = () => {
+  for (const item of configGroups.value['image'] || []) {
+    if (item.key === 'image_allowed_sizes' || item.key === 'image_default_size') {
+      item.value = normalizeImageSizeText(String(item.value || ''))
+    }
+  }
+}
+
 const saveConfigs = async () => {
   saving.value = true
   try {
+    normalizeImageSizeItems()
     const updates: ConfigItem[] = []
     for (const cat in configGroups.value) {
       const items = configGroups.value[cat]
@@ -1493,8 +1520,25 @@ const saveConfigs = async () => {
         saving.value = false
         return
     }
-    await axios.put('/api/portal/system/configs', { updates })
-    showToast(`成功更新 ${updates.length} 项配置`, 'success')
+    const { data } = await axios.put('/api/portal/system/configs', { updates })
+    // 后端会跳过一部分更新（典型是密钥框里回显的脱敏串原样提交回来——写进去会把
+    // 真实密钥覆盖成 "abc****wxyz"，所以服务层保留了旧值）。只报「成功」的话，
+    // 管理员以为密钥换掉了，之后所有调用都 401，却找不到原因。
+    const skipped: { key: string; reason: string }[] = Array.isArray(data?.skipped)
+      ? data.skipped
+      : []
+    const reallySaved = Array.isArray(data?.updated)
+      ? data.updated.length
+      : Math.max(0, updates.length - skipped.length)
+    if (skipped.length) {
+      const names = skipped.map((x) => x.key).join('、')
+      showToast(
+        `已更新 ${reallySaved} 项；${names} 未改动（${skipped[0]?.reason || '值没有变化'}）`,
+        'warning'
+      )
+    } else {
+      showToast(`成功更新 ${reallySaved} 项配置`, 'success')
+    }
     await fetchConfigs()
   } catch (e: any) {
      showToast(`保存失败: ${e.response?.data?.detail || e.message}`, 'error')
@@ -1642,6 +1686,460 @@ const submitEmailTest = async () => {
   }
 }
 
+// ── 图像生成分组：模型列表弹窗与分辨率选择 ────────────────────────────────
+//
+// 「从列表选择」由后端代理 GET {API 地址}/models：密钥只该留在后端，浏览器
+// 直连第三方网关还会被跨域拦下。允许未保存的地址/密钥直接试，省掉
+// 「先存一遍再回来看列表」这一轮。
+const showImageModelModal = ref(false)
+const imageModelLoading = ref(false)
+const imageModelError = ref('')
+/**
+ * 「连上了，但网关没返回任何模型」单独一支状态。
+ *
+ * 塞进 imageModelError 会被渲染成红色的「列表拉取失败 · 常见原因：密钥无效」——
+ * 明明 200 连上了，却把人往排查密钥的方向带。这不是错误，只是这家网关不给列表。
+ */
+const imageModelEmptyHint = ref('')
+const imageModelList = ref<string[]>([])
+const imageModelSearch = ref('')
+const imageModelFilter = ref<'all' | 'image' | 'other'>('all')
+const imageModelSelected = ref('')
+const imageModelEndpoint = ref('')
+
+/** 按 id 猜用途：`/models` 只回 id，没有类型字段，只能靠命名习惯分。 */
+const IMAGE_MODEL_ID_RE = /image|flux|diffusion|dall-?e|imagen|kolors|seedream|sd[-_]?[0-9x]/i
+const isImageModelId = (id: string) => IMAGE_MODEL_ID_RE.test(id)
+
+const imageModelCandidates = computed(() => {
+  const q = imageModelSearch.value.trim().toLowerCase()
+  return imageModelList.value
+    .filter((id) => {
+      if (imageModelFilter.value === 'image') return isImageModelId(id)
+      if (imageModelFilter.value === 'other') return !isImageModelId(id)
+      return true
+    })
+    .filter((id) => (q ? id.toLowerCase().includes(q) : true))
+    .slice()
+    .sort((a, b) => {
+      // 图像模型排前面：这个弹窗就是为了选它。
+      const ai = isImageModelId(a) ? 0 : 1
+      const bi = isImageModelId(b) ? 0 : 1
+      return ai === bi ? a.localeCompare(b) : ai - bi
+    })
+})
+
+const imageModelCounts = computed(() => {
+  const total = imageModelList.value.length
+  const image = imageModelList.value.filter(isImageModelId).length
+  return { total, image, other: total - image }
+})
+
+const setImageModelFilter = (key: string) => {
+  imageModelFilter.value = key === 'image' || key === 'other' ? key : 'all'
+}
+
+// ── 图像分组：测试生成（真跑一次，不落库） ──────────────────────────────
+//
+// 管理员填完地址密钥最想知道的是「到底通不通」，这个答案只有真跑一次才有。
+// 测试走的是和工具完全相同的请求路径（后端 preview_image_generation 复用
+// request_image_once），所以「测通了」≈「对话里能用」，不会出现测通但调不通。
+const IMAGE_TEST_DEFAULT_PROMPT = '一只戴圆框眼镜、正在敲键盘的橘猫，扁平插画风格，纯色背景'
+const imageTestPrompt = ref(IMAGE_TEST_DEFAULT_PROMPT)
+const imageTestLoading = ref(false)
+const imageTestError = ref('')
+const imageTestResult = ref<{
+  image: string
+  mime_type: string
+  width: number | null
+  height: number | null
+  size: string
+  model: string
+  bytes: number
+  elapsed_ms: number
+  /** 实际生效的协议：改协议没保存就测试时，这里显示的才是真跑的那一套。 */
+  api_format?: string
+} | null>(null)
+
+/** 总开关当前是否打开（读输入值，不是已保存值），决定测试面板显不显示。 */
+const imageGroupEnabled = computed(() => {
+  const item = (configGroups.value['image'] || []).find(
+    (x) => x.key === 'image_generation_enabled'
+  )
+  return (item?.value ?? '0') === '1'
+})
+
+const imageGroupValueOf = (key: string) =>
+  String((configGroups.value['image'] || []).find((x) => x.key === key)?.value ?? '').trim()
+
+const formatBytes = (bytes: number) => {
+  if (!bytes) return '-'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`
+}
+
+// ── 图像分组：测试改图（内置样图，验证模型能不能吃图输入） ──────────────
+//
+// 「测试生成」通过 ≠ 能改图。只支持文生图的模型（例如只有 openai 端点的 kolors）
+// 在配置上完全合法，文生图测起来也正常，但改图会全 500。这个差别只有真发一张图
+// 过去才看得出来，所以单独一个按钮，用内置样图 + 固定指令。
+const imageEditTestLoading = ref(false)
+const imageEditTestError = ref('')
+const imageEditTestResult = ref<{
+  image: string
+  mime_type: string
+  width: number | null
+  height: number | null
+  size: string
+  model: string
+  bytes: number
+  elapsed_ms: number
+  instruction: string
+} | null>(null)
+
+// 曾经按「接口格式是不是 openai_chat」把测试按钮置灰，现在不需要了：
+// 改图的协议是写死的聊天接口（见 request_image_once），和生图用哪个端点无关。
+
+/** 白名单字符串 → 数组，供测试接口覆盖用（后端会再归一一次尺寸写法）。 */
+const imageAllowedSizesForTest = (): string[] =>
+  imageGroupValueOf('image_allowed_sizes')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean)
+
+/**
+ * 把后端/网络错误转成一句人话。
+ *
+ * 422 的 detail 是数组（FastAPI 校验错误），直接塞进模板会渲染成 [object Object]；
+ * 超时和 401 也不该只显示 axios 原文——它们各自有明确的下一步动作。
+ */
+const describeImageError = (e: any, fallback = '测试失败'): string => {
+  const detail = e?.response?.data?.detail
+  if (Array.isArray(detail)) {
+    const text = detail
+      .map((d: any) => (d && typeof d === 'object' ? d.msg : String(d)))
+      .filter(Boolean)
+      .join('；')
+    if (text) return text
+  }
+  if (typeof detail === 'string' && detail.trim()) return detail.trim()
+  const message = String(e?.message || '')
+  if (e?.code === 'ECONNABORTED' || /timeout/i.test(message)) {
+    return '请求超时：网关没在限定时间内返回。可以先把「单次超时」调大再试。'
+  }
+  const status = e?.response?.status
+  if (status === 401 || status === 403) {
+    return '登录状态已失效或没有配置权限，请重新登录后再试。'
+  }
+  return message || fallback
+}
+
+const runImageEditTest = async () => {
+  // 两个测试各自要真调一次付费接口，并发跑既浪费钱又让结果对不上号
+  // （两个面板同时闪结果，用户分不清哪个是哪个）。同一时间只允许一个在跑。
+  if (imageTestLoading.value || imageEditTestLoading.value) return
+  imageEditTestLoading.value = true
+  imageEditTestError.value = ''
+  imageEditTestResult.value = null
+  try {
+    const { data } = await axios.post(
+      '/api/portal/system/configs/image-generation/test-edit',
+      {
+        base_url: imageGroupValueOf('image_api_base_url') || null,
+        model: imageGroupValueOf('image_model') || null,
+        api_format: imageGroupValueOf('image_api_format') || null,
+        api_key: isConfigItemModified('image_api_key')
+          ? imageGroupValueOf('image_api_key') || null
+          : null,
+        // 开关与超时也传：否则「打开开关还没保存就点测试」测的是库里关着的那套，
+        // 直接报「请先打开开关」，而界面上开关明明是开的。
+        enabled: imageGroupEnabled.value,
+        timeout_seconds: Number(imageGroupValueOf('image_timeout_seconds')) || null,
+      }
+    )
+    if (data?.ok) {
+      imageEditTestResult.value = data
+    } else {
+      imageEditTestError.value = data?.message || '测试失败'
+    }
+  } catch (e: any) {
+    imageEditTestError.value = describeImageError(e)
+  } finally {
+    imageEditTestLoading.value = false
+  }
+}
+
+const runImageTest = async () => {
+  const prompt = imageTestPrompt.value.trim()
+  if (!prompt) {
+    imageTestError.value = '请先填写要生成的画面描述'
+    return
+  }
+  // 与改图测试互斥：两次真实调用并发，钱花了还分不清哪个结果对应哪次点击。
+  if (imageTestLoading.value || imageEditTestLoading.value) return
+  imageTestLoading.value = true
+  imageTestError.value = ''
+  imageTestResult.value = null
+  try {
+    const { data } = await axios.post(
+      '/api/portal/system/configs/image-generation/test',
+      {
+        prompt,
+        // 用当前输入值（可能是没保存的新配置）
+        size: imageGroupValueOf('image_default_size') || null,
+        base_url: imageGroupValueOf('image_api_base_url') || null,
+        model: imageGroupValueOf('image_model') || null,
+        // 协议同样取当前输入值：改了格式还没保存就点测试，测的必须是新协议
+        api_format: imageGroupValueOf('image_api_format') || null,
+        // 密钥只在确实改过时才传：没改时后端会回落库里的真实值，
+        // 而前端手里只有脱敏串（abc****wxyz），传过去只会 401。
+        api_key: isConfigItemModified('image_api_key')
+          ? imageGroupValueOf('image_api_key') || null
+          : null,
+        // 开关/白名单/前缀/超时同样取输入值：这四项决定了后端会不会拒绝、拒绝在哪一步，
+        // 用库里旧值测出来的结论和界面上看到的不一致。
+        enabled: imageGroupEnabled.value,
+        allowed_sizes: imageAllowedSizesForTest(),
+        prompt_prefix: imageGroupValueOf('image_prompt_prefix'),
+        timeout_seconds: Number(imageGroupValueOf('image_timeout_seconds')) || null,
+      }
+    )
+    if (data?.ok) {
+      imageTestResult.value = data
+    } else {
+      imageTestError.value = data?.message || '测试失败'
+    }
+  } catch (e: any) {
+    imageTestError.value = describeImageError(e)
+  } finally {
+    imageTestLoading.value = false
+  }
+}
+
+/**
+ * 密钥框聚焦即全选。
+ *
+ * 框里回显的是脱敏值（abc****wxyz）。用户想换密钥时若光标落在末尾直接打字，
+ * 会拼成「abc****wxyz新密钥」这种既不是旧值也不是新值的串，保存下去看着成功、
+ * 实际 401。全选之后直接输入就是替换。
+ */
+const focusSecretInput = (key: string, event: FocusEvent) => {
+  if (key !== 'image_api_key') return
+  const input = event.target as HTMLInputElement | null
+  input?.select()
+}
+
+/** 中文/日文输入法组字时按回车是在确认候选词，不该顺手发一次付费请求。 */
+const onImageTestEnter = (event: KeyboardEvent) => {
+  if (event.isComposing) return
+  void runImageTest()
+}
+
+const imageModelField = () =>
+  (configGroups.value['image'] || []).find((x) => x.key === 'image_model')
+
+const openImageModelModal = () => {
+  imageModelSelected.value = imageModelField()?.value?.trim() || ''
+  imageModelSearch.value = ''
+  imageModelFilter.value = 'all'
+  showImageModelModal.value = true
+  void loadImageModels()
+}
+
+const closeImageModelModal = () => {
+  showImageModelModal.value = false
+}
+
+const loadImageModels = async () => {
+  imageModelLoading.value = true
+  imageModelError.value = ''
+  imageModelEmptyHint.value = ''
+  imageModelList.value = []
+  try {
+    const group = configGroups.value['image'] || []
+    const pick = (key: string) => (group.find((x) => x.key === key)?.value || '').trim()
+    const { data } = await axios.post('/api/portal/system/configs/image-models', {
+      base_url: pick('image_api_base_url') || null,
+      // 改过密钥就用输入框里的新值：原来这里硬编码 null，等于「新密钥必须先保存
+      // 才能验证」，而没验证过就保存一个坏密钥，模型列表页面对的就是 401。
+      // 后端认得出脱敏串（含 ****）并回落到库里的真实密钥，不用前端判断。
+      api_key: isConfigItemModified('image_api_key')
+        ? pick('image_api_key') || null
+        : null,
+    })
+    if (data?.ok) {
+      imageModelList.value = Array.isArray(data.models) ? data.models : []
+      imageModelEndpoint.value = data.endpoint || ''
+      if (!imageModelList.value.length) {
+        imageModelEmptyHint.value = '接口连上了（HTTP 200），但这个地址没有返回任何模型。可直接手填模型 id。'
+      }
+    } else {
+      imageModelError.value = data?.message || '拉取模型列表失败'
+    }
+  } catch (e: any) {
+    imageModelError.value = e.response?.data?.detail || e.message || '网络错误'
+  } finally {
+    imageModelLoading.value = false
+  }
+}
+
+const applyImageModel = () => {
+  const target = imageModelSelected.value.trim()
+  if (!target) return
+  const field = imageModelField()
+  if (field) field.value = target
+  showImageModelModal.value = false
+  // 选了非图像模型多半是点错：提示一句，但不阻止——有些网关的图生模型名字里不带 image。
+  if (!isImageModelId(target)) {
+    showToast(`已选择「${target}」：它的名字不像图像模型，请确认能出图`, 'warning')
+  }
+}
+
+/** 分辨率白名单的候选：配置里已有的 + 常用尺寸，合成可点选的胶囊。 */
+// ── 图像分组：接口格式下拉 ──────────────────────────────────
+//
+// 两种协议是网关对不同上游暴露的不同入口，同一个模型未必都支持，所以必须让管理员
+// 显式声明。选项同时给出「格式名 + 请求路径 + 行为差异」——只写名字判断不出来。
+const IMAGE_FORMAT_OPTIONS = [
+  {
+    value: 'openai_images',
+    title: '原生 OpenAI 图像格式',
+    badge: '推荐',
+    path: 'POST {API 地址}/images/generations',
+    note: '生图专用接口：size 真实生效并回显 · 支持 n 一次出多张 · 参数写错会明确报错',
+  },
+  {
+    value: 'openai_chat',
+    title: 'OpenAI 聊天格式',
+    badge: '',
+    path: 'POST {API 地址}/chat/completions',
+    note: '兼容性最广、模型 id 宽松匹配 · 一次只能一张 · 尺寸格式不对会被静默忽略',
+  },
+] as const
+
+const imageFormatOpen = ref(false)
+
+const imageFormatCurrent = computed(() => {
+  const item = (configGroups.value['image'] || []).find((x) => x.key === 'image_api_format')
+  const value = String(item?.value ?? '').trim() || 'openai_images'
+  return IMAGE_FORMAT_OPTIONS.find((o) => o.value === value) || IMAGE_FORMAT_OPTIONS[0]
+})
+
+const selectImageFormat = (item: ConfigItem, value: string) => {
+  item.value = value
+  imageFormatOpen.value = false
+}
+
+// 512x512 是最小的一档（图标 / 预览图够用），放在最前保持「由小到大」的阅读顺序。
+// 它默认不勾选：能不能真出 512 取决于上游模型（gpt-image-1 最小只到 1024），
+// 预设里有它是为了让管理员自己按模型能力决定，而不是被写死成不可用。
+const IMAGE_SIZE_PRESETS = [
+  '512x512',
+  '1024x1024',
+  '1328x1328',
+  '1664x928',
+  '928x1664',
+  '1328x1008',
+  '768x1344',
+  '1344x768'
+]
+
+const imageSizeList = (item: ConfigItem) =>
+  (item.value || '')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean)
+
+const imageSizeOptions = (item: ConfigItem) => {
+  const current = imageSizeList(item)
+  const merged = [...IMAGE_SIZE_PRESETS]
+  current.forEach((size) => {
+    if (!merged.includes(size)) merged.push(size)
+  })
+  return merged
+}
+
+/** 常见画幅比例；尺寸是模型侧的原生分辨率（如 1664x928），和 16:9 不完全相等。 */
+const STANDARD_RATIOS: Array<{ label: string; value: number }> = [
+  { label: '1:1', value: 1 },
+  { label: '4:3', value: 4 / 3 },
+  { label: '3:2', value: 3 / 2 },
+  { label: '16:9', value: 16 / 9 },
+  { label: '3:4', value: 3 / 4 },
+  { label: '2:3', value: 2 / 3 },
+  { label: '9:16', value: 9 / 16 }
+]
+
+const ratioLabelOf = (size: string) => {
+  const m = /^(\d+)x(\d+)$/.exec(size.trim())
+  if (!m) return ''
+  const w = Number(m[1])
+  const h = Number(m[2])
+  if (!w || !h) return ''
+  const ratio = w / h
+  // 优先贴到标准画幅上：1664x928 硬化简是 52:29，管理员看不懂，但它就是 16:9。
+  const nearest = STANDARD_RATIOS.reduce((best, cur) =>
+    Math.abs(cur.value - ratio) < Math.abs(best.value - ratio) ? cur : best
+  )
+  if (Math.abs(nearest.value - ratio) / nearest.value <= 0.05) return nearest.label
+  const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a)
+  const g = gcd(w, h)
+  return `${w / g}:${h / g}`
+}
+
+const toggleImageSize = (item: ConfigItem, size: string) => {
+  const current = imageSizeList(item)
+  const next = current.includes(size)
+    ? current.filter((x) => x !== size)
+    : [...current, size]
+  // 最后一项不许取消：空白名单在后端等于「不限尺寸」，反而比只留一项更宽松。
+  // 用户想「换成另一档」时，先取消再勾的中间态若被顺手保存，平台就对任意尺寸放行了。
+  if (next.length === 0) {
+    showToast('至少要保留一个可出图尺寸。要换成别的规格，请先勾上新的再取消这个。', 'warning')
+    return
+  }
+  item.value = next.join(',')
+  syncImageDefaultSize()
+}
+
+/**
+ * 把默认分辨率拉回白名单内。
+ *
+ * 后端的硬约束是「默认值必须属于白名单」，不在其中会被静默改成白名单第一个——
+ * 那种「我明明选了 1024x1024，存完变成 1328x1328」的错位最难查。所以在勾选白名单
+ * 的当下就改，让变化发生在用户眼皮底下。
+ */
+const syncImageDefaultSize = () => {
+  const allowedItem = (configGroups.value['image'] || []).find((x) => x.key === 'image_allowed_sizes')
+  const defaultItem = (configGroups.value['image'] || []).find((x) => x.key === 'image_default_size')
+  const allowed = allowedItem ? imageSizeList(allowedItem) : []
+  if (!defaultItem || allowed.length === 0) return
+  if (!allowed.includes(String(defaultItem.value || '').trim())) {
+    defaultItem.value = allowed[0]
+  }
+}
+
+/** 当前默认值是否在白名单内。不在时要当场提醒，而不是等保存后被悄悄纠正。 */
+const imageDefaultSizeInAllowed = (defaultItem: ConfigItem) => {
+  const allowedItem = (configGroups.value['image'] || []).find((x) => x.key === 'image_allowed_sizes')
+  const allowed = allowedItem ? imageSizeList(allowedItem) : []
+  if (allowed.length === 0) return true
+  return allowed.includes(String(defaultItem.value || '').trim())
+}
+
+/** 默认分辨率的可选项：就是白名单本身；白名单为空（还没勾）时退回预设全量。 */
+const imageDefaultSizeOptions = (defaultItem: ConfigItem) => {
+  const allowedItem = (configGroups.value['image'] || []).find((x) => x.key === 'image_allowed_sizes')
+  const allowed = allowedItem ? imageSizeList(allowedItem) : []
+  const options = allowed.length ? [...allowed] : [...IMAGE_SIZE_PRESETS]
+  const current = String(defaultItem.value || '').trim()
+  // 存量值可能不在白名单里（历史配置/手工改库）：仍要列出来，否则下拉显示空白，
+  // 用户会以为「没设置」而随手又选一个，真实值就丢了。
+  if (current && !options.includes(current)) options.unshift(current)
+  return options
+}
+
 const getCategoryLabel = (cat: string, short = true) => {
   const map: Record<string, { short: string; full: string }> = {
     'agent_context': { short: '上下文管理', full: '上下文管理 (Context Management)' },
@@ -1655,6 +2153,7 @@ const getCategoryLabel = (cat: string, short = true) => {
     'email':         { short: '邮件服务',    full: '邮件服务 (Mail Service)' },
     // 这个分组里只有 secret_policy_*：既然全是凭据注入的闸门，就叫它凭证策略
     'security':      { short: '凭证策略',    full: '凭证策略 (Credential Policy)' },
+    'image':         { short: '图像生成',    full: '图像生成 (Image Generation)' },
   }
   const entry = map[cat]
   if (!entry) return cat.toUpperCase()
@@ -1682,6 +2181,7 @@ const CATEGORY_ICONS: Record<string, any> = {
   'other':         WrenchScrewdriverIcon,
   'email':         EnvelopeIcon,
   'security':      ShieldCheckIcon,
+  'image':         PhotoIcon,
 }
 
 const getCategoryIcon = (cat: string) => CATEGORY_ICONS[cat] || CATEGORY_ICONS['general']
@@ -1694,6 +2194,9 @@ const getCategoryIcon = (cat: string) => CATEGORY_ICONS[cat] || CATEGORY_ICONS['
 const BOOLEAN_FLAG_KEYS = new Set([
   'secret_policy_allow_external_host',
   'secret_policy_allow_script_env',
+  // 图像生成总开关：关闭时 generate_image 不会下发给任何智能体
+  // （后端 ToolRegistry.CONFIG_GATED_TOOLS 同一份语义）。
+  'image_generation_enabled',
 ])
 
 const isBooleanFlag = (item: ConfigItem) => BOOLEAN_FLAG_KEYS.has(item.key)
@@ -1712,30 +2215,56 @@ const toggleFlag = (item: ConfigItem) => {
  * 失焦时纠正到合法区间。后端 `validate_config_update` 是硬闸门，前端只负责别
  * 让人先输错再吃一个 400。
  */
-const SECRET_MAX_INJECT_KEY = 'secret_policy_max_inject_per_call'
-const SECRET_MAX_INJECT_RANGE = [1, 50] as const
+/**
+ * 数值型参数的步进控件规格：纯数字字段用文本框输入，能把「-1」「abc」「999」这种
+ * 值原样存进库，读取侧再悄悄回退成默认值——「改了但没生效」最难查。
+ *
+ * 这里按 key 登记范围/步长/单位，模板只按规格渲染，不再一个字段写一套控件。
+ */
+interface StepperSpec {
+  low: number
+  high: number
+  step: number
+  unit: string
+}
 
-const isSecretMaxInject = (item: ConfigItem) => item.key === SECRET_MAX_INJECT_KEY
+const NUMERIC_STEPPER_SPECS: Record<string, StepperSpec> = {
+  secret_policy_max_inject_per_call: { low: 1, high: 50, step: 1, unit: '条' },
+  // 与后端 MAX_IMAGES_HARD_LIMIT 一致：单次最多 4 张
+  image_max_images_per_call: { low: 1, high: 4, step: 1, unit: '张' },
+  // 实测 1024 约 4-5 秒、横版大图 6-7 秒，10 秒起步、600 秒封顶够覆盖排队
+  image_timeout_seconds: { low: 10, high: 600, step: 10, unit: '秒' }
+}
+
+const stepperSpecOf = (item: ConfigItem): StepperSpec | null =>
+  NUMERIC_STEPPER_SPECS[item.key] ?? null
+
+const isNumericStepper = (item: ConfigItem) => stepperSpecOf(item) !== null
+
+const _stepperNumber = (item: ConfigItem, spec: StepperSpec) => {
+  const raw = Number(String(item.value ?? '').trim())
+  return Number.isFinite(raw) ? raw : spec.low
+}
 
 const clampLimit = (item: ConfigItem) => {
-  const raw = Number(String(item.value ?? '').trim())
-  const [low, high] = SECRET_MAX_INJECT_RANGE
-  const next = Number.isFinite(raw) ? Math.round(raw) : low
-  item.value = String(Math.min(high, Math.max(low, next)))
+  const spec = stepperSpecOf(item)
+  if (!spec) return
+  const next = Math.round(_stepperNumber(item, spec))
+  item.value = String(Math.min(spec.high, Math.max(spec.low, next)))
 }
 
 const nudgeLimit = (item: ConfigItem, delta: number) => {
-  const raw = Number(String(item.value ?? '').trim())
-  const [low, high] = SECRET_MAX_INJECT_RANGE
-  const next = (Number.isFinite(raw) ? raw : low) + delta
-  item.value = String(Math.min(high, Math.max(low, Math.round(next))))
+  const spec = stepperSpecOf(item)
+  if (!spec) return
+  const next = _stepperNumber(item, spec) + delta * spec.step
+  item.value = String(Math.min(spec.high, Math.max(spec.low, Math.round(next))))
 }
 
 const canNudge = (item: ConfigItem, delta: number) => {
-  const raw = Number(String(item.value ?? '').trim())
-  const [low, high] = SECRET_MAX_INJECT_RANGE
-  const base = Number.isFinite(raw) ? raw : low
-  return delta > 0 ? base < high : base > low
+  const spec = stepperSpecOf(item)
+  if (!spec) return false
+  const base = _stepperNumber(item, spec)
+  return delta > 0 ? base < spec.high : base > spec.low
 }
 
 const isLongText = (item: ConfigItem) => {
@@ -2787,6 +3316,38 @@ const getVisibleItems = (items: ConfigItem[] | undefined, category: string) => {
       return a.key.localeCompare(b.key)
     })
   }
+  if (category === 'image') {
+    // 总开关关着时，后面 8 项一个都用不上：地址密钥填了也不会生效，白占一屏还让人
+    // 以为「是不是还得配点什么」。与 knowledge_base_enabled 同一惯例——只不渲染，
+    // 值仍留在 configGroups 里，保存不会把已填的内容清空。
+    const enabledItem = list.find(x => x.key === 'image_generation_enabled')
+    const enabled = (enabledItem?.value ?? '0') === '1'
+    if (!enabled) {
+      list = list.filter(x => x.key === 'image_generation_enabled')
+    }
+    // 按「先总闸、再连接、后行为」排：管理员从上到下填一遍就能用。
+    const order = [
+      'image_generation_enabled',
+      // 先定协议再定地址：地址要按格式拼 /images/generations 或 /chat/completions
+      'image_api_format',
+      'image_api_base_url',
+      'image_api_key',
+      'image_model',
+      'image_default_size',
+      'image_allowed_sizes',
+      'image_max_images_per_call',
+      'image_timeout_seconds',
+      'image_prompt_prefix'
+    ]
+    list.sort((a, b) => {
+      const idxA = order.indexOf(a.key)
+      const idxB = order.indexOf(b.key)
+      if (idxA !== -1 && idxB !== -1) return idxA - idxB
+      if (idxA !== -1) return -1
+      if (idxB !== -1) return 1
+      return a.key.localeCompare(b.key)
+    })
+  }
   if (category === 'agent_context') {
     const order = [
       'agent_context_max_tokens',
@@ -3418,8 +3979,14 @@ const replaySystemTour = async () => {
   sysTourActive.value = true
 }
 
+/** 点空白处收起接口格式下拉（触发器与选项都带了 @click.stop）。 */
+const handleImageFormatOutsideClick = () => {
+  if (imageFormatOpen.value) imageFormatOpen.value = false
+}
+
 onMounted(async () => {
   window.addEventListener('keydown', handleGlobalKeydown)
+  window.addEventListener('click', handleImageFormatOutsideClick)
   if (route.query.tab === 'mcp') {
     router.replace('/dashboard/mcp')
     return
@@ -3457,6 +4024,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleGlobalKeydown)
+  window.removeEventListener('click', handleImageFormatOutsideClick)
   stopDockerPrebuildTimer()
   if (sysTourBootTimer) window.clearTimeout(sysTourBootTimer)
 })
@@ -4617,6 +5185,12 @@ onUnmounted(() => {
                           知识库功能已<strong>关闭</strong>。开启「knowledge_base_enabled」后将显示 RAGFlow 连接与检索参数，并启用知识库管理、检索测试与智能体知识库检索工具。
                        </div>
                     </div>
+                    <div v-if="category === 'image'" class="bg-blue-50 border-l-4 border-blue-400 p-4 rounded-md text-sm text-blue-900 flex items-start space-x-2 mb-4">
+                       <span class="text-blue-500 font-bold shrink-0">ℹ️</span>
+                       <div>
+                          打开总开关后，平台才会把 <code class="font-mono text-xs">generate_image</code> 工具挂到<strong>已勾选该工具</strong>的智能体上；新建智能体默认不带。关闭总开关时工具完全不暴露给模型，不会出现「调了才报错」的多余一轮。
+                       </div>
+                    </div>
                     <div v-if="category === 'email'" class="bg-blue-50 border-l-4 border-blue-400 p-4 rounded-md text-sm text-blue-900 flex items-start space-x-2 mb-4">
                        <span class="text-blue-500 font-bold shrink-0">ℹ️</span>
                        <div>
@@ -4742,21 +5316,21 @@ onUnmounted(() => {
                               </span>
                             </div>
                           </div>
-                          <div v-else-if="isSecretMaxInject(item)">
-                            <div class="flex items-center gap-2">
+                          <div v-else-if="isNumericStepper(item)">
+                            <div class="flex flex-wrap items-center gap-2">
                               <button
                                 type="button"
                                 :disabled="isConfigItemDisabled(String(category), item) || !canNudge(item, -1)"
-                                :aria-label="'减少一条'"
+                                :aria-label="`减少${stepperSpecOf(item)?.step ?? 1}`"
                                 class="flex h-9 w-9 items-center justify-center rounded-md border border-gray-300 bg-white text-gray-600 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
                                 @click="nudgeLimit(item, -1)"
                               >−</button>
                               <input
                                 v-model="item.value"
                                 type="number"
-                                min="1"
-                                max="50"
-                                step="1"
+                                :min="stepperSpecOf(item)?.low ?? 0"
+                                :max="stepperSpecOf(item)?.high ?? 9999"
+                                :step="stepperSpecOf(item)?.step ?? 1"
                                 inputmode="numeric"
                                 :disabled="isConfigItemDisabled(String(category), item)"
                                 class="h-9 w-20 rounded-md border border-gray-300 bg-white text-center text-sm tabular-nums focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary disabled:cursor-not-allowed disabled:bg-gray-100 disabled:opacity-70"
@@ -4765,11 +5339,13 @@ onUnmounted(() => {
                               <button
                                 type="button"
                                 :disabled="isConfigItemDisabled(String(category), item) || !canNudge(item, 1)"
-                                aria-label="增加一条"
+                                :aria-label="`增加${stepperSpecOf(item)?.step ?? 1}`"
                                 class="flex h-9 w-9 items-center justify-center rounded-md border border-gray-300 bg-white text-gray-600 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
                                 @click="nudgeLimit(item, 1)"
                               >+</button>
-                              <span class="text-xs text-gray-500">条（1-50）</span>
+                              <span class="text-xs text-gray-500">
+                                {{ stepperSpecOf(item)?.unit }}（{{ stepperSpecOf(item)?.low }}-{{ stepperSpecOf(item)?.high }}）
+                              </span>
                             </div>
                           </div>
                           <div v-else-if="item.key === 'agent_graceful_finish_enabled'">
@@ -5399,12 +5975,150 @@ onUnmounted(() => {
                               </div>
                             </div>
                           </div>
+                          <div v-else-if="item.key === 'image_api_format'" class="space-y-2">
+                            <!-- 自定义下拉而非原生 select：原生 option 只能放纯文本，
+                                 而这两种协议必须同时看到「格式名 + 请求路径」才判断得出该选哪个。 -->
+                            <div class="relative max-w-md">
+                              <button
+                                type="button"
+                                :disabled="isConfigItemDisabled(String(category), item)"
+                                :aria-expanded="imageFormatOpen"
+                                class="flex w-full items-center gap-2 rounded-lg border border-gray-300 bg-white px-2.5 py-1.5 text-left transition-colors hover:border-gray-400 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:opacity-70"
+                                :class="imageFormatOpen ? 'border-primary ring-1 ring-primary' : ''"
+                                @click.stop="imageFormatOpen = !imageFormatOpen"
+                              >
+                                <span class="min-w-0 flex-1">
+                                  <span class="flex items-center gap-1.5 text-[13px] font-semibold text-gray-800">
+                                    {{ imageFormatCurrent.title }}
+                                    <span
+                                      v-if="imageFormatCurrent.badge"
+                                      class="rounded-full bg-emerald-100 px-1.5 py-0.5 text-[9.5px] font-semibold text-emerald-700"
+                                    >{{ imageFormatCurrent.badge }}</span>
+                                  </span>
+                                  <span class="mt-0.5 block truncate font-mono text-[10.5px] text-gray-400">
+                                    {{ imageFormatCurrent.path }}
+                                  </span>
+                                </span>
+                                <svg
+                                  class="h-3.5 w-3.5 flex-none text-gray-400 transition-transform"
+                                  :class="imageFormatOpen ? 'rotate-180' : ''"
+                                  viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                                >
+                                  <path stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6" />
+                                </svg>
+                              </button>
+
+                              <div
+                                v-if="imageFormatOpen"
+                                class="absolute left-0 right-0 top-full z-30 mt-1 rounded-xl border border-gray-200 bg-white p-1 shadow-xl"
+                              >
+                                <button
+                                  v-for="opt in IMAGE_FORMAT_OPTIONS"
+                                  :key="opt.value"
+                                  type="button"
+                                  class="block w-full rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-gray-50"
+                                  :class="item.value === opt.value ? 'bg-primary/5' : ''"
+                                  @click="selectImageFormat(item, opt.value)"
+                                >
+                                  <span
+                                    class="flex items-center gap-1.5 text-[13px] font-semibold"
+                                    :class="item.value === opt.value ? 'text-primary' : 'text-gray-800'"
+                                  >
+                                    {{ opt.title }}
+                                    <span
+                                      v-if="opt.badge"
+                                      class="rounded-full bg-emerald-100 px-1.5 py-0.5 text-[9.5px] font-semibold text-emerald-700"
+                                    >{{ opt.badge }}</span>
+                                  </span>
+                                  <span class="mt-0.5 block break-all font-mono text-[10.5px] text-gray-500">{{ opt.path }}</span>
+                                  <span class="mt-0.5 block text-[10.5px] leading-relaxed text-gray-400">{{ opt.note }}</span>
+                                </button>
+                              </div>
+                            </div>
+                            <p class="text-[11px] leading-relaxed text-gray-500">
+                              选错格式的典型症状：<strong>404</strong>（路径不对）、<strong>Model mismatch</strong> 或
+                              <strong>No available channel</strong>（该渠道不支持这个协议），以及「出图了但尺寸/张数没生效」。
+                              改完点下方「测试生成」立刻验证，不用进对话试。
+                            </p>
+                          </div>
+                          <div v-else-if="item.key === 'image_model'" class="space-y-2">
+                             <div class="flex items-center gap-2">
+                                <input
+                                   type="text"
+                                   v-model="item.value"
+                                   :disabled="isConfigItemDisabled(String(category), item)"
+                                   placeholder="如 qwen-image-21-turbo"
+                                   class="shadow-sm focus:ring-primary focus:border-primary block w-full sm:text-sm border-gray-300 rounded-md bg-white disabled:bg-gray-100 disabled:opacity-70 disabled:cursor-not-allowed font-mono flex-1"
+                                />
+                                <button
+                                   type="button"
+                                   :disabled="isConfigItemDisabled(String(category), item)"
+                                   class="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-primary/30 bg-white px-3 py-2 text-xs font-medium text-primary shadow-sm transition-colors hover:bg-primary/5 disabled:cursor-not-allowed disabled:opacity-50"
+                                   title="调用 GET {API 地址}/models 拉取列表后点选，比手打稳"
+                                   @click="openImageModelModal"
+                                >
+                                   <PhotoIcon class="h-3.5 w-3.5" />
+                                   从列表选择
+                                </button>
+                             </div>
+                             <p class="text-[11px] leading-relaxed text-gray-500">
+                                必须与 <code class="font-mono">GET {API 地址}/models</code> 返回的 id 完全一致——手打差一个字母就 404。
+                             </p>
+                          </div>
+                          <div v-else-if="item.key === 'image_default_size'" class="space-y-2">
+                            <!-- 下拉而不是文本框：这个值必须落在白名单里，自由输入只会造出
+                                 「填了但保存后被纠正成别的」这种查不到的错位。 -->
+                            <select
+                              v-model="item.value"
+                              :disabled="isConfigItemDisabled(String(category), item)"
+                              class="block w-full max-w-xs rounded-md border-gray-300 bg-white p-2 shadow-sm focus:border-primary focus:ring-primary disabled:cursor-not-allowed disabled:bg-gray-100 disabled:opacity-70 sm:text-sm"
+                            >
+                              <option v-for="opt in imageDefaultSizeOptions(item)" :key="opt" :value="opt">
+                                {{ opt }}{{ ratioLabelOf(opt) ? `（${ratioLabelOf(opt)}）` : '' }}
+                              </option>
+                            </select>
+                            <p class="text-[11px] leading-relaxed text-gray-500">
+                              只能从「允许的分辨率」里选。用户没在对话里指定比例时用它。
+                              <template v-if="!imageDefaultSizeInAllowed(item)">
+                                <strong class="text-amber-700">当前值不在白名单内</strong>，保存后会被自动改成白名单里的第一个。
+                              </template>
+                            </p>
+                          </div>
+                          <div v-else-if="item.key === 'image_allowed_sizes'" class="space-y-2.5">
+                             <div class="flex flex-wrap items-center gap-2">
+                                <button
+                                   v-for="size in imageSizeOptions(item)"
+                                   :key="size"
+                                   type="button"
+                                   :disabled="isConfigItemDisabled(String(category), item)"
+                                   class="inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+                                   :class="imageSizeList(item).includes(size)
+                                     ? 'border-primary bg-primary text-white'
+                                     : 'border-gray-300 bg-white text-gray-600 hover:border-primary/40 hover:bg-primary/5'"
+                                   @click="toggleImageSize(item, size)"
+                                >
+                                   <svg v-if="imageSizeList(item).includes(size)" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-3.5 w-3.5">
+                                      <path fill-rule="evenodd" d="M16.704 5.29a1 1 0 010 1.42l-7.5 7.5a1 1 0 01-1.42 0l-3.5-3.5a1 1 0 111.42-1.42l2.79 2.79 6.79-6.79a1 1 0 011.42 0z" clip-rule="evenodd" />
+                                   </svg>
+                                   <span class="font-mono">{{ size }}</span>
+                                   <span class="text-[10px] opacity-70">{{ ratioLabelOf(size) }}</span>
+                                </button>
+                             </div>
+                             <p class="text-[11px] leading-relaxed text-gray-500">
+                                只有勾选的尺寸会写进工具说明，模型只能从中挑。聊天格式对不认识的尺寸<strong>不报错</strong>、
+                                会静默回退成别的尺寸，原生图像格式才会明确报错——白名单是为了两种协议下都不出「看不出来的错」。
+                             </p>
+                          </div>
                           <div v-else-if="item.is_secret && item.key !== 'embed_api_key'" class="relative">
-                             <input :type="showSecrets[item.key] ? 'text' : 'password'" v-model="item.value" :disabled="isConfigItemDisabled(String(category), item)" class="shadow-sm focus:ring-primary focus:border-primary block w-full sm:text-sm border-gray-300 rounded-md pr-10 bg-white disabled:bg-gray-100 disabled:opacity-70 disabled:cursor-not-allowed" />
+                             <input :type="showSecrets[item.key] ? 'text' : 'password'" v-model="item.value" :disabled="isConfigItemDisabled(String(category), item)" class="shadow-sm focus:ring-primary focus:border-primary block w-full sm:text-sm border-gray-300 rounded-md pr-10 bg-white disabled:bg-gray-100 disabled:opacity-70 disabled:cursor-not-allowed" @focus="focusSecretInput(item.key, $event)" />
                              <div @click="toggleSecret(item.key)" class="absolute inset-y-0 right-0 pr-3 flex items-center cursor-pointer text-gray-400">
                                 <EyeIcon v-if="!showSecrets[item.key]" class="h-5 w-5" />
                                 <EyeSlashIcon v-else class="h-5 w-5" />
                              </div>
+                             <p v-if="item.key === 'image_api_key'" class="mt-1.5 text-[11px] leading-relaxed text-gray-500">
+                               框里是脱敏值（形如 <code class="font-mono">abc****wxyz</code>）。点进来会全选，直接输入即可整体替换；
+                               原样不动地保存不会改动已存的密钥。
+                             </p>
                              <div v-if="item.key === 'ragflow_api_key'" class="mt-3 flex flex-wrap items-center gap-3">
                                <button
                                  type="button"
@@ -5945,6 +6659,21 @@ onUnmounted(() => {
                                 <option value="custom">自定义文字</option>
                              </select>
                           </div>
+                          <div v-else-if="item.key === 'image_prompt_prefix'" class="space-y-1.5">
+                            <!-- 风格前缀通常就一句话，不该套用 isLongText 的 rows=10：
+                                 一屏高的大文本框里只有一行字，既浪费空间也让人以为要写很多。
+                                 保留多行能力（可能想分行罗列风格词），默认两行高。 -->
+                            <textarea
+                              v-model="item.value"
+                              :disabled="isConfigItemDisabled(String(category), item)"
+                              rows="2"
+                              placeholder="例如：企业级扁平插画，主色 #0172a2 / #2563eb，留白充足，画面内不要出现文字"
+                              class="block w-full rounded-md border-gray-300 bg-white p-2.5 text-sm leading-relaxed shadow-sm focus:border-primary focus:ring-primary disabled:cursor-not-allowed disabled:bg-gray-100 disabled:opacity-70"
+                            ></textarea>
+                            <p class="text-[11px] leading-relaxed text-gray-500">
+                              留空则完全按用户描述生成。这段前缀会计入每次出图的提示词，写得越长越容易盖掉用户自己的描述。
+                            </p>
+                          </div>
                           <div v-else-if="isLongText(item)">
                              <textarea v-model="item.value" :disabled="isConfigItemDisabled(String(category), item)" rows="10" class="shadow-sm focus:ring-primary focus:border-primary block w-full sm:text-sm border-gray-300 rounded-md font-mono text-xs bg-white disabled:bg-gray-100 p-3 disabled:opacity-70 disabled:cursor-not-allowed"></textarea>
                              <p v-if="item.key === 'third_party_user_sync_config'" class="mt-2 text-xs text-blue-600 bg-blue-50/50 p-2.5 rounded-lg border border-blue-100 leading-normal select-none">
@@ -6243,7 +6972,7 @@ onUnmounted(() => {
                                @keydown="handleDelegationLimitKeydown"
                                @input="handleDelegationLimitInput(item, $event)"
                                @blur="normalizeDelegationLimitInput(item)"
-                               :aria-label="`${DELEGATION_LIMIT_LABELS[item.key]}（${DELEGATION_LIMIT_RANGES[item.key].min}-${DELEGATION_LIMIT_RANGES[item.key].max}）`"
+                               :aria-label="`${DELEGATION_LIMIT_LABELS[item.key]}（${getDelegationLimitMin(item)}-${getDelegationLimitMax(item)}）`"
                                class="min-w-[5rem] rounded-md border border-gray-300 bg-white disabled:bg-gray-100 px-3 py-2 text-center font-mono text-sm text-gray-700 shadow-sm focus:border-primary focus:ring-primary disabled:cursor-not-allowed disabled:opacity-70"
                              />
                              <button
@@ -6253,8 +6982,8 @@ onUnmounted(() => {
                                @click="adjustDelegationLimit(item, 1)"
                                class="inline-flex h-9 w-9 items-center justify-center rounded-md border border-gray-300 bg-white text-lg leading-none text-gray-600 shadow-sm hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
                              >+</button>
-                             <span class="text-xs text-gray-500">{{ DELEGATION_LIMIT_RANGES[item.key].unit }}</span>
-                             <span class="text-xs text-gray-400">范围 {{ DELEGATION_LIMIT_RANGES[item.key].min }}-{{ DELEGATION_LIMIT_RANGES[item.key].max }}</span>
+                             <span class="text-xs text-gray-500">{{ getDelegationLimitRange(item).unit }}</span>
+                             <span class="text-xs text-gray-400">范围 {{ getDelegationLimitMin(item) }}-{{ getDelegationLimitMax(item) }}</span>
                           </div>
                           <div v-else-if="['audit_log_retention_days', 'agent_max_iterations', 'agent_max_context_turns', 'data_api_timeout_seconds', 'schema_api_timeout_seconds', 'ragflow_metadata_top_k', 'knowledge_ragflow_metadata_top_k', 'chatbi_sample_top_k', 'knowledge_scope_gate_threshold', 'knowledge_scope_gate_ranked_limit'].includes(item.key)">
 	                             <input type="text" v-model="item.value" @keypress="!/[0-9]/.test(($event as KeyboardEvent).key) && ($event as KeyboardEvent).preventDefault()" @input="item.value = item.value.replace(/\D/g, '')" :disabled="isConfigItemDisabled(String(category), item)" class="shadow-sm focus:ring-primary focus:border-primary block w-full sm:text-sm border-gray-300 rounded-md bg-white disabled:bg-gray-100 disabled:opacity-70 disabled:cursor-not-allowed p-2" />
@@ -6542,6 +7271,102 @@ onUnmounted(() => {
                           </div>
                        </div>
                    </div>
+
+                    <!-- 测试生成：走和工具完全相同的请求路径，真跑一次但不落库 -->
+                    <div
+                      v-if="category === 'image' && imageGroupEnabled"
+                      class="mt-2 rounded-xl border border-gray-200 bg-slate-50/60 p-4"
+                    >
+                      <div class="mb-2 flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                        <span class="text-sm font-semibold text-gray-900">测试生成</span>
+                        <span class="text-[11px] text-gray-500">用当前填写的配置真实调一次，<strong class="text-gray-700">不落库、不计入统计</strong></span>
+                        <!-- 只读账号：按钮是禁用的，但不说原因等于让人反复点。 -->
+                        <span v-if="!canSave" class="text-[11px] text-amber-700">
+                          当前账号没有「保存配置」权限（element:system:config_save），无法发起真实调用
+                        </span>
+                      </div>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <input
+                          v-model="imageTestPrompt"
+                          type="text"
+                          :disabled="imageTestLoading"
+                          placeholder="描述想生成的画面，例如：一只戴圆框眼镜、正在敲键盘的橘猫"
+                          class="min-w-[12rem] flex-1 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-400 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary disabled:bg-gray-50 disabled:opacity-70"
+                          @keydown.enter="onImageTestEnter"
+                        />
+                        <button
+                          type="button"
+                          :disabled="imageTestLoading || !canSave"
+                          class="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                          @click="runImageTest"
+                        >
+                          <span v-if="imageTestLoading" class="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/60 border-t-transparent"></span>
+                          <svg v-else xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-3.5 w-3.5">
+                            <path d="M11.3 1.05a.75.75 0 01.55.9l-1.2 4.8h4.1a.75.75 0 01.58 1.22l-7.2 8.9a.75.75 0 01-1.33-.62l1.2-4.8h-4.1a.75.75 0 01-.58-1.22l7.2-8.9a.75.75 0 01.78-.28z" />
+                          </svg>
+                          {{ imageTestLoading ? '生成中…' : '生成' }}
+                        </button>
+                        <button
+                          type="button"
+                          :disabled="imageEditTestLoading || !canSave"
+                          title="用内置样图验证这个模型能不能改图"
+                          class="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-4 py-2 text-sm font-medium text-rose-700 transition-opacity hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50"
+                          @click="runImageEditTest"
+                        >
+                          <span v-if="imageEditTestLoading" class="h-3.5 w-3.5 animate-spin rounded-full border-2 border-rose-400 border-t-transparent"></span>
+                          <svg v-else xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-3.5 w-3.5">
+                            <path d="M13.5 3a.75.75 0 01.75.75V6h2.25a.75.75 0 010 1.5H14.25v2.25a.75.75 0 01-1.5 0V7.5H10.5a.75.75 0 010-1.5h2.25V3.75A.75.75 0 0113.5 3zM2 12a.75.75 0 01.75-.75h6.5a.75.75 0 010 1.5h-6.5A.75.75 0 012 12z" />
+                          </svg>
+                          {{ imageEditTestLoading ? '测试中…' : '测试改图' }}
+                        </button>
+                      </div>
+
+                      <p class="mt-2 text-[11px] leading-relaxed text-gray-500">
+                        「测试改图」用一张内置样图跑一次真改图（把背景换成浅蓝色），验证当前模型能不能接收图片输入——只支持文生图的模型这里会失败。改图固定走 <code class="font-mono">/chat/completions</code>，与上方的接口格式无关。
+                      </p>
+
+                      <p v-if="imageTestError" class="mt-2 break-all rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-2 text-[11px] leading-relaxed text-rose-700">
+                        {{ imageTestError }}
+                      </p>
+
+                      <div v-if="imageTestResult" class="mt-3 flex flex-wrap items-start gap-3">
+                        <img
+                          :src="imageTestResult.image"
+                          :alt="imageTestPrompt"
+                          class="max-h-52 w-auto rounded-lg border border-gray-200 bg-white object-contain shadow-sm"
+                        />
+                        <div class="min-w-[9rem] space-y-1 text-[11px] text-gray-600">
+                          <div>尺寸：<span class="font-mono text-gray-800">{{ imageTestResult.width || '?' }}×{{ imageTestResult.height || '?' }}</span><span class="ml-1 text-gray-400">（请求 {{ imageTestResult.size }}）</span></div>
+                          <div>耗时：<span class="font-mono text-gray-800">{{ (imageTestResult.elapsed_ms / 1000).toFixed(1) }}s</span>　大小：<span class="font-mono text-gray-800">{{ formatBytes(imageTestResult.bytes) }}</span></div>
+                          <div class="break-all">模型：<span class="font-mono text-gray-800">{{ imageTestResult.model }}</span></div>
+                          <!-- 协议决定出图体积与画质，也是排查「这次出来的图和上次不一样」时第一个该看的字段 -->
+                          <div v-if="imageTestResult.api_format">协议：<span class="font-mono text-gray-800">{{ imageTestResult.api_format === 'openai_chat' ? '聊天接口（chat/completions）' : '原生图像接口（images/generations）' }}</span></div>
+                          <p class="pt-1 text-[10px] leading-relaxed text-emerald-700">测试通过。这张图只用于预览，未保存为产物。</p>
+                        </div>
+                      </div>
+
+                      <!-- 改图测试结果单独一块：与生成结果并列会让人误以为是同一张图 -->
+                      <p v-if="imageEditTestError" class="mt-2 break-all rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-2 text-[11px] leading-relaxed text-rose-700">
+                        {{ imageEditTestError }}
+                      </p>
+                      <div v-if="imageEditTestResult" class="mt-3 flex flex-wrap items-start gap-3 rounded-lg border border-emerald-200 bg-emerald-50/50 p-2.5">
+                        <img
+                          :src="imageEditTestResult.image"
+                          alt="改图测试结果"
+                          class="max-h-40 w-auto rounded-lg border border-emerald-200 bg-white object-contain shadow-sm"
+                        />
+                        <div class="min-w-[9rem] space-y-1 text-[11px] text-gray-600">
+                          <div class="text-[12px] font-semibold text-emerald-700">✓ 这个模型可以改图</div>
+                          <div>输出：<span class="font-mono text-gray-800">{{ imageEditTestResult.width || '?' }}×{{ imageEditTestResult.height || '?' }}</span></div>
+                          <div>耗时：<span class="font-mono text-gray-800">{{ (imageEditTestResult.elapsed_ms / 1000).toFixed(1) }}s</span>　大小：<span class="font-mono text-gray-800">{{ formatBytes(imageEditTestResult.bytes) }}</span></div>
+                          <div class="break-all">模型：<span class="font-mono text-gray-800">{{ imageEditTestResult.model }}</span></div>
+                          <p class="pt-1 text-[10px] leading-relaxed text-gray-500">
+                            指令：{{ imageEditTestResult.instruction }}<br>
+                            现在可以到智能体配置里勾选 <code class="font-mono">edit_image</code> 了。
+                          </p>
+                        </div>
+                      </div>
+                    </div>
                 </div>
              </div>
               <div v-if="canSave" class="flex justify-end pt-4 pb-12">
@@ -7181,6 +8006,122 @@ onUnmounted(() => {
             class="px-5 py-2 rounded-xl text-sm font-bold text-white bg-primary hover:bg-primary-dark transition-all duration-200 active:scale-95 shadow-sm focus:outline-none"
           >
             确认裁剪并上传
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 图像模型列表：由后端代理 GET {API 地址}/models（密钥不落到浏览器） -->
+    <div
+      v-if="showImageModelModal"
+      class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm animate-fade-in"
+      @click.self="closeImageModelModal"
+    >
+      <div class="bg-white rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden border border-gray-100 flex flex-col max-h-[80vh]">
+        <div class="px-6 py-4 border-b border-gray-100 flex items-center space-x-2.5 bg-gray-50/50 shrink-0">
+          <div class="p-2 bg-primary/10 rounded-xl text-primary">
+            <PhotoIcon class="h-5 w-5" />
+          </div>
+          <div class="min-w-0">
+            <h3 class="text-md font-bold text-gray-900">选择模型</h3>
+            <p class="text-[11px] text-gray-500 truncate" :title="imageModelEndpoint">
+              即时请求 <code class="font-mono">{{ imageModelEndpoint || 'GET {API 地址}/models' }}</code>，用上方已填的地址与密钥
+            </p>
+          </div>
+        </div>
+
+        <div class="px-5 py-3 border-b border-gray-100 flex flex-wrap items-center gap-2 shrink-0">
+          <input
+            v-model="imageModelSearch"
+            type="search"
+            placeholder="搜索模型 id，例如 image"
+            class="flex-1 min-w-[9rem] rounded-lg border border-gray-200 px-3 py-1.5 text-xs text-gray-800 placeholder-gray-400 focus:border-primary focus:ring-1 focus:ring-primary focus:outline-none"
+          />
+          <div class="flex overflow-hidden rounded-lg border border-gray-300">
+            <button
+              v-for="opt in [{ key: 'all', label: `全部 ${imageModelCounts.total}` }, { key: 'image', label: `图像 ${imageModelCounts.image}` }, { key: 'other', label: `其他 ${imageModelCounts.other}` }]"
+              :key="opt.key"
+              type="button"
+              class="px-2.5 py-1.5 text-[11px] font-medium transition-colors"
+              :class="imageModelFilter === opt.key ? 'bg-gray-900 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'"
+              @click="setImageModelFilter(opt.key)"
+            >
+              {{ opt.label }}
+            </button>
+          </div>
+          <button
+            type="button"
+            :disabled="imageModelLoading"
+            class="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-gray-200 text-gray-500 transition-colors hover:bg-gray-50 disabled:opacity-50"
+            title="重新拉取"
+            @click="loadImageModels"
+          >
+            <ArrowPathIcon class="h-4 w-4" :class="{ 'animate-spin': imageModelLoading }" />
+          </button>
+        </div>
+
+        <div class="min-h-0 flex-1 overflow-y-auto px-3 py-2">
+          <div v-if="imageModelLoading" class="flex items-center justify-center gap-2 py-10 text-xs text-gray-500">
+            <span class="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent"></span>
+            正在拉取模型列表…
+          </div>
+          <div v-else-if="imageModelEmptyHint" class="mx-2 my-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-relaxed text-amber-800">
+            <div class="font-semibold">列表为空</div>
+            <div class="mt-1">{{ imageModelEmptyHint }}</div>
+          </div>
+          <div v-else-if="imageModelError" class="mx-2 my-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-xs leading-relaxed text-rose-700">
+            <div class="font-semibold">列表拉取失败</div>
+            <div class="mt-1 break-all font-mono text-[11px]">{{ imageModelError }}</div>
+            <div class="mt-1.5 text-[11px] text-rose-600">常见原因：API 地址少了 <code class="font-mono">/v1</code>、密钥无效、或该网关不提供 <code class="font-mono">/models</code>。可直接手填模型 id。</div>
+          </div>
+          <div v-else-if="!imageModelCandidates.length" class="py-10 text-center text-xs text-gray-500">
+            没有匹配的模型
+          </div>
+          <button
+            v-for="mid in imageModelCandidates"
+            :key="mid"
+            type="button"
+            class="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-colors"
+            :class="imageModelSelected === mid ? 'bg-primary/10' : 'hover:bg-gray-50'"
+            @click="imageModelSelected = mid"
+          >
+            <span
+              class="flex h-4 w-4 shrink-0 items-center justify-center rounded-full border"
+              :class="imageModelSelected === mid ? 'border-primary' : 'border-gray-300'"
+            >
+              <span v-if="imageModelSelected === mid" class="h-2 w-2 rounded-full bg-primary"></span>
+            </span>
+            <span class="min-w-0 flex-1 truncate font-mono text-xs text-gray-800">{{ mid }}</span>
+            <span
+              v-if="isImageModelId(mid)"
+              class="shrink-0 rounded bg-violet-50 px-1.5 py-0.5 text-[10px] font-medium text-violet-700"
+            >图像生成</span>
+            <span v-else class="shrink-0 text-[10px] text-gray-400">其他</span>
+          </button>
+        </div>
+
+        <div class="px-5 py-3 border-t border-gray-100 bg-gray-50/50 flex items-center gap-3 shrink-0">
+          <p class="min-w-0 flex-1 text-[11px] leading-relaxed text-gray-500">
+            <template v-if="imageModelSelected">
+              已选 <code class="font-mono break-all text-gray-700">{{ imageModelSelected }}</code>
+              <span v-if="!isImageModelId(imageModelSelected)" class="text-amber-600">（名字不像图像模型，请确认能出图）</span>
+            </template>
+            <template v-else>选择一个模型后点「使用该模型」</template>
+          </p>
+          <button
+            type="button"
+            class="px-3 py-1.5 rounded-lg text-xs font-bold text-gray-600 bg-white border border-gray-200 hover:bg-gray-50 transition-colors"
+            @click="closeImageModelModal"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            :disabled="!imageModelSelected"
+            class="px-3 py-1.5 rounded-lg text-xs font-bold text-white bg-primary hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
+            @click="applyImageModel"
+          >
+            使用该模型
           </button>
         </div>
       </div>

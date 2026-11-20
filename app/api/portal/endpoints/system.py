@@ -2,9 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException, Body, File, UploadFile
 from fastapi.responses import StreamingResponse
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
-from app.core.dependencies import require_admin, require_permission
+from app.core.dependencies import require_admin, require_permission, require_api_key
 from app.core.config import settings
 from app.core import redis
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.orm import get_db_session
 from app.services.config_service import ConfigService
 from app.schemas.branding import BrandingSettingsUpdate
 from app.services.branding_settings_service import BrandingSettingsService
@@ -786,7 +788,9 @@ async def update_system_configs(
     try:
         updates = [item.model_dump() for item in request.updates]
         # Pass the username to the service for audit logging
-        await ConfigService.bulk_update(updates, changed_by=user.get("user_name", "admin"))
+        result = await ConfigService.bulk_update(
+            updates, changed_by=user.get("user_name", "admin")
+        )
 
         touched_keys = {str(item.get("key") or "") for item in updates}
         if "platform_timezone" in touched_keys:
@@ -815,7 +819,15 @@ async def update_system_configs(
             except Exception as sched_exc:
                 logging.warning(f"Scheduler reload after timezone change failed: {sched_exc}")
 
-        return {"status": "success", "message": "Configurations updated successfully."}
+        # skipped 一定要回给前端：密钥输入框里回显的是脱敏串，原样提交回来会被服务层
+        # 跳过（保留库里的真实密钥）。只回「保存成功」的话，管理员会以为密钥换掉了。
+        skipped = result.get("skipped") or []
+        return {
+            "status": "success",
+            "message": "Configurations updated successfully.",
+            "updated": result.get("updated") or [],
+            "skipped": skipped,
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
@@ -861,6 +873,195 @@ async def test_email_service(
         "这是一封测试邮件。收到它说明平台邮件服务配置可用。\n",
     )
     return {"ok": ok, "message": message}
+
+
+class ImageModelsRequest(BaseModel):
+    """拉取图像模型列表的入参。
+
+    两个字段都允许为空：为空时用库里已保存的地址/密钥，这样管理员打开弹窗就能
+    直接看到列表；填了则用当前输入框里的值，便于「先验证再保存」。
+    """
+
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+
+
+@router.post("/configs/image-models", summary="拉取图像模型列表（系统设置 · 图像）")
+async def list_image_models_endpoint(
+    payload: Optional[ImageModelsRequest] = Body(default=None),
+    user: Dict = Depends(require_permission("element", "element:system:config_save")),
+):
+    """代理 ``GET {API 地址}/models``。
+
+    由后端代发而不是让前端直连：密钥只应留在后端，且浏览器直连第三方网关会被跨域拦下。
+    失败时把上游原文回给前端——管理员需要看到「401 密钥无效」这种话，才知道该改哪个字段。
+    """
+    from app.services.ai.tools.image_generation_tool import list_image_models
+
+    body = payload or ImageModelsRequest()
+    try:
+        result = await list_image_models(
+            base_url=body.base_url, api_key=body.api_key
+        )
+    except PermissionError as exc:
+        return {"ok": False, "message": str(exc)}
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - 兜底，别让弹窗因为异常白屏
+        logging.error(f"Failed to list image models: {exc}")
+        return {"ok": False, "message": f"拉取模型列表失败：{exc}"}
+    return {"ok": True, **result}
+
+
+class ImageTestRequest(BaseModel):
+    """「测试生成」入参。
+
+    三个配置字段都允许为空：空着就用库里已保存的值，填了就用输入框里的当前值，
+    这样「改了地址/模型但还没保存」也能先试通再保存。
+    """
+
+    prompt: str
+    size: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+    # 协议也要能覆盖：改了格式没保存就点测试时，测的必须是界面上选的这个协议。
+    api_format: Optional[str] = None
+    # 开关 / 白名单 / 前缀 / 超时同样要能覆盖。少了它们，管理员「先关掉开关测一下会不会被拒」
+    # 「把超时改大再测」这类操作永远测不准：真正跑的还是库里那一套。
+    enabled: Optional[bool] = None
+    allowed_sizes: Optional[List[str]] = None
+    prompt_prefix: Optional[str] = None
+    timeout_seconds: Optional[float] = None
+
+
+class ImageEditTestRequest(BaseModel):
+    """「测试改图」入参。
+
+    没有 prompt / size：这一项测的是「这个模型能不能吃图输入」，用的是内置样图与
+    固定指令，让不同模型之间可比。配置字段同样允许为空——空着就用库里已保存的值。
+    """
+
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+    api_format: Optional[str] = None
+    # 改图也有自己的超时体验：同一个网关，改图往往比文生图慢一半，
+    # 不改大就得等它自己断。开关同理——测试要能验证「关掉后确实被拒」。
+    enabled: Optional[bool] = None
+    timeout_seconds: Optional[float] = None
+
+
+@router.post(
+    "/configs/image-generation/test-edit",
+    summary="测试改图（系统设置 · 图像）",
+)
+async def test_image_edit(
+    payload: ImageEditTestRequest,
+    user: Dict = Depends(require_permission("element", "element:system:config_save")),
+):
+    """用内置样图真实调一次改图，验证当前模型能不能吃图输入。
+
+    **不落盘、不发布产物、不写数据库**：结果以 data URL 直接回给设置页预览。
+
+    为什么单独一个测试：一个只支持文生图的模型（例如只有 ``openai`` 端点的
+    ``kolors``）在配置上完全合法，「测试生成」也会通过，但改图会全 500。
+    这个差别只有真发一张图过去才看得出来。
+    """
+    from app.services.ai.tools.image_generation_tool import preview_image_edit
+
+    try:
+        result = await preview_image_edit(
+            base_url=payload.base_url,
+            api_key=payload.api_key,
+            model=payload.model,
+            api_format=payload.api_format,
+            enabled=payload.enabled,
+            timeout_seconds=payload.timeout_seconds,
+        )
+    except (PermissionError, ValueError) as exc:
+        return {"ok": False, "message": str(exc), "supports_edit": False}
+    except Exception as exc:  # noqa: BLE001 - 设置页要看到原因，不能白屏
+        logging.error(f"Image edit test failed: {exc}")
+        return {
+            "ok": False,
+            "message": f"测试失败：{exc}",
+            "supports_edit": False,
+        }
+    return {"ok": True, **result}
+
+
+@router.post("/configs/image-generation/test", summary="测试生成（系统设置 · 图像）")
+async def test_image_generation(
+    payload: ImageTestRequest,
+    user: Dict = Depends(require_permission("element", "element:system:config_save")),
+):
+    """用当前配置真实调一次图像模型，验证能不能出图。
+
+    **不落盘、不发布产物、不写数据库**：结果以 data URL 直接回给设置页预览。
+    管理员配完地址密钥最需要确认的就是「到底通不通」，而这个答案只有真跑一次才有。
+    业务逻辑在 ``preview_image_generation`` 里，端点只负责权限与错误转成可读文案。
+    """
+    from app.services.ai.tools.image_generation_tool import preview_image_generation
+
+    try:
+        result = await preview_image_generation(
+            prompt=payload.prompt,
+            size=payload.size,
+            base_url=payload.base_url,
+            api_key=payload.api_key,
+            model=payload.model,
+            api_format=payload.api_format,
+            enabled=payload.enabled,
+            allowed_sizes=payload.allowed_sizes,
+            prompt_prefix=payload.prompt_prefix,
+            timeout_seconds=payload.timeout_seconds,
+        )
+    except (PermissionError, ValueError) as exc:
+        return {"ok": False, "message": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - 设置页要看到原因，不能白屏
+        logging.error(f"Image generation test failed: {exc}")
+        return {"ok": False, "message": f"测试失败：{exc}"}
+    return {"ok": True, **result}
+
+
+@router.get("/configs/image-generation/status", summary="图像生成可用状态（对话页入口用）")
+async def get_image_generation_status(
+    agent_id: Optional[str] = None,
+    user: Dict = Depends(require_api_key),
+):
+    """给对话输入框的「图像参数」入口判定能不能点。
+
+    只看系统层：``system_enabled=False`` → 「未开启」，用户得找管理员。
+
+    **不再回「当前智能体有没有勾 generate_image / edit_image」**。早先按
+    ``agent_id`` 的已发布版本查过，但「智能委派」这类入口智能体只负责往下分发，
+    本身不会勾业务工具，而真正执行的是被委派的子智能体——前端手里那个
+    ``agent_id`` 代表不了它。判错会把「可用」显示成「不可用」，代价远大于
+    让运行时去报错（用户至少知道发生了什么）。
+
+    ``agent_id`` 参数保留：老前端仍在传，将来若要做「按智能体给不同尺寸白名单」
+    还有用。
+
+    只回布尔与尺寸白名单，**不回任何密钥**——这个接口普通登录用户可访问。
+    """
+    from app.services.ai.tools.image_generation_tool import load_image_generation_config
+
+    config = await load_image_generation_config()
+    # 改图只看总开关：它自己的协议是写死的聊天接口（见 request_image_once），
+    # 不受「生图用哪个端点」影响，所以这里不再拿 api_format 判一遍。
+    payload: Dict[str, Any] = {
+        "system_enabled": bool(config["enabled"]),
+        "allowed_sizes": config["allowed_sizes"],
+        "default_size": config["default_size"],
+        "max_images": config["max_images_per_call"],
+        # 系统层面能不能改图：只看总开关，与智能体无关。
+        "edit_system_enabled": bool(config["enabled"]),
+        # 字段保留：前端已经按它渲染提示，豁免原因将来可能再加（比如换模型）
+        "edit_unavailable_reason": "" if config["enabled"] else "图像生成总开关未开启，请联系管理员",
+    }
+
+    return payload
 
 
 @router.get("/branding")
@@ -940,9 +1141,6 @@ async def reset_branding_icon(
 
 
 # --- Log & Partition Management Endpoints (Admin Only) ---
-
-from app.core.orm import get_db_session
-from sqlalchemy.ext.asyncio import AsyncSession
 
 class LogConfigUpdateRequest(BaseModel):
     audit_log_retention_days: int

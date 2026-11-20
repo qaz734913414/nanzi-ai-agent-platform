@@ -906,6 +906,9 @@
                 dark-mode
                 @stop="stopGeneration({ notifySuccess: true })"
               />
+              <!-- 生图/改图进行中的占位：图落地后这里自动消失（工具项不再是 pending）。
+                   放在时间线下方、正文上方，与最终图片的位置一致，所以不会来回跳。 -->
+              <ImageGenerationPlaceholder :spec="imagePlaceholderFor(msg)" />
               <ToolPermissionCard
                 v-if="msg.pendingPermission"
                 :payload="msg.pendingPermission"
@@ -1381,7 +1384,7 @@
                 :token-label="getMessageTokenAmount(msg)"
                 :can-save-report="canSaveGoldenReportFromMessage(msg) && checkRole(msg, 'agent') && !msg.isThinking"
                 :chatbi-actions="msg.chatbiInsight?.actions || []"
-                :show-generic-continue="checkRole(msg, 'agent') && isGeneralAgentMessage(msg) && !msg.chatbiInsight?.actions?.length && !msg.isThinking && visibleStreamBody(msg)"
+                :show-generic-continue="checkRole(msg, 'agent') && isGeneralAgentMessage(msg) && !msg.chatbiInsight?.actions?.length && !msg.isThinking && Boolean(visibleStreamBody(msg))"
                 @export-data="msg.trace_id && exportData(msg.trace_id, 'xlsx')"
                 @open-reusable-results="openReusableResults(msg.reusableResultStatus?.resultId, msg.trace_id, msg.reusableResultStatus?.status)"
                 @open-artifacts="openMessageArtifacts(msg.trace_id)"
@@ -1528,6 +1531,7 @@
         @update:thinking-enable-override="thinkingEnableOverride = $event"
         @update:reasoning-effort-override="reasoningEffortOverride = $event"
         @update:temperature-override="temperatureOverride = $event"
+        @update:image-size="imageSizeOverride = $event"
         @send="sendMessage"
         @refresh-context-compactions="refreshEmbedContextCompactions(true)"
         @manual-context-compaction="manualCompactEmbedContext"
@@ -2806,6 +2810,7 @@ const handleShareCreated = (_created: any) => {
   historySidebarRef.value?.reloadShares?.();
 };
 import MessageRenderer from "@/components/MessageRenderer.vue";
+import ImageGenerationPlaceholder from "@/components/chat/ImageGenerationPlaceholder.vue";
 import ToolPermissionCard from "@/components/chat/ToolPermissionCard.vue";
 import GroundingBlockedCard from "@/components/GroundingBlockedCard.vue";
 import BusinessConfirmationCard from "@/components/BusinessConfirmationCard.vue";
@@ -2983,6 +2988,7 @@ import {
   type GroundingBlockedPayload,
 } from "@/utils/agentscopeSseHandlers";
 import { hydrateHistoryProcessTimeline, resolveBannerTodoTimeline, settlePendingTimelineSteps, timelineHasPending } from "@/utils/processTimeline";
+import { resolveImagePlaceholder } from "@/utils/imageGenerationPlaceholder";
 import { normalizeSubagentTraceMeta, type SubagentTraceMeta } from "@/utils/subagentTrace";
 import {
   buildBusinessConfirmationUserMessage,
@@ -3442,6 +3448,19 @@ const messages = ref<Message[]>([]);
 const lastAgentMessage = computed(() => {
     return [...messages.value].reverse().find(m => m.role === 'agent' && !m.isTimeLabel);
 });
+/**
+ * 这条消息此刻是否还在出图：在就返回占位参数，否则 null（组件自己 v-if 掉）。
+ *
+ * 纯派生、不含计时——秒表由占位组件内部走。放在渲染期调用，工具项状态一翻
+ * （从 pending 变成完成/失败）就自动重算，占位随之撤掉，不需要额外的收尾逻辑。
+ */
+const imagePlaceholderFor = (msg: Message) => {
+  // 等用户批准权限时工具还没真正开始跑：这里写「正在绘制」就是假话，
+  // 用户真正该看的是下面那张权限卡。
+  if (msg.pendingPermission) return null;
+  return resolveImagePlaceholder(msg.processTimeline);
+};
+
 const displayMessages = computed(() => {
   const raw = messages.value;
   if (!raw || raw.length === 0) return [];
@@ -4650,6 +4669,9 @@ const updateBrowserApprovalMode = async (mode: BrowserApprovalMode) => {
 const thinkingEnableOverride = ref<boolean | null>(null);
 const reasoningEffortOverride = ref<ReasoningEffort | null>(null);
 const temperatureOverride = ref<number | null>(null);
+/** 输入框「图像参数」里选的出图尺寸（白名单原值）。它不进正文，随 execution_options 下发，
+ *  由 generate_image 在调用时锁定尺寸；null = 不指定，用后台默认尺寸。 */
+const imageSizeOverride = ref<string | null>(null);
 const welcomeCards = ref<Array<{ icon: string; title: string; subtitle: string; prompt: string }>>([]);
 interface WelcomeRecentConversation {
   conversation_id: string;
@@ -13093,6 +13115,9 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
   const forcedDataAgentIdForTurn = forceDataQueryAgentOnce.value ? resolvePreferredDataQueryAgentId() : "";
   forceDataQueryAgentOnce.value = false;
   const turnMetadataDatasetIds = [...activeMetadataDatasetIds.value];
+  // 尽早快照本轮出图尺寸：后面清空 userInput + await nextTick 会触发 ChatInput 重置参数，
+  // 若拖到组装请求体时再读 imageSizeOverride.value，已经被清回 null/默认值。
+  const turnImageSize = imageSizeOverride.value || undefined;
 
   const quotaBlock = await ensureCanSend();
   if (quotaBlock) {
@@ -13343,6 +13368,8 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
         knowledge_ragflow_vector_weight: knowledgeVectorWeight.value,
         knowledge_ragflow_metadata_top_k: knowledgeMetadataTopK.value,
         resource_scope: resourceScope.value,
+        // 出图尺寸：只有用户在这次「图像参数」里点了具体分辨率才下发。
+        image_size: turnImageSize,
       },
       permission_options: {
         approval_mode: config.approvalMode || "ask",
