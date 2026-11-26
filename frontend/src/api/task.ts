@@ -2,6 +2,11 @@ import axios from '../utils/axios'
 import type { StandardResponse, ListResponse } from './common'
 
 export interface AgentTask {
+  /**
+   * cron 表达式是否合法（后端 TaskResponse 计算后下发）。
+   * `false` 时任务仍在列表里，但前端要标红提示「离线时不推送」。
+   */
+  cron_valid?: boolean;
   id: number
   name: string
   agent_id: string
@@ -38,6 +43,11 @@ export interface AgentTask {
   }
   last_run_id?: string
   last_run_at?: string
+  /**
+   * 最近 7 次执行状态（时间正序，旧 → 新）。后端按任务会话前缀从执行历史聚合，
+   * 报表订阅等无执行记录的任务会是空数组。
+   */
+  recent_runs?: Array<{ status: string; at?: string | null }>
   next_run_at?: string
   created_at: string
   updated_at: string

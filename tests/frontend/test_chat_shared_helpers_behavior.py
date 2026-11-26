@@ -312,7 +312,7 @@ def test_process_narration_handler_is_shared_across_chat_surfaces():
     assert 'if (item.subagent || item.status === "error" || item.category === "tool_resolution") return false;' in timeline
     assert "🛠️" not in timeline
     assert ".thought-status-dot" in timeline
-    assert "shrink-0 truncate rounded-full border border-purple-100 bg-purple-50" in (
+    assert "shrink-0 truncate rounded-full border border-primary/10 bg-primary/5" in (
         ROOT / "frontend/src/components/chat/ChatThinkingHeader.vue"
     ).read_text(encoding="utf-8")
 
@@ -1357,12 +1357,24 @@ return api.groupChatHistoryByDate(items, now).map(group => ({
     ]
 
 
-def test_stream_normalizers_preserve_nested_trace_type_and_citation_dedupe():
+def test_stream_normalizers_keep_top_level_trace_and_dedupe_citations():
+    """trace_id 归一化：顶层优先，且子代理的嵌套 trace 不能覆盖主轮次。
+
+    旧实现让 `data.data.trace_id`（子智能体）覆盖顶层值，于是嵌套委派一旦发生，
+    这条消息的 trace 就变成子代理的：产物归集、断线重放、取消都对不上真正那一轮。
+    """
     result = _run_typescript(
         "frontend/src/utils/agentscopeSseHandlers.ts",
         """
 const message = { content: '', citations: [{ chunk_id: '1', content: 'old', doc_name: 'a' }] };
+// 顶层与嵌套同时出现：顶层赢
 api.applyStreamTraceId(message, { trace_id: 'outer', data: { trace_id: 42 } });
+
+// 主轮次 UUID 已确定后，子代理的非 UUID trace 不得覆盖它
+const nested = { content: '' };
+api.applyStreamTraceId(nested, { trace_id: '3f8a1c2e-5b7d-4a91-8c33-2d4e5f607182' });
+api.applyStreamTraceId(nested, { trace_id: 'subagent_alice_1' });
+
 api.mergeStreamCitations(message, {
   type: 'citation',
   data: [
@@ -1371,11 +1383,14 @@ api.mergeStreamCitations(message, {
     { chunk_id: '3', content: 'new', doc_name: 'b' }
   ]
 });
-return { traceId: message.trace_id, citations: message.citations };
+return { traceId: message.trace_id, nestedTraceId: nested.trace_id, citations: message.citations };
 """,
     )
 
-    assert result["traceId"] == 42
+    assert result["traceId"] == "outer", "顶层 trace_id 必须优先于嵌套的 data.data.trace_id"
+    assert result["nestedTraceId"] == "3f8a1c2e-5b7d-4a91-8c33-2d4e5f607182", (
+        "子代理的嵌套 trace 不能覆盖主轮次 UUID"
+    )
     assert [citation["chunk_id"] for citation in result["citations"]] == ["1", "2"]
 
 

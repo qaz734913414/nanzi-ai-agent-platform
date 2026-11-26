@@ -6,12 +6,12 @@ import { buildWorkspaceActionEntries, buildWorkspaceItemMenuContext, isPublicWor
 
 const keys = (ctx) => buildWorkspaceActionEntries(ctx).map((entry) => entry.key)
 
-// --- 1. 普通文件：6 项，重命名/删除前有分隔线，删除为危险项 ---
+// --- 1. 普通文件：7 项（分享紧跟下载），重命名/删除前有分隔线，删除为危险项 ---
 const file = buildWorkspaceActionEntries({
   scene: 'regular-item',
   target: { name: 'report.md', path: '/w/report.md', isDir: false, isPreviewable: true },
 })
-assert.deepEqual(file.map((e) => e.key), ['preview', 'download', 'copy-path', 'mount', 'rename', 'delete'])
+assert.deepEqual(file.map((e) => e.key), ['preview', 'download', 'share', 'copy-path', 'mount', 'rename', 'delete'])
 assert.equal(file.find((e) => e.key === 'rename').separatorBefore, true)
 assert.equal(file.find((e) => e.key === 'delete').danger, true)
 assert.equal(file.find((e) => e.key === 'delete').separatorBefore, undefined)
@@ -26,7 +26,7 @@ assert.equal(zip.find((e) => e.key === 'preview').disabledHint, '该格式不支
 assert.equal(zip.find((e) => e.key === 'download').disabled, undefined)
 assert.deepEqual(
   zip.map((e) => e.key),
-  ['preview', 'download', 'extract', 'copy-path', 'mount', 'rename', 'delete'],
+  ['preview', 'download', 'share', 'extract', 'copy-path', 'mount', 'rename', 'delete'],
 )
 assert.equal(zip.find((e) => e.key === 'extract').label, '解压到…')
 assert.equal(zip.find((e) => e.key === 'extract').disabled, undefined)
@@ -87,7 +87,7 @@ assert.deepEqual(
     canManage: false,
     target: { name: 'r.md', path: '/w/r.md', isDir: false, isPreviewable: true },
   }),
-  ['preview', 'download', 'copy-path', 'mount'],
+  ['preview', 'download', 'share', 'copy-path', 'mount'],
 )
 
 // --- 4. 公共只读：有表头、无重命名/删除 ---
@@ -97,7 +97,7 @@ const pub = buildWorkspaceActionEntries({
 })
 assert.equal(pub[0].key, 'header')
 assert.equal(pub[0].label, '公共只读资源')
-assert.deepEqual(pub.map((e) => e.key), ['header', 'preview', 'download', 'mount', 'copy-path'])
+assert.deepEqual(pub.map((e) => e.key), ['header', 'preview', 'download', 'copy-and-share', 'mount', 'copy-path'])
 
 // --- 5. 公共目录（管理员）+ 系统保护目录：无重命名/永久删除 ---
 const admin = buildWorkspaceActionEntries({
@@ -215,7 +215,7 @@ assert.deepEqual(
     userWorkspaceRoot: root,
     isAdminScope: true,
   })),
-  ['preview', 'download', 'copy-path', 'mount', 'rename', 'delete'],
+  ['preview', 'download', 'share', 'copy-path', 'mount', 'rename', 'delete'],
 )
 
 // 回收站优先于公共判定：trash 条目即使路径不在本人工作区内也是 trash-item
@@ -248,5 +248,46 @@ assert.deepEqual(
   })),
   ['open-dir', 'copy-path', 'mount'],
 )
+
+// --- 分享按归属置灰：管理员能浏览他人目录，但不能分享---------------------------
+// `is_public_fs_path` 只认公共目录（docs / skills 那类），别人的私有目录一律
+// false，因此被判成 regular-item。过去菜单照样可点，点完才收到
+// 「只能分享本人工作区的文件」——分享链接是公开可读的，这条必须事先拦住。
+const ownFile = buildWorkspaceActionEntries(
+  buildWorkspaceItemMenuContext({
+    item: { path: `${root}/docs/a.xlsx`, name: 'a.xlsx', is_public: false },
+    target: target('a.xlsx', `${root}/docs/a.xlsx`),
+    userWorkspaceRoot: root,
+  }),
+)
+assert.equal(ownFile.find((e) => e.key === 'share').disabled, undefined, '本人文件应可分享')
+
+const otherFile = buildWorkspaceActionEntries(
+  buildWorkspaceItemMenuContext({
+    item: { path: '/data/agent_workspaces/bob__2/docs/a.xlsx', name: 'a.xlsx', is_public: false },
+    target: target('a.xlsx', '/data/agent_workspaces/bob__2/docs/a.xlsx'),
+    userWorkspaceRoot: root,
+  }),
+)
+const otherShare = otherFile.find((e) => e.key === 'share')
+assert.equal(otherShare.disabled, true, '他人工作区文件必须置灰')
+assert.match(otherShare.disabledHint, /本人工作区/)
+
+// 前缀相近但不是本人目录：alice2 不在 alice 之下，不能被 isPathUnderRoot 误判
+const siblingFile = buildWorkspaceActionEntries(
+  buildWorkspaceItemMenuContext({
+    item: { path: '/data/agent_workspaces/alice2/docs/a.xlsx', name: 'a.xlsx', is_public: false },
+    target: target('a.xlsx', '/data/agent_workspaces/alice2/docs/a.xlsx'),
+    userWorkspaceRoot: root,
+  }),
+)
+assert.equal(siblingFile.find((e) => e.key === 'share').disabled, true, 'alice2 不属于 alice')
+
+// 判不出本人根时不置灰：宁可让后端拒绝，也不能凭空禁掉本人的分享
+const unknownRootFile = buildWorkspaceActionEntries({
+  scene: 'regular-item',
+  target: target('a.xlsx', '/data/agent_workspaces/bob__2/docs/a.xlsx'),
+})
+assert.equal(unknownRootFile.find((e) => e.key === 'share').disabled, undefined, '判不出归属时不下结论')
 
 console.log('工作区行操作菜单项测试全部通过')

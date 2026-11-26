@@ -1,14 +1,27 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
+import { ExclamationTriangleIcon,
+  LightBulbIcon,
+  BookOpenIcon,
+  ChartBarIcon,
+  DocumentIcon,
+  DocumentTextIcon,
+  GlobeAltIcon,
+  PhotoIcon,
+  TableCellsIcon,
+} from "@heroicons/vue/24/outline";
+import { ref, computed, watch, onMounted, onUnmounted, type Component } from 'vue';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/github.css';
 import MermaidRenderer from '@/components/MermaidRenderer.vue';
 import CanvasMarkdownRenderer from '@/components/embed/CanvasMarkdownRenderer.vue';
+import CanvasReaderShell from '@/components/embed/CanvasReaderShell.vue';
 import WorkspaceDirectorySaveDialog from '@/components/embed/WorkspaceDirectorySaveDialog.vue';
+import ShareFileDialog from '@/components/ShareFileDialog.vue';
 import ConfirmModal from '@/components/ConfirmModal.vue';
 import PivotTable from '@/components/embed/PivotTable.vue';
 import { useToast } from '@/composables/useToast';
-import { buildGeneratedWorkspaceFilename, canWriteWorkspaceFile, createWorkspaceEntry, downloadWorkspaceFile, isDirectRenderableUrl, resolveHighlightLanguage, resolvePublicUploadsPreviewUrl, saveWorkspaceFileContent, shouldPreviewWithFileViewerInCanvas } from '@/utils/workspaceFilePreview';
+import { buildGeneratedWorkspaceFilename, canWriteWorkspaceFile, createWorkspaceEntry, downloadWorkspaceFile, isDirectRenderableUrl, relocateGeneratedArtifact, resolveHighlightLanguage, resolvePublicUploadsPreviewUrl, saveWorkspaceFileContent, shouldPreviewWithFileViewerInCanvas, uploadToWorkspaceDir } from '@/utils/workspaceFilePreview';
+import { extractArtifactId } from '@/utils/generatedArtifact';
 import { buildArtifactDownloadUrl } from '@/utils/generatedFilePreviewPlan';
 import { copyToClipboard } from '@/utils/clipboard';
 import { highlightCsvCell } from '@/utils/csvHighlight';
@@ -63,9 +76,83 @@ const outputCopied = ref(false);
 const editorContent = ref('');
 const savedContent = ref('');
 const saving = ref(false);
-const pendingOverwrite = ref<{ path: string; content: string } | null>(null);
+/**
+ * 覆盖确认。两种来源：
+ * - `content`：写文本内容（代码/HTML/CSV/Markdown）；
+ * - `artifactId`：产物迁址撞上同名文件，确认后重发一次带 overwrite 的移动。
+ * 图片走迁址，绝不能落到「写文本」那条分支上——那会把图片文件写坏。
+ */
+const pendingOverwrite = ref<
+  | { kind: 'content'; path: string; content: string }
+  | { kind: 'relocate'; path: string; artifactId: string; parentPath: string; name: string }
+  | null
+>(null);
 const effectiveSourcePath = ref('');
+/**
+ * 当前画布内容对应的生成产物 ID（从 download_url 里解析）。
+ *
+ * 产物已在 `<user_key>/generated/` 下，但路径从没出过后端：有这个 ID 就能分享，
+ * 也能让「保存到目录」走移动而不是再复制一份。
+ */
+const artifactRef = ref('');
 const showSaveDialog = ref(false);
+/**
+ * 顶栏「⋯」菜单状态。
+ *
+ * 原来顶栏是 6 个同级图标平铺（保存 / 复制 / 下载 / 钉住 / 全屏 / 关闭），
+ * 再加分享就是 7 个，窄屏必然挤成一排小点。收敛规则：对文件做的事全进菜单，
+ * 顶栏只留改「面板本身」的控制（钉住 / 全屏 / 关闭）。
+ */
+const moreMenuOpen = ref(false);
+/**
+ * 阅读偏好：字号倍率与限宽。存 localStorage 而不是每次打开重置——
+ * 调过字号的人就是眼睛不舒服，每次重开都退回 100% 等于没做这个功能。
+ */
+const READER_SCALE_KEY = 'canvas:reader-scale';
+const READER_NARROW_KEY = 'canvas:reader-narrow';
+const readerScale = ref(1);
+const readerNarrow = ref(false);
+
+const loadReaderPrefs = () => {
+  try {
+    const scale = Number(localStorage.getItem(READER_SCALE_KEY));
+    if (Number.isFinite(scale) && scale >= 0.9 && scale <= 1.4) readerScale.value = scale;
+    readerNarrow.value = localStorage.getItem(READER_NARROW_KEY) === '1';
+  } catch {
+    /* 隐私模式下 localStorage 不可用：用默认值即可，不该因此报错 */
+  }
+};
+
+const persistReaderPrefs = () => {
+  try {
+    localStorage.setItem(READER_SCALE_KEY, String(readerScale.value));
+    localStorage.setItem(READER_NARROW_KEY, readerNarrow.value ? '1' : '0');
+  } catch {
+    /* 同上 */
+  }
+};
+
+const zoomReader = (delta: number) => {
+  const next = Math.min(1.4, Math.max(0.9, Number((readerScale.value + delta).toFixed(2))));
+  readerScale.value = next;
+  persistReaderPrefs();
+};
+
+const resetReaderScale = () => {
+  readerScale.value = 1;
+  persistReaderPrefs();
+};
+
+const toggleReaderNarrow = () => {
+  readerNarrow.value = !readerNarrow.value;
+  persistReaderPrefs();
+};
+
+const readerScalePercent = computed(() => `${Math.round(readerScale.value * 100)}%`);
+/** 字号与限宽只对 Markdown 阅读有意义：代码、图片、Office 有自己的显示逻辑 */
+const showReaderControls = computed(() => isMarkdownContent.value && activeTab.value === 'preview');
+/** 分享目标：只有拿到工作区路径才能分享，所以这里是一个可空对象而不是 boolean */
+const shareTarget = ref<{ path: string; name: string; size: number; artifactId: string } | null>(null);
 const isMobile = ref(
   typeof window !== 'undefined' && window.matchMedia('(max-width: 639px)').matches,
 );
@@ -437,11 +524,70 @@ const isHtmlContent = computed(() => {
   return false;
 });
 
+/**
+ * 对话里生成的内容能不能「保存到工作区」。
+ *
+ * 原来只放行 code / html，于是生成的表格（csv）和图表（mermaid）连手动保存都没有，
+ * 分享自然也无从谈起——这不是分享带来的新问题，是本来缺的能力。
+ * markdown 走的是 code 类型（靠标题识别），本就已覆盖。
+ */
+const SAVEABLE_GENERATED_TYPES: ReadonlySet<string> = new Set(['code', 'html', 'csv', 'mermaid', 'image']);
+
 const canSaveGeneratedContent = computed(() => {
   if (!props.data || effectiveSourcePath.value) return false;
-  if (props.data.type !== 'code' && props.data.type !== 'html') return false;
+  if (!SAVEABLE_GENERATED_TYPES.has(props.data.type)) return false;
   return !!codeTextContent.value;
 });
+
+/** 图片内容不是文本（blob: / data: / http 地址），保存要走上传通道而不是写文本。 */
+const isImageGeneratedContent = computed(() => props.data?.type === 'image' && !effectiveSourcePath.value);
+
+/**
+ * 把画布里的图片读成 Blob。
+ *
+ * 图片的 ``content`` 是一个地址而不是内容本身，所以要先 fetch 回来才能落盘；
+ * 读不到就明确失败，不要落一个 0 字节文件让用户以为存好了。
+ */
+const resolveGeneratedImageBlob = async (): Promise<Blob | null> => {
+  const src = String(props.data?.content || '').trim();
+  if (!src) return null;
+  try {
+    const resp = await fetch(src);
+    if (!resp.ok) return null;
+    const blob = await resp.blob();
+    return blob.size > 0 ? blob : null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * 类型徽标的图标与文案。
+ *
+ * 原来这里是 8 套配色（蓝/绿/红/琥珀/靛/紫/青/天蓝）内联三元链，同一排里三套颜色语言，
+ * 而用户并不会从「紫色 = 文件差异」学到任何东西。颜色应该留给真需要一眼看出的状态
+ * （已保存 / 未保存），类型只用一个中性徽标 + 图标区分。
+ */
+const canvasTypeMeta = computed<{ icon: Component | null; glyph: string; label: string }>(() => {
+  const type = props.data?.type;
+  if (type === 'html') return { icon: GlobeAltIcon, glyph: '', label: 'Application' };
+  if (isMarkdownFile.value) return { icon: DocumentTextIcon, glyph: '', label: 'Markdown' };
+  if (type === 'image') return { icon: PhotoIcon, glyph: '', label: 'Image' };
+  if (type === 'pdf') return { icon: BookOpenIcon, glyph: '', label: 'PDF' };
+  if (type === 'csv') return { icon: TableCellsIcon, glyph: '', label: 'CSV' };
+  if (type === 'mermaid') return { icon: ChartBarIcon, glyph: '', label: 'Diagram' };
+  // 差异与代码用自带形状的文本标记：± 和 </> 本身就是最省地方的表意符号
+  if (type === 'compare') return { icon: null, glyph: '±', label: 'Diff' };
+  if (type === 'document') return { icon: DocumentIcon, glyph: '', label: 'Office' };
+  return { icon: null, glyph: '</>', label: 'Code' };
+});
+
+/** 已保存徽标点一下就复制路径：路径本身不再占一整行，但「复制路径」这个需求还在。 */
+const copySourcePath = async () => {
+  if (!effectiveSourcePath.value) return;
+  const ok = await copyToClipboard(effectiveSourcePath.value);
+  showToast(ok ? '路径已复制' : '复制失败，请手动选中', ok ? 'success' : 'error');
+};
 
 const generatedFilename = computed(() => {
   const data = props.data;
@@ -549,6 +695,7 @@ const syncEditorFromData = () => {
   editorContent.value = text;
   savedContent.value = text;
   effectiveSourcePath.value = props.data?.sourcePath || '';
+  artifactRef.value = extractArtifactId(String(props.data?.content || ''));
   showSaveDialog.value = false;
 };
 
@@ -577,6 +724,64 @@ const saveWorkspaceFile = async () => {
   }
 };
 
+/**
+ * 点击「⋯」之外的任何地方都要收起菜单。
+ *
+ * 用 document 上的捕获阶段监听而不是给遮罩层：画布本身可能钉在侧边、
+ * 遮罩会把对话区吃掉，用户点了对话却关不掉菜单，比不收起更烦。
+ */
+const handleMoreMenuOutside = (event: MouseEvent) => {
+  const el = event.target as HTMLElement | null;
+  if (el?.closest('[data-canvas-more]')) return;
+  moreMenuOpen.value = false;
+};
+
+const closeMoreMenu = () => {
+  moreMenuOpen.value = false;
+};
+
+/**
+ * 分享当前画布文件。
+ *
+ * 分享的对象是**工作区里的文件**，不是画布里的这段内容——后端按路径 + 指纹分享。
+ * 所以没有 ``sourcePath`` 时（对话里刚生成、还没落盘的内容）不能分享，
+ * 菜单项会置灰并说明原因，而不是点了以后报一个看不懂的错。
+ */
+const openShare = () => {
+  closeMoreMenu();
+  const path = effectiveSourcePath.value;
+  const artifactId = artifactRef.value;
+  if (!path && !artifactId) {
+    showToast('请先保存到工作区，再分享', 'info');
+    return;
+  }
+  const data = props.data;
+  // Office / PDF / 图片 / CSV 的 content 是地址而不是内容，按它算出来的体积是假的
+  // （会显示成一个几十字节的 xlsx）。这类文件交给分享弹窗留空，别显示错数字。
+  const raw = typeof data?.content === 'string' ? data.content : '';
+  const contentIsUrl = /^(blob:|data:|https?:\/\/|\/api\/)/.test(raw);
+  shareTarget.value = {
+    path,
+    name: (data?.title || path.split('/').pop() || 'file').trim(),
+    size: contentIsUrl ? 0 : new Blob([raw]).size,
+    artifactId,
+  };
+};
+
+/**
+ * 能分享的条件：拿到了工作区路径，或者拿到了产物 ID。
+ *
+ * 生成类产物落盘在 `generated/` 下，但前端只有 download_url——过去因此把它当成
+ * 「未落盘」，分享一直置灰（提示「需先保存」，其实文件早就在工作区里了）。
+ * 现在凭 ID 交给后端反查路径。
+ */
+const canShareFile = computed(() => !!effectiveSourcePath.value || !!artifactRef.value);
+
+const handleShareCreated = () => {
+  // 弹窗自己会展示结果态；这里只留一个轻提示，避免用户以为没成功
+  showToast('分享链接已创建', 'success');
+};
+
 const requestSaveToDirectory = () => {
   if (!canSaveGeneratedContent.value || saving.value) return;
   showSaveDialog.value = true;
@@ -589,6 +794,34 @@ const handleDirectorySave = async (payload: { parentPath: string; name: string }
   const fullPath = `${parentPath}/${payload.name}`;
   saving.value = true;
   try {
+    if (isImageGeneratedContent.value) {
+      // 产物本来就在工作区 generated/ 里：移动即可，别再下载再上传白占一份磁盘
+      if (artifactRef.value) {
+        const response = await relocateGeneratedArtifact(
+          artifactRef.value,
+          parentPath,
+          payload.name,
+        );
+        const savedPath = response.data?.data?.path || fullPath;
+        markContentSaved(savedPath, '');
+        showSaveDialog.value = false;
+        return;
+      }
+      // 没有产物 ID 的图片（外部链接等）只能走上传：
+      // create-entry 只收文本（后端按 TEXT_PREVIEW_EXTENSIONS 白名单拒绝二进制），
+      // 直接写文本会把图片存成坏文件。
+      const blob = await resolveGeneratedImageBlob();
+      if (!blob) {
+        showToast('图片内容读取失败，无法保存', 'error');
+        return;
+      }
+      const file = new File([blob], payload.name, { type: blob.type || 'image/png' });
+      const uploaded = await uploadToWorkspaceDir(parentPath, file);
+      const savedPath = uploaded.data?.data?.path || fullPath;
+      markContentSaved(savedPath, '');
+      showSaveDialog.value = false;
+      return;
+    }
     const response = await createWorkspaceEntry({
       parentPath,
       name: payload.name,
@@ -600,7 +833,16 @@ const handleDirectorySave = async (payload: { parentPath: string; name: string }
     showSaveDialog.value = false;
   } catch (err: any) {
     if (err.response?.status === 409) {
-      pendingOverwrite.value = { path: fullPath, content };
+      pendingOverwrite.value =
+        isImageGeneratedContent.value && artifactRef.value
+          ? {
+              kind: 'relocate',
+              path: fullPath,
+              artifactId: artifactRef.value,
+              parentPath,
+              name: payload.name,
+            }
+          : { kind: 'content', path: fullPath, content };
     } else if (err.response?.status !== 409) {
       const errMsg = err.response?.data?.detail || err.response?.data?.message || err.message || '保存失败';
       showToast(errMsg, 'error');
@@ -616,6 +858,19 @@ const confirmOverwrite = async () => {
   pendingOverwrite.value = null;
   saving.value = true;
   try {
+    if (pending.kind === 'relocate') {
+      // 产物迁址的覆盖：重发一次移动，带上 overwrite
+      const response = await relocateGeneratedArtifact(
+        pending.artifactId,
+        pending.parentPath,
+        pending.name,
+        { overwrite: true },
+      );
+      const savedPath = response.data?.data?.path || pending.path;
+      markContentSaved(savedPath, '');
+      showSaveDialog.value = false;
+      return;
+    }
     await saveWorkspaceFileContent({
       path: pending.path,
       content: pending.content,
@@ -897,14 +1152,18 @@ const panelStyle = computed(() => {
 
 onMounted(() => {
   loadCustomWidth();
+  loadReaderPrefs();
   mobileMq = window.matchMedia('(max-width: 639px)');
   syncMobile();
   mobileMq.addEventListener('change', syncMobile);
   applyFillAvailableWidth();
   window.addEventListener('resize', applyFillAvailableWidth);
+  // 捕获阶段：菜单项自己也点了，必须在冒泡前判断，否则点菜单项会先被当成「外部点击」关掉
+  document.addEventListener('click', handleMoreMenuOutside, true);
 });
 
 onUnmounted(() => {
+  document.removeEventListener('click', handleMoreMenuOutside, true);
   void stopExecution();
   stopResize();
   mobileMq?.removeEventListener('change', syncMobile);
@@ -915,6 +1174,7 @@ watch(
   () => [props.visible, pinned.value, props.dockSide, props.adjacentDockWidth, isMobile.value] as const,
   ([visible], previous) => {
     if (!visible) {
+      moreMenuOpen.value = false;
       widthManuallyAdjusted.value = false;
       return;
     }
@@ -1011,118 +1271,164 @@ const overlayBackdropClass = computed(() =>
       <!-- Header -->
       <div class="p-4 border-b border-gray-100 dark:border-gray-700 flex justify-between items-center flex-shrink-0">
         <div class="min-w-0 flex-1">
-          <div class="flex items-center space-x-2">
-            <span class="text-sm font-bold text-gray-800 dark:text-gray-200 truncate max-w-[200px] sm:max-w-[320px]">
+          <!--
+            标题独占一行，类型徽标与保存状态落到第二行。
+            三者挤同一行时，标题会被两个徽标顶掉、只剩
+            `generated-image-20261120-013808-1-d0c8…`，而标题恰恰是
+            「我打开的是哪个文件」的唯一线索；徽标只是补充信息，让它先让位。
+            标题也就此不再需要 max-w 硬截断——那个限制原本就是为了给徽标腾地方。
+          -->
+          <div class="flex min-w-0 flex-col gap-1">
+            <!-- 标题被窄面板截断是常态，tooltip 里给全名，否则用户无从判断打开的是哪个文件 -->
+            <span
+              class="truncate text-sm font-bold text-gray-800 dark:text-gray-200"
+              :title="data?.title || '画布'"
+            >
               {{ data?.title || '画布' }}
             </span>
-            <span
-              class="px-1.5 py-0.5 text-[8px] rounded font-bold uppercase"
-              :class="
-                data?.type === 'html' ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400' :
-                data?.type === 'image' ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400' :
-                data?.type === 'pdf' ? 'bg-rose-100 dark:bg-rose-900/30 text-rose-600 dark:text-rose-400' :
-                data?.type === 'csv' ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400' :
-                data?.type === 'mermaid' ? 'bg-indigo-100 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400' :
-                data?.type === 'compare' ? 'bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400' :
-                data?.type === 'document' ? 'bg-teal-100 dark:bg-teal-900/30 text-teal-600 dark:text-teal-400' :
-                isMarkdownFile ? 'bg-sky-100 dark:bg-sky-900/30 text-sky-600 dark:text-sky-400' :
-                'bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400'
-              "
-            >
-              {{
-                data?.type === 'html' ? 'Application' :
-                isMarkdownFile ? 'Markdown' :
-                data?.type === 'image' ? 'Image' :
-                data?.type === 'pdf' ? 'PDF' :
-                data?.type === 'csv' ? 'CSV Table' :
-                data?.type === 'mermaid' ? 'Diagram' :
-                data?.type === 'compare' ? 'File Diff' :
-                data?.type === 'document' ? 'Office' :
-                'Code'
-              }}
-            </span>
-          </div>
-          <div v-if="effectiveSourcePath" class="mt-1 truncate text-[10px] text-emerald-600 dark:text-emerald-400" :title="effectiveSourcePath">
-            已保存：<code class="font-mono">{{ effectiveSourcePath }}</code>
+            <div class="flex min-w-0 items-center gap-1.5">
+              <span
+                class="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold bg-gray-100 text-gray-600 dark:bg-gray-700/60 dark:text-gray-300"
+                :title="`类型：${canvasTypeMeta.label}`"
+              >
+                <component
+                  :is="canvasTypeMeta.icon"
+                  v-if="canvasTypeMeta.icon"
+                  class="h-3 w-3"
+                  aria-hidden="true"
+                />
+                <span v-else class="text-[10px] leading-none">{{ canvasTypeMeta.glyph }}</span>
+                <span class="uppercase tracking-wide">{{ canvasTypeMeta.label }}</span>
+              </span>
+              <!--
+                已保存状态不再占一整行路径（路径可复制，没必要常驻）。
+                颜色留给它：绿=已保存、灰=未保存，这才是真需要一眼看出的信息。
+              -->
+              <button
+                v-if="effectiveSourcePath"
+                type="button"
+                class="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold bg-emerald-50 text-emerald-600 hover:bg-emerald-100 dark:bg-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/50 transition-colors"
+                :title="`已保存：${effectiveSourcePath}（点击复制路径）`"
+                @click="copySourcePath"
+              >
+                <svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="3">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
+                </svg>
+                已保存
+              </button>
+            </div>
           </div>
         </div>
-        <div class="flex items-center space-x-2">
-          <!-- AI Analyze Button (Only show in compare mode) -->
-          <button
-            v-if="data?.type === 'compare'"
-            @click="analyzeDiff"
-            class="px-2.5 py-1.5 text-[10px] font-bold text-white bg-gradient-to-r from-indigo-500 to-blue-600 hover:from-indigo-600 hover:to-blue-700 active:scale-95 rounded-lg shadow-xs transition-all flex items-center space-x-1"
-            title="AI 一键智能分析差异"
-          >
-            <span>💡</span>
-            <span>AI 分析差异</span>
-          </button>
-
-          <!-- 保存到目录（画布内容写入工作区） -->
-          <button
-            v-if="canSaveGeneratedContent"
-            type="button"
-            @click="requestSaveToDirectory"
-            :disabled="saving"
-            class="p-1.5 rounded-lg transition-colors text-emerald-500 hover:text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 disabled:opacity-50 disabled:cursor-not-allowed"
-            :title="saving ? '保存中...' : '保存到目录'"
-            :aria-label="saving ? '保存中' : '保存到目录'"
-          >
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-            </svg>
-          </button>
-
-          <!-- 复制链接 / 复制代码 -->
-          <button
-            type="button"
-            @click="copyContent"
-            class="p-1.5 rounded-lg transition-colors"
-            :class="copied
-              ? 'text-emerald-500 bg-emerald-50 dark:bg-emerald-900/20'
-              : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'"
-            :title="copied ? '已复制！' : (data?.type === 'image' || isDocumentPreview ? '复制链接' : '复制代码')"
-            :aria-label="copied ? '已复制' : '复制'"
-          >
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path
-                v-if="copied"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="2"
-                d="M5 13l4 4L19 7"
-              />
-              <path
-                v-else
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="2"
-                d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
-              />
-            </svg>
-          </button>
-
+        <div class="flex items-center space-x-1.5 shrink-0">
           <!--
-            file-viewer（Office/PDF/文本预览）工具栏自带「下载」，故此时隐藏该图标避免重复。
-            切到「源代码」编辑时 file-viewer 不再渲染，图标重新出现。
-            .ppt 不会走到 document 类型（已在 useWorkspaceCanvas 里被
-            shouldDownloadInsteadOfPreview 拦成下载），因此它始终保留该图标。
-
-            用 computed 而不是内联的字面量 type 比较：内联比较会让 TS 对本按钮的子节点
-            收窄 data.type，导致按钮内的 pdf/document 比较报 TS2367（本文件 +2 条）。
+            「⋯」收纳所有「对这份文件做的事」：分享 / 下载 / 保存到目录 / 复制 / AI 分析。
+            顶栏只留改面板本身的三项（钉住 / 全屏 / 关闭）——加分享后原来那排图标是 7 个，
+            窄屏必然挤成一片小点，且「分享」「下载」「复制」本就是一回事的不同出口。
           -->
-          <button
-            v-if="!isFileViewerRendered"
-            type="button"
-            @click="downloadFile"
-            class="p-1.5 rounded-lg transition-colors text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
-            :title="data?.type === 'image' || data?.type === 'pdf' || data?.type === 'document' ? '下载文件' : '下载数据'"
-            :aria-label="data?.type === 'image' ? '下载文件' : '下载数据'"
-          >
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-            </svg>
-          </button>
+          <div class="relative" data-canvas-more>
+            <button
+              type="button"
+              @click.stop="moreMenuOpen = !moreMenuOpen"
+              class="p-1.5 rounded-lg transition-colors"
+              :class="moreMenuOpen
+                ? 'text-primary bg-primary/10 dark:bg-primary/20'
+                : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'"
+              :title="moreMenuOpen ? '收起操作菜单' : '更多操作（分享 / 下载 / 保存 / 复制）'"
+              aria-haspopup="menu"
+              :aria-expanded="moreMenuOpen"
+            >
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <circle cx="5" cy="12" r="1.6" fill="currentColor" stroke="none" />
+                <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none" />
+                <circle cx="19" cy="12" r="1.6" fill="currentColor" stroke="none" />
+              </svg>
+            </button>
+
+            <Transition name="tp-fade">
+              <div
+                v-if="moreMenuOpen"
+                class="absolute right-0 top-full z-50 mt-1 w-[178px] rounded-xl border border-gray-200 bg-white p-1 shadow-xl ring-1 ring-black/5 dark:border-gray-700 dark:bg-gray-800 dark:ring-white/10"
+                role="menu"
+                @click="closeMoreMenu"
+              >
+                <!-- 分享：只有工作区文件能分享，未落盘的内容置灰并说明原因 -->
+                <button
+                  type="button"
+                  role="menuitem"
+                  :disabled="!canShareFile"
+                  :title="canShareFile ? '生成分享链接' : '请先保存到工作区，再分享'"
+                  @click="openShare"
+                                class="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700/60 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  <svg class="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+                    <circle cx="17" cy="6" r="2.6" /><circle cx="6.5" cy="12" r="2.6" /><circle cx="17" cy="18" r="2.6" />
+                    <path stroke-linecap="round" d="M8.8 10.7l5.9-3.3M8.8 13.3l5.9 3.3" />
+                  </svg>
+                  <span>分享文件</span>
+                  <span
+                    v-if="!canShareFile"
+                    class="ml-auto text-[10px] text-gray-400 dark:text-gray-500"
+                  >需先保存</span>
+                </button>
+
+                <!-- 下载：file-viewer 自带下载时不重复 -->
+                <button
+                  v-if="!isFileViewerRendered"
+                  type="button"
+                  role="menuitem"
+                  @click="downloadFile"
+                                class="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700/60 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  <svg class="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v11m0 0l-4-4m4 4l4-4M5 19h14" />
+                  </svg>
+                  <span>{{ data?.type === 'image' || data?.type === 'pdf' || data?.type === 'document' ? '下载文件' : '下载数据' }}</span>
+                </button>
+
+                <!-- 保存到目录：仅生成型内容（还没有工作区路径） -->
+                <button
+                  v-if="canSaveGeneratedContent"
+                  type="button"
+                  role="menuitem"
+                  :disabled="saving"
+                  @click="requestSaveToDirectory"
+                                class="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700/60 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  <svg class="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4" />
+                  </svg>
+                  <span>{{ saving ? '保存中…' : '保存到目录' }}</span>
+                </button>
+
+                <button
+                  type="button"
+                  role="menuitem"
+                  @click="copyContent"
+                                class="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700/60 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  <svg class="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                  <span>{{ copied ? '已复制' : (data?.type === 'image' || isDocumentPreview ? '复制链接' : '复制代码') }}</span>
+                </button>
+
+                <template v-if="data?.type === 'compare'">
+                  <div class="my-1 h-px bg-gray-100 dark:bg-gray-700"></div>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    @click="analyzeDiff"
+                                  class="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700/60 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <LightBulbIcon class="h-4 w-4 shrink-0 text-amber-500" aria-hidden="true" />
+                    <span>AI 分析差异</span>
+                  </button>
+                </template>
+              </div>
+            </Transition>
+          </div>
+
+          <span class="h-4 w-px bg-gray-200 dark:bg-gray-700"></span>
 
           <!-- Pin Button -->
           <button
@@ -1137,6 +1443,7 @@ const overlayBackdropClass = computed(() =>
             "
             :title="pinned ? '取消钉住' : '钉住画布（固定在侧边不遮挡对话）'"
             :aria-label="pinned ? '取消钉住' : '钉住画布'"
+            :aria-pressed="pinned"
           >
             <svg
               class="w-4 h-4 transition-transform duration-200"
@@ -1158,6 +1465,7 @@ const overlayBackdropClass = computed(() =>
             @click="toggleFullscreen"
             class="p-1.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
             :title="isFullscreen ? '半屏展示' : '全屏展示'"
+            :aria-pressed="isFullscreen"
           >
             <svg
               class="w-4 h-4"
@@ -1181,6 +1489,7 @@ const overlayBackdropClass = computed(() =>
               />
             </svg>
           </button>
+
           <!-- Close Button -->
           <button
             @click="handleClose"
@@ -1205,8 +1514,50 @@ const overlayBackdropClass = computed(() =>
       </div>
 
       <!-- HTML / Markdown Preview/Code Tabs Selector -->
-      <div v-if="isHtmlContent || isMarkdownContent || isFileViewerTextPreview" class="px-4 py-2 border-b border-gray-100/50 dark:border-gray-700/50 bg-slate-50/50 dark:bg-gray-900/10 flex-shrink-0 flex items-center justify-center gap-2">
-        <div class="bg-gray-150/80 dark:bg-gray-900 p-0.5 rounded-lg flex space-x-1 w-full max-w-[240px] border border-gray-200/20 shadow-inner">
+      <div v-if="isHtmlContent || isMarkdownContent || isFileViewerTextPreview" class="relative px-4 py-2 border-b border-gray-100/50 dark:border-gray-700/50 bg-slate-50/50 dark:bg-gray-900/10 flex-shrink-0 flex items-center justify-center gap-2">
+        <!--
+          字号 / 行宽控件放在页签栏右侧的空白里，而不是顶栏标题行。
+          顶栏挤了标题、类型徽标、已保存徽标和三四个窗口按钮，再塞四个控件就把文件名
+          压成省略号；而这一行左右本来就是空的，控件在语义上也属于「怎么读」而非「这个文件是什么」。
+          绝对定位是为了让中间那组页签保持真正居中，不被控件推偏。
+        -->
+        <div
+          v-if="showReaderControls"
+          class="absolute right-3 flex items-center gap-0.5 rounded-lg bg-white/70 p-0.5 shadow-xs ring-1 ring-gray-200/60 dark:bg-gray-800/70 dark:ring-gray-700/60"
+        >
+          <button
+            type="button"
+            class="h-6 min-w-6 rounded-md px-1 text-[11px] font-bold text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:opacity-40 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-gray-200"
+            :disabled="readerScale <= 0.9"
+            title="缩小字号"
+            @click="zoomReader(-0.1)"
+          >A−</button>
+          <button
+            type="button"
+            class="h-6 min-w-9 rounded-md px-1 text-[10.5px] font-bold tabular-nums text-gray-600 transition-colors hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700"
+            title="点击重置为 100%"
+            @click="resetReaderScale"
+          >{{ readerScalePercent }}</button>
+          <button
+            type="button"
+            class="h-6 min-w-6 rounded-md px-1 text-[11px] font-bold text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:opacity-40 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-gray-200"
+            :disabled="readerScale >= 1.4"
+            title="放大字号"
+            @click="zoomReader(0.1)"
+          >A+</button>
+          <span class="mx-0.5 h-4 w-px bg-gray-200 dark:bg-gray-600"></span>
+          <button
+            type="button"
+            class="h-6 rounded-md px-1.5 text-[11px] font-bold transition-colors"
+            :class="readerNarrow
+              ? 'bg-primary/10 text-primary dark:bg-primary/20'
+              : 'text-gray-500 hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-700'"
+            :title="readerNarrow ? '当前限宽 68 字符，点击恢复通栏' : '把正文限制在约 68 字符行宽'"
+            :aria-pressed="readerNarrow"
+            @click="toggleReaderNarrow"
+          >↔</button>
+        </div>
+        <div class="bg-gray-100/80 dark:bg-gray-900 p-0.5 rounded-lg flex space-x-1 w-full max-w-[240px] border border-gray-200/20 shadow-inner">
           <button
             @click="activeTab = 'preview'"
             class="flex-1 py-1 text-[11px] font-bold rounded-md transition-all duration-200 flex items-center justify-center space-x-1"
@@ -1317,10 +1668,17 @@ const overlayBackdropClass = computed(() =>
         <!-- Markdown Render Block / Code Switchable -->
         <template v-else-if="isMarkdownContent">
           <!-- Markdown Preview html -->
-          <div v-if="activeTab === 'preview'" class="w-full h-full overflow-y-auto bg-white dark:bg-gray-900 rounded-xl p-6 border border-gray-100 dark:border-gray-850 shadow-inner select-text">
-            <CanvasMarkdownRenderer
+          <div v-if="activeTab === 'preview'" class="w-full h-full overflow-hidden bg-white dark:bg-gray-900 rounded-xl border border-gray-100 dark:border-gray-850 shadow-inner select-text">
+            <CanvasReaderShell
               :content="canSaveWorkspaceFile ? editorContent : (props.data?.content || '')"
-            />
+              :scale="readerScale"
+              :narrow="readerNarrow"
+              class="h-full"
+            >
+              <CanvasMarkdownRenderer
+                :content="canSaveWorkspaceFile ? editorContent : (props.data?.content || '')"
+              />
+            </CanvasReaderShell>
           </div>
           <!-- Markdown Source Code -->
           <div v-else class="w-full font-mono text-xs overflow-x-auto bg-white dark:bg-gray-900 rounded-xl border border-gray-100 dark:border-gray-850 shadow-inner flex leading-relaxed select-text min-h-[320px]">
@@ -1345,16 +1703,16 @@ const overlayBackdropClass = computed(() =>
 
         <!-- General Code Block (Not HTML) -->
         <template v-else-if="data?.type === 'code'">
-          <div v-if="data && data.runnable" class="mb-3 flex items-center justify-between rounded-xl border border-blue-100 bg-blue-50/70 px-3 py-2 dark:border-blue-900/50 dark:bg-blue-950/20">
-            <div class="flex items-center gap-2 text-[11px] text-blue-700 dark:text-blue-300">
-              <span class="h-2 w-2 rounded-full" :class="isCodeRunning ? 'animate-pulse bg-amber-500' : 'bg-blue-500'" />
+          <div v-if="data && data.runnable" class="mb-3 flex items-center justify-between rounded-xl border border-primary/10 bg-primary/5 px-3 py-2 dark:border-primary-dark/50 dark:bg-primary-dark/20">
+            <div class="flex items-center gap-2 text-[11px] text-primary-dark dark:text-primary-hover">
+              <span class="h-2 w-2 rounded-full" :class="isCodeRunning ? 'animate-pulse bg-amber-500' : 'bg-primary'" />
               <span>{{ isCodeRunning ? '脚本正在执行，可实时查看输出' : (data.sourcePath ? '这是当前工作区的可执行脚本' : '这是当前 AI 生成的可执行脚本') }}</span>
             </div>
             <div class="flex items-center gap-2">
               <button
                 v-if="!isCodeRunning"
                 type="button"
-                class="rounded-lg bg-blue-600 px-3 py-1.5 text-[11px] font-bold text-white shadow-sm transition hover:bg-blue-700"
+                class="rounded-lg bg-primary px-3 py-1.5 text-[11px] font-bold text-white shadow-sm transition hover:bg-primary-dark"
                 @click="requestCodeRun"
               >运行</button>
               <button
@@ -1428,7 +1786,7 @@ const overlayBackdropClass = computed(() =>
               </button>
               <button
                 type="button"
-                class="flex h-7 w-7 items-center justify-center rounded-full border border-blue-500/60 bg-blue-600 text-white shadow-sm transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-40"
+                class="flex h-7 w-7 items-center justify-center rounded-full border border-primary/60 bg-primary text-white shadow-sm transition hover:bg-primary-hover disabled:cursor-not-allowed disabled:opacity-40"
                 title="发送到 AI 分析"
                 aria-label="发送到 AI 分析"
                 :disabled="!hasCodeOutput"
@@ -1480,7 +1838,7 @@ const overlayBackdropClass = computed(() =>
         <template v-else-if="data?.type === 'csv'">
           <!-- CSV View Mode Tabs -->
           <div v-if="!csvLoading && !csvError" class="mb-4 flex justify-center flex-shrink-0">
-            <div class="bg-gray-150/80 dark:bg-gray-900 p-0.5 rounded-lg flex space-x-1 w-full max-w-[240px] border border-gray-200/20 shadow-inner">
+            <div class="bg-gray-100/80 dark:bg-gray-900 p-0.5 rounded-lg flex space-x-1 w-full max-w-[240px] border border-gray-200/20 shadow-inner">
               <button
                 @click="csvViewMode = 'table'"
                 class="flex-1 py-1 text-[11px] font-bold rounded-md transition-all duration-200 flex items-center justify-center space-x-1"
@@ -1488,7 +1846,6 @@ const overlayBackdropClass = computed(() =>
                   ? 'bg-white dark:bg-gray-800 text-gray-800 dark:text-white shadow-xs border border-gray-200/10'
                   : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'"
               >
-                <span>📊</span>
                 <span>原始表格</span>
               </button>
               <button
@@ -1498,7 +1855,6 @@ const overlayBackdropClass = computed(() =>
                   ? 'bg-white dark:bg-gray-800 text-gray-800 dark:text-white shadow-xs border border-gray-200/10'
                   : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'"
               >
-                <span>💡</span>
                 <span>数据透视</span>
               </button>
             </div>
@@ -1526,7 +1882,7 @@ const overlayBackdropClass = computed(() =>
               <span class="text-xs text-gray-400">正在拉取并解析数据...</span>
             </div>
             <div v-else-if="csvError" class="flex-grow flex flex-col items-center justify-center py-12 px-4 text-center">
-              <span class="text-xl mb-2">⚠️</span>
+              <span class="text-xl mb-2"><ExclamationTriangleIcon class="h-5 w-5" aria-hidden="true" /></span>
               <span class="text-xs text-red-500 font-mono">{{ csvError }}</span>
             </div>
 
@@ -1545,7 +1901,7 @@ const overlayBackdropClass = computed(() =>
                       </th>
                     </tr>
                   </thead>
-                  <tbody class="divide-y divide-gray-150 dark:divide-gray-800 text-[11px] text-gray-700 dark:text-gray-300">
+                  <tbody class="divide-y divide-gray-200 dark:divide-gray-800 text-[11px] text-gray-700 dark:text-gray-300">
                     <tr
                       v-for="(row, rIdx) in filteredCsvRows"
                       :key="rIdx"
@@ -1628,7 +1984,7 @@ const overlayBackdropClass = computed(() =>
 
             <!-- 对比行展示区域 -->
             <div class="flex-1 overflow-auto font-mono text-[11px] leading-relaxed custom-scrollbar divide-y divide-gray-100/30 dark:divide-gray-800/30">
-              <div v-for="(seg, idx) in diffSegments" :key="idx" class="grid grid-cols-2 divide-x divide-gray-200 dark:divide-gray-880 min-w-[700px]">
+              <div v-for="(seg, idx) in diffSegments" :key="idx" class="grid grid-cols-2 divide-x divide-gray-200 dark:divide-gray-800 min-w-[700px]">
                 <!-- 左侧行 -->
                 <div
                   class="flex items-stretch min-h-[22px]"
@@ -1686,6 +2042,21 @@ const overlayBackdropClass = computed(() =>
     </Transition>
   </teleport>
 
+  <!--
+    分享弹窗放在 teleport 之外：它是 fixed 全屏遮罩，本身不参与画布布局；
+    放进 teleport 内会被画布面板的层叠上下文限制，钉住时反而容易被侧栏压住。
+  -->
+  <ShareFileDialog
+    :visible="!!shareTarget"
+    :file-path="shareTarget?.path || ''"
+    :artifact-id="shareTarget?.artifactId || ''"
+    :file-name="shareTarget?.name || ''"
+    :file-size="shareTarget?.size || 0"
+    @close="shareTarget = null"
+    @created="handleShareCreated"
+    @toast="showToast"
+  />
+
   <ConfirmModal
     v-if="pendingOverwrite"
     title="确认覆盖文件"
@@ -1697,6 +2068,17 @@ const overlayBackdropClass = computed(() =>
 </template>
 
 <style scoped>
+/* 顶栏「⋯」菜单：轻微下移淡入，避免硬切 */
+.tp-fade-enter-active,
+.tp-fade-leave-active {
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.tp-fade-enter-from,
+.tp-fade-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
 .slide-enter-active,
 .slide-leave-active {
   transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease;

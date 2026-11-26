@@ -8,12 +8,20 @@ import json
 import re
 import fnmatch
 import time
-from typing import Optional
+from typing import Any, Optional
 from app.services.ai.tools.tool_compat import tool
 from app.services.ai.code_execution_service import run_shell_command_capture
 from app.services.ai.runtime.shell_deletion_policy import assess_shell_deletion
 from app.services.skill_rename_service import SkillRenameError, validate_skill_id
-from app.utils.skill_metadata import is_skill_enabled, parse_skill_frontmatter
+from app.utils.skill_metadata import (
+    SKILL_READ_MAX_CHARS,
+    SKILL_RESOURCE_LIST_MAX_DEPTH as _SKILL_RESOURCE_LIST_MAX_DEPTH,
+    SKILL_RESOURCE_LIST_MAX_ENTRIES as _SKILL_RESOURCE_LIST_MAX_ENTRIES,
+    clip_skill_text,
+    format_skill_resource_tree,
+    is_skill_enabled,
+    parse_skill_frontmatter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +37,24 @@ def _current_tool_temperature() -> Optional[float]:
 
         return get_current_tool_temperature()
     except Exception:  # noqa: BLE001 - 取不到上下文就退回默认行为
+        return None
+
+
+def _resolve_path_access_user_info() -> dict[str, Any] | None:
+    """当前工具调用所属用户，供 ``read_image`` 做跨租户判定。
+
+    返回 ``None`` 表示拿不到身份上下文（定时任务、内部自调用等）。此时调用方
+    **跳过**跨租户比对而不是一律拒绝：没有身份就没有"他人"的概念，历史行为也是
+    放行。真正基于身份的严格鉴权（``fs_access.is_runtime_path_allowed``）只用于
+    Read/Write 这类走绑定层的文件工具，不套在 ``read_image`` 上——它的公共根口径
+    太窄，会把 ``data/uploads``、``data/generated_files`` 这些既有图片入口全挡死。
+    """
+    try:
+        from app.utils.context import current_user_info
+
+        info = current_user_info.get()
+        return info or None
+    except Exception:  # noqa: BLE001 - 取不到上下文就当作无身份
         return None
 
 
@@ -95,15 +121,9 @@ def _parse_skill_frontmatter(skill_id: str, skill_md_path: str) -> dict:
     return parse_skill_frontmatter(skill_id, skill_md_path)
 
 
-#: 技能文件单次读取上限（SKILL.md 与技能包内资源同一口径）
+#: 技能文件单次读取上限（SKILL.md 与技能包内资源同一口径）；
+#: 截断上限 SKILL_READ_MAX_CHARS 与资源树上限均统一收敛在 app.utils.skill_metadata。
 SKILL_RESOURCE_MAX_BYTES = 262144
-#: 单次返回给模型的技能正文上限（字符）。必须明显低于上下文侧
-#: ``DEFAULT_TOOL_OUTPUT_MAX_LEN``（64Ki 字符），并给返回头与资源清单留出余量：
-#: 否则工具内部读到的内容会在下一层被静默砍掉，而模型以为拿到的是全文。
-SKILL_READ_MAX_CHARS = 56_000
-#: 技能资源清单的条目 / 深度上限：技能包导入上限是 2000 个文件，清单无上限会写爆上下文
-_SKILL_RESOURCE_LIST_MAX_ENTRIES = 200
-_SKILL_RESOURCE_LIST_MAX_DEPTH = 4
 
 
 def _skill_allowed_roots(user_info: Optional[dict]) -> list[str]:
@@ -161,65 +181,17 @@ def _decode_skill_resource(blob: bytes) -> Optional[str]:
 
 
 def _format_skill_resource_tree(skill_dir: str) -> str:
-    """技能包内资源清单（路径相对技能目录，排除 SKILL.md 与隐藏项）。
-
-    这是"有哪些资源可读"的提示，不是目录树工具：条目数与深度都有上限，超限在末尾
-    显式说明，避免大技能包把上下文写爆。没有任何附带资源时返回空串。
-    """
-    entries: list[str] = []
-    truncated = False
-    root = os.path.abspath(skill_dir)
-    for current, dirnames, filenames in os.walk(root, followlinks=False):
-        depth = 0 if current == root else os.path.relpath(current, root).count(os.sep) + 1
-        dirnames[:] = sorted(
-            name for name in dirnames if not name.startswith(".") and name != "__pycache__"
-        )
-        if depth >= _SKILL_RESOURCE_LIST_MAX_DEPTH:
-            if dirnames:
-                truncated = True
-            dirnames[:] = []
-        rel_dir = os.path.relpath(current, root)
-        for filename in sorted(filenames):
-            if filename.startswith(".") or filename == "SKILL.md":
-                continue
-            if len(entries) >= _SKILL_RESOURCE_LIST_MAX_ENTRIES:
-                truncated = True
-                break
-            rel = filename if rel_dir == os.curdir else os.path.join(rel_dir, filename)
-            entries.append(rel.replace(os.sep, "/"))
-        if len(entries) >= _SKILL_RESOURCE_LIST_MAX_ENTRIES:
-            break
-    if not entries and not truncated:
-        return ""
-    lines = [f"- {entry}" for entry in entries]
-    if truncated:
-        lines.append(
-            f"- …（清单已截断：最多列 {_SKILL_RESOURCE_LIST_MAX_ENTRIES} 条 / "
-            f"{_SKILL_RESOURCE_LIST_MAX_DEPTH} 层；需要完整目录请用 directory_tree_navigator 或 Bash）"
-        )
-    return "\n".join(lines)
+    """技能包内资源清单（复用 ``app.utils.skill_metadata.format_skill_resource_tree``）。"""
+    return format_skill_resource_tree(
+        skill_dir,
+        max_entries=_SKILL_RESOURCE_LIST_MAX_ENTRIES,
+        max_depth=_SKILL_RESOURCE_LIST_MAX_DEPTH,
+    )
 
 
 def _clip_skill_text(text: str, *, max_chars: int = SKILL_READ_MAX_CHARS) -> tuple[str, int]:
-    """把过长的技能正文裁成「头 + 尾」，中间显式标注省略量。
-
-    技能尾部的「禁止事项 / 输出格式 / 异常处理」最容易被整段丢掉，又最容易导致
-    越权或格式错，所以超限时保留结尾而不是简单砍尾。
-
-    Args:
-        text: 已解码的技能正文。
-        max_chars: 单次返回的字符上限。
-
-    Returns:
-        ``(裁剪后的正文, 被省略的字符数)``；未超限时省略量为 0，正文原样返回。
-    """
-    if len(text) <= max_chars:
-        return text, 0
-    head_chars = int(max_chars * 0.7)
-    tail_chars = max_chars - head_chars
-    omitted = len(text) - max_chars
-    marker = f"\n… [中间省略 {omitted} 字符；共 {len(text)} 字符] …\n"
-    return f"{text[:head_chars]}{marker}{text[-tail_chars:]}", omitted
+    """把过长的技能正文裁成「头 + 尾」（复用 ``app.utils.skill_metadata.clip_skill_text``）。"""
+    return clip_skill_text(text, max_chars=max_chars)
 
 
 def _read_skill_resource_file(
@@ -348,14 +320,60 @@ def _is_forbidden_shell_command(command: str) -> str | None:
     return None
 
 
+#: 技能清单单次默认返回条数 / 硬上限。
+#:
+#: 清单是「全序枚举」：模型靠"列表里有没有它"判断某个技能是否存在，因此一旦被截断
+#: 而模型不知道，就会把"没看到"断言成"不存在"。默认值与上限要保证正常规模的清单
+#: 一次就能拿全，超出时必须靠 ``truncated`` 让模型知道还有未展示的条目。
+_SKILL_LIST_LIMIT_DEFAULT = 50
+_SKILL_LIST_LIMIT_MAX = 200
+
+
+def _coerce_skill_list_limit(limit: Optional[int]) -> int:
+    """把 ``limit`` 规范化成 ``[1, _SKILL_LIST_LIMIT_MAX]``；非法值退回默认。"""
+    if isinstance(limit, bool):
+        return _SKILL_LIST_LIMIT_DEFAULT
+    try:
+        value = int(limit)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return _SKILL_LIST_LIMIT_DEFAULT
+    if value <= 0:
+        return _SKILL_LIST_LIMIT_DEFAULT
+    return min(value, _SKILL_LIST_LIMIT_MAX)
+
+
+def _skill_matches_keyword(item: dict, needle: str) -> bool:
+    """技能是否命中 keyword（匹配 id / 名称 / 描述，不区分大小写）。"""
+    if not needle:
+        return True
+    haystack = " ".join(
+        str(item.get(key) or "") for key in ("id", "name", "description")
+    ).lower()
+    return needle in haystack
+
+
 @tool
-async def list_available_skills() -> str:
-    """
-    列出当前会话可用的技能摘要（已启用），供智能体按 name/description 判断是否需要读取具体技能。
+async def list_available_skills(
+    keyword: Optional[str] = None,
+    limit: Optional[int] = _SKILL_LIST_LIMIT_DEFAULT,
+) -> str:
+    """列出当前会话可用的技能摘要（已启用），供智能体按 id/描述判断是否需要读取具体技能。
+
+    返回 JSON 对象：`{"total": N, "returned": M, "truncated": bool, "skills": [...]}`，
+    每个技能含 id / name / description / scope。
+    - `total` 是当前会话可见技能总数，`returned` 是本次实际返回条数。
+    - `truncated=true` 表示还有未展示的技能（`note` 会说明有多少条）。此时**必须**用
+      `keyword` 收窄或调大 `limit` 再查一次，**不能**因为这次没看到某个技能就断言它不存在。
+    - 清单较长时优先用 `keyword` 定位（匹配 id / 名称 / 描述，不区分大小写）。
+
     规则与运行时一致：未自定义时=全部已启用公共技能+当前用户个人技能；
     自定义开启时=智能体勾选的公共技能+当前用户个人技能；
     两种情况都还要再扣掉权限侧禁用（forbidden_skills）的公共技能。
     只返回技能 ID、名称、描述与 scope，不读取完整 SKILL.md。
+
+    Args:
+        keyword: 可选。按技能 id / 名称 / 描述模糊匹配（不区分大小写），用于在长清单里定位。
+        limit: 可选。本次最多返回多少条，默认 50，最大 200。
     """
     try:
         from app.core.context import get_current_agent_context
@@ -375,11 +393,11 @@ async def list_available_skills() -> str:
             allowed_global_skills=allowed if skills_custom else None,
             excluded_skill_ids=forbidden_skill_ids,
         )
-        skills = []
+        visible = []
         for meta in metas:
             if not is_skill_enabled(meta):
                 continue
-            skills.append(
+            visible.append(
                 {
                     "id": meta.get("id"),
                     "name": meta.get("name") or meta.get("id"),
@@ -387,9 +405,134 @@ async def list_available_skills() -> str:
                     "scope": meta.get("scope") or "global",
                 }
             )
-        return json.dumps(skills, ensure_ascii=False, indent=2)
+
+        needle = str(keyword or "").strip().lower()
+        page_size = _coerce_skill_list_limit(limit)
+        matched = [item for item in visible if _skill_matches_keyword(item, needle)]
+        page = matched[:page_size]
+
+        payload: dict = {
+            "total": len(matched),
+            "returned": len(page),
+            "truncated": len(matched) > len(page),
+            "skills": page,
+        }
+        if needle:
+            payload["keyword"] = needle
+        if payload["truncated"]:
+            payload["note"] = (
+                f"另有 {len(matched) - len(page)} 个技能未展示；请用 keyword 收窄或调大 "
+                f"limit（最大 {_SKILL_LIST_LIMIT_MAX}）再查，未展示不等于不存在。"
+            )
+        elif not matched:
+            payload["note"] = (
+                f"没有技能匹配 keyword={needle!r}；可去掉 keyword 查看全部技能。"
+                if needle
+                else "当前会话没有可见技能。"
+            )
+        return json.dumps(payload, ensure_ascii=False)
     except Exception as e:
         return f"错误：列出技能失败，原因: {str(e)}"
+
+
+def _normalize_skill_id_token(value: str) -> str:
+    """技能 id 的宽松归一：忽略大小写与分隔符差异（``dsapi_admin`` vs ``dsapi-admin``）。"""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _closest_skill_ids(skill_id: str, candidates: list[str], limit: int = 3) -> list[str]:
+    """给出最接近的技能 id，帮模型自查拼写，而不是靠猜"是不是被禁用了"。"""
+    if not skill_id or not candidates:
+        return []
+    import difflib
+
+    target = _normalize_skill_id_token(skill_id)
+    if not target:
+        return []
+    by_token: dict[str, str] = {}
+    for candidate in candidates:
+        token = _normalize_skill_id_token(candidate)
+        # 只排除"和传入 id 完全相同"的那个；归一化后相同（下划线 vs 中划线这类常见手误）
+        # 恰恰是最该提示的候选，不能一起排掉。
+        if token and candidate != skill_id:
+            by_token.setdefault(token, candidate)
+    hits: list[str] = []
+    if target in by_token:
+        hits.append(by_token[target])
+    for token in difflib.get_close_matches(target, list(by_token), n=limit, cutoff=0.6):
+        candidate = by_token[token]
+        if candidate not in hits:
+            hits.append(candidate)
+        if len(hits) >= limit:
+            break
+    return hits[:limit]
+
+
+def _describe_skill_lookup_failure(
+    skill_id: str,
+    *,
+    user_info,
+    skills_custom: bool,
+    forbidden_skill_ids,
+    visible_skill_ids: Optional[list[str]] = None,
+) -> str:
+    """说明「技能读不到」的具体原因，并在拼写错误时从可见集合给出最接近的候选 id。
+
+    旧文案把「不存在 / 已禁用 / 不在智能体范围 / 被权限禁用」压成一句三选一
+    （"不存在、已禁用，或不在当前智能体可用 Skills 范围内"）。实测模型会把它读成
+    "该技能被移出范围了"，据此向用户报告一个不存在的问题。这四种原因的处理动作
+    完全不同（改 id / 找管理员启用 / 调整智能体白名单 / 联系管理员解禁），必须分开说。
+
+    候选建议**只能**从当前会话可见且已启用的技能里挑，绝不把被权限禁用、已停用或
+    不在白名单里的技能 id 当候选暴露给模型；已明确判定为停用/禁用/白名单外时，
+    也不再追加「不代表已被禁用，请重试」这类自相矛盾的提示。
+    """
+    from app.services.ai.skill_resolver import list_skill_metas
+
+    try:
+        # 不带过滤参数的全量清单：只用来区分"根本没这个技能"与"被过滤掉了"，不作为候选对外暴露。
+        all_metas = list_skill_metas(user_info=user_info)
+    except Exception as e:  # noqa: BLE001 - 诊断信息拿不到也不能盖掉原始错误
+        logger.debug("[Skills] Failed to build lookup diagnostics for %s: %s", skill_id, e)
+        all_metas = []
+    known = {str(meta.get("id") or ""): meta for meta in all_metas}
+    forbidden = {str(item).strip() for item in (forbidden_skill_ids or set()) if str(item).strip()}
+
+    meta = known.get(skill_id)
+    if meta is not None:
+        is_personal = (meta.get("scope") or "global") == "personal"
+        if not is_skill_enabled(meta):
+            reason = (
+                f"技能 {skill_id} 存在，但它在 SKILL.md 里的 enabled 不是 true（已被停用），"
+                "因此不会加载。需要启用请到技能管理里打开该技能。"
+            )
+        elif not is_personal and skill_id in forbidden:
+            reason = (
+                f"技能 {skill_id} 在公共技能库里存在，但被权限规则禁用（forbidden_skills），"
+                "当前用户不可读。需要解禁请让管理员调整权限。"
+            )
+        elif not is_personal and skills_custom:
+            reason = (
+                f"技能 {skill_id} 是公共技能，但当前智能体开启了「自定义技能」，"
+                "而它的白名单里没有这个技能。请改用白名单内的技能，或让管理员把该智能体"
+                "的技能配置改回全部可用。"
+            )
+        else:
+            reason = f"技能 {skill_id} 当前不可读（可见性过滤后未命中）。"
+        return f"错误：{reason}"
+
+    reason = (
+        f"技能 {skill_id} 不存在：公共技能库里没有它，当前用户的个人技能目录里也没有。"
+    )
+    candidates = [str(item) for item in (visible_skill_ids or []) if str(item)]
+    suggestions = _closest_skill_ids(skill_id, candidates)
+    if suggestions:
+        reason += f" 最接近的候选 id：{', '.join(suggestions)}。"
+    reason += (
+        " 请先用 list_available_skills 核对 id（只能用小写英文、数字、中划线），"
+        "确认无误后原样传入重试一次；单次读取失败不代表该技能已被删除或禁用。"
+    )
+    return f"错误：{reason}"
 
 
 @tool
@@ -433,9 +576,17 @@ async def read_skill_instruction(skill_id: str, path: Optional[str] = None) -> s
             None,
         )
         if not matched:
-            return (
-                f"错误：技能 {safe_skill_id} 不存在、已禁用，"
-                "或不在当前智能体可用 Skills 范围内。"
+            visible_ids = [
+                str(m.get("id") or "")
+                for m in metas
+                if is_skill_enabled(m) and m.get("id")
+            ]
+            return _describe_skill_lookup_failure(
+                safe_skill_id,
+                user_info=user_info,
+                skills_custom=skills_custom,
+                forbidden_skill_ids=forbidden_skill_ids,
+                visible_skill_ids=visible_ids,
             )
 
         skill_md_path = matched.get("skill_md_path")
@@ -488,6 +639,26 @@ async def read_skill_instruction(skill_id: str, path: Optional[str] = None) -> s
                 f'read_skill_instruction(skill_id="{safe_skill_id}", path="<相对路径>")）]\n'
                 f"{resource_tree}"
             )
+        # 动态通过 read_skill_instruction 加载 SKILL.md 时补记技能激活统计（读取附带 path 不重复计数；
+        # 若存在当前 AgentContext，同一轮内重复读取同一技能 SKILL.md 也只记 1 次，避免虚高）。
+        try:
+            recorded_set = None
+            if ctx is not None:
+                recorded_set = getattr(ctx, "_recorded_skill_activations", None)
+                if not isinstance(recorded_set, set):
+                    recorded_set = set()
+                    try:
+                        setattr(ctx, "_recorded_skill_activations", recorded_set)
+                    except Exception:
+                        recorded_set = None
+            if recorded_set is None or safe_skill_id not in recorded_set:
+                from app.services.ai.skills_stats_service import skills_stats_service
+
+                await skills_stats_service.record_activations([safe_skill_id])
+                if recorded_set is not None:
+                    recorded_set.add(safe_skill_id)
+        except Exception as stats_err:
+            logger.debug("[SkillsStats] Recording dynamic skill read failed: %s", stats_err)
         return f"{header}\n{content}"
     except ValueError as e:
         return f"错误：非法技能 ID，{str(e)}"
@@ -543,6 +714,30 @@ async def read_image(path: str, question: str = "") -> str:
     """
     try:
         abs_path = validate_safe_path(path)
+        # ① 软链接逃逸：validate_safe_path 用的是 abspath、不解析软链，于是在自己
+        #    工作区放一个指向 /etc/shadow 的 fake.png 就能读走宿主机文件。对
+        #    realpath 再校验一次，解引用后仍必须落在 data 安全目录内。
+        resolved_path = os.path.realpath(abs_path)
+        if resolved_path != os.path.normpath(abs_path):
+            validate_safe_path(resolved_path)
+        # ② 跨租户读取：read_image 不在 AGENTSCOPE_BUILTIN_TOOL_ALIASES 里，绑定层
+        #    不会把它换成走 fs_access 的 Read，因此这里必须自己补——否则任意用户
+        #    都能让模型读走 agent_workspaces/<别人>/ 下的私有图片。
+        #
+        #    刻意**不**用 is_runtime_path_allowed 的全量口径：它只认
+        #    branding/skills/docs 三个公共根，而平台历史上传目录(data/uploads)、
+        #    产物图(data/generated_files) 都在其外，全量收紧会把 read_image 的
+        #    主要用法直接打死。这里只堵"他人工作区"这一个真实越权面。
+        from app.utils.fs_access import is_fs_admin, is_other_user_workspace_path
+
+        user_info = _resolve_path_access_user_info()
+        if (
+            user_info
+            and not is_fs_admin(user_info)
+            and is_other_user_workspace_path(resolved_path, user_info)
+        ):
+            logger.warning("read_image 跨用户工作区读取被拒绝: path=%s", path)
+            return f"错误：无权访问图片路径 {path}（仅限本人工作区与平台公共目录）。"
         if not os.path.exists(abs_path):
             return f"错误：图片文件 {path} 不存在。"
         if os.path.isdir(abs_path):

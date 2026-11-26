@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 from app.core.dependencies import require_admin, require_api_key
-from app.api.portal.endpoints import auth, audit, management, user_import, keys, dashboard, system, chat, metadata, agents, prompts, slash_commands, health, models, tools, script_tools, tool_bundles, ragflow, roles, menus, departments, mcp, mcp_service, changelog, chat_feedback, examples, chatbi_briefs, chatbi_monitors, chatbi_export, skills, personal_skills, skill_gallery, memory, saved_reports, portal_prefs, quota, notifications, inbox, broadcast, data_portal, scenario_templates, workbench, langfuse, web_preview, access_requests, resource_square, chat_shares, secrets, instances
+from app.api.portal.endpoints import auth, audit, management, user_import, keys, dashboard, system, chat, metadata, agents, prompts, slash_commands, health, models, tools, script_tools, tool_bundles, ragflow, roles, menus, departments, mcp, mcp_changes, mcp_service, changelog, chat_feedback, examples, chatbi_briefs, chatbi_monitors, chatbi_export, skills, personal_skills, skill_gallery, memory, saved_reports, portal_prefs, quota, notifications, inbox, broadcast, data_portal, scenario_templates, workbench, langfuse, web_preview, access_requests, resource_square, chat_shares, file_shares, secrets, instances
 
 portal_router = APIRouter()
 
@@ -21,6 +21,10 @@ portal_router.include_router(chat_feedback.router, prefix="/chat", tags=["反馈
 # 4.2 会话在线分享（所有者视角：创建 / 我分享的 / 作废）
 # 访客读取走免鉴权的 /api/v1/share/*，不在这里。
 portal_router.include_router(chat_shares.router, prefix="/chat-shares", tags=["会话分享"], dependencies=[Depends(require_api_key)])
+
+# 4.3 工作区文件在线分享（所有者视角：创建 / 我分享的 / 作废）
+# 访客下载走免鉴权的 /api/v1/share/file/*，不在这里。
+portal_router.include_router(file_shares.router, prefix="/file-shares", tags=["文件分享"], dependencies=[Depends(require_api_key)])
 
 # 4.1 问答经验库 (Examples)
 portal_router.include_router(examples.router, prefix="/examples", tags=["问答经验库"], dependencies=[Depends(require_api_key)])
@@ -84,6 +88,8 @@ portal_router.include_router(ragflow.router, prefix="/ragflow", tags=["RAGFlow�
 
 # 15. MCP 管理 (MCP Management)
 portal_router.include_router(mcp.router, prefix="/mcp", tags=["MCP管理"], dependencies=[Depends(require_api_key)])
+# 定义变更（探测 / 待办 / 应用 / 忽略）单独成模块，路由仍挂在 /mcp 下，前端路径不变。
+portal_router.include_router(mcp_changes.router, prefix="/mcp", tags=["MCP管理"], dependencies=[Depends(require_api_key)])
 portal_router.include_router(mcp_service.router, prefix="/mcp-service", tags=["MCP服务台"], dependencies=[Depends(require_api_key)])
 
 # 15.1 凭据中心 (Credential Center)

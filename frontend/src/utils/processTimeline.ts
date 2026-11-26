@@ -97,6 +97,14 @@ export type ProcessTimelineLogItem = {
   reasoning?: boolean;
   execution_time_ms?: number | null;
   started_at?: number | null;
+  /**
+   * 后端事件序号（Redis journal 分配的会话维度单调递增值）。
+   *
+   * 时间线位置本来由「首次到达」决定，并发工具 / 断线补发 / 多路事件交错时会偏离
+   * 真实发生顺序。首帧带上它就按它排序（见 `orderTimelineBySeq`）；缺失（本地创建的
+   * 文本项、老快照）则保持原序。
+   */
+  seq?: number;
   subagent?: SubagentTraceMeta;
   /**
    * 远端 MCP 工具上报的进度快照（瞬态，不落库）。
@@ -142,6 +150,14 @@ export type ProcessTimelineTodo = {
 
 export type ProcessTimelineTodoItem = {
   kind: "todo";
+  /**
+   * 后端事件序号。
+   *
+   * 清单项实际不参与事件序排序，但这里必须声明：`SeqOrderableNode` 的字段全是可选，
+   * 一个字段都不沾的 todo 会触发 TS 的弱类型检测（「no properties in common」），
+   * 连带让 `orderTimelineBySeq(ProcessTimelineItem[])` 的整条调用链失败。
+   */
+  seq?: number;
   id: string;
   title: string;
   todos: ProcessTimelineTodo[];
@@ -153,6 +169,17 @@ export type ProcessTimelineTodoItem = {
 };
 
 export type ProcessTimelineItem = ProcessTimelineTextItem | ProcessTimelineLogItem | ProcessTimelineTodoItem;
+
+/**
+ * 树遍历用的子节点读取。
+ *
+ * `children` 只声明在 text / log 两个变体上（todo 项当前不挂子节点），
+ * 直接写 `item.children` 在 union 上不合法。把「哪些变体有子节点」收在这里，
+ * 递归遍历的代码就不必每处窄化。
+ */
+export function timelineItemChildren(item: ProcessTimelineItem): ProcessTimelineItem[] {
+  return item.kind === "todo" ? [] : item.children ?? [];
+}
 
 export const PREPARATION_TIMELINE_PARENT_ID = "preparation:auth_context_capability";
 
@@ -617,23 +644,162 @@ export function resolveBannerTodoTimeline(
 /**
  * 执行过程时间线要渲染的项。
  *
- * - 当前轮由 banner 卡片负责时传 `hideTodo: true`，避免同一份清单渲染两遍；
- * - 归档视图保留清单（含没有 `settled` 的旧快照与提问轮）——否则这些轮次的
- *   清单既不在 banner 也不在时间线，等于永久丢失；
- * - 旧快照可能残留多条 todo 项（同一 id），只保留最后一份，避免重复卡片和
- *   Vue `:key` 冲突。
+ * **任务清单一律不进执行明细**，只保留过程记录：
+ *
+ * - 清单是任务级概览，明细是过程记录，两个层级不该混。它唯一的正式位置是输入框
+ *   上方那张横幅（进行中 / 等待用户 / 终态回顾，见 `resolveBannerTodoTimeline`）。
+ * - 以前靠 `hideTodo` 开关做到「横幅显示时明细让位」，但横幅只服务**最后一条**回答：
+ *   历史轮次的清单就常驻在链路第一条、还带着「N 项未完成」，看着像整轮没收尾；
+ *   提问轮更糟——它不会被结算成终态（本轮还可能被回执接着跑），按 `settled` 判断
+ *   等于没生效，往回翻永远能看到那张卡。用户两次实测反馈都指向这里。
+ * - 代价：历史轮次的清单在界面上**完全不可见**——横幅只服务最后一轮，明细也不渲染。
+ *   过程信息不缺（`工具完成 · todo_write` 那条记录仍在明细里），清单快照仍在库里。
+ *
+ * 顺带失去的作用：以前这里还会对残留的多条 todo（同一 id 的旧快照）去重，
+ * 现在一条都不渲染，去重自然不需要了。
  */
+/**
+ * 同层按事件序号稳定排序（`seq` 由后端 Redis journal 分配，见 `ProcessTimelineLogItem.seq`）。
+ *
+ * - 有 seq 的按 seq 升序；没有 seq 的项（本地创建的旁白/推理文本、老快照）继承
+ *   「前一个已知 seq」跟着它走，不会被甩到别处；
+ * - seq 相同时按原始下标兜底，不依赖运行时 sort 的稳定性；
+ * - 整层都没有 seq、或本来就有序时**返回原数组引用**：渲染层按引用比较，
+ *   没有变化就不该触发重渲染；children 有变化时只复制受影响的那一项。
+ */
+/**
+ * 可参与事件序排序的树节点：只要求 `seq` 与 `children`。
+ *
+ * 原先把约束写成 `children?: T[]`，`ProcessTimelineItem` 这种 union 推断不出 T，
+ * 约束校验随之失败（报「参数字段不兼容」）。用递归接口描述结构后，
+ * text / log 的 `children?: ProcessTimelineLogItem[]` 都能结构化匹配。
+ */
+export interface SeqOrderableNode {
+  seq?: number;
+  children?: SeqOrderableNode[];
+}
+
+export function orderTimelineBySeq<T extends SeqOrderableNode>(
+  items: T[] | undefined,
+): T[] {
+  const list = items || [];
+  if (list.length < 2 && !list.some((item) => (item?.children?.length ?? 0) > 1)) return list;
+
+  let working: T[] = list;
+  for (let index = 0; index < list.length; index += 1) {
+    const item = list[index];
+    const children = item?.children;
+    if (!children || children.length < 2) continue;
+    const orderedChildren = orderTimelineBySeq(children);
+    if (orderedChildren === children) continue;
+    if (working === list) working = [...list];
+    working[index] = { ...item, children: orderedChildren };
+  }
+
+  const ordered = orderTimelineLevelBySeq(working);
+  if (ordered) return ordered;
+  return working;
+}
+
+/** 单层排序；无需变动返回 `undefined`（调用方据此保留原引用）。 */
+function orderTimelineLevelBySeq<T extends { seq?: number }>(items: T[]): T[] | undefined {
+  let lastSeq: number | undefined;
+  let sawSeq = false;
+  const keyed = items.map((item, index) => {
+    let key: number;
+    if (typeof item.seq === "number") {
+      key = item.seq;
+      lastSeq = item.seq;
+      sawSeq = true;
+    } else {
+      key = lastSeq ?? Number.NEGATIVE_INFINITY;
+    }
+    return { item, key, index };
+  });
+  if (!sawSeq) return undefined;
+  let outOfOrder = false;
+  for (let index = 1; index < keyed.length; index += 1) {
+    if ((keyed[index]?.key ?? 0) < (keyed[index - 1]?.key ?? 0)) {
+      outOfOrder = true;
+      break;
+    }
+  }
+  if (!outOfOrder) return undefined;
+  keyed.sort((left, right) => left.key - right.key || left.index - right.index);
+  return keyed.map((entry) => entry.item);
+}
+
+/**
+ * 递归读取当前时间线中已记录的最大后端事件序号（无则返回 0）。
+ *
+ * 用于权限确认 / 外部执行恢复流启动时记录挂起前的序号上限：正常情况下后端恢复流
+ * 会保留 `:seq` 继续单调递增，但若等待确认期间 Redis 过期或重启导致序号从 1 起算，
+ * 前端可用此上限把恢复流的新序号平移到挂起前之后，避免 `orderTimelineBySeq` 把新卡片
+ * 插队到审批前步骤前面。
+ *
+ * 注意：若用户在审批确认前刷新过页面，历史快照本身不持久化 `seq`，此处会返回 `0`、
+ * `createResumeSeqNormalizer(0)` 退化为透传；但此时旧节点在 `orderTimelineLevelBySeq`
+ * 中均使用 `-Infinity` 作为排序键，新节点（`seq >= 1`）仍稳定排在旧节点之后，不会乱序。
+ */
+export function maxTimelineSeq(items: ProcessTimelineItem[] | undefined): number {
+  let max = 0;
+  const visited = new WeakSet<object>();
+  const walk = (list: ProcessTimelineItem[] | undefined) => {
+    for (const item of list || []) {
+      if (!item || visited.has(item)) continue;
+      visited.add(item);
+      if ("seq" in item && typeof item.seq === "number" && Number.isFinite(item.seq) && item.seq > max) {
+        max = item.seq;
+      }
+      const children = timelineItemChildren(item);
+      if (children.length) walk(children);
+    }
+  };
+  walk(items);
+  return max;
+}
+
+/**
+ * 为单次恢复流构造 `_seq` 防回退归一化器。
+ *
+ * - 后端正常保留 `:seq`（收到 `_seq > baseSeq`）时零偏移透传，保持恢复流内并发乱序可被
+ *   `orderTimelineBySeq` 正常纠偏；
+ * - 若因 Redis TTL 过期 / 重启导致后端序号回退到 `<= baseSeq`，则锁定平移偏移量，把本段
+ *   恢复流事件整体平移到 `baseSeq` 之后，既保留恢复流内部相对顺序，也防止新步骤插队到
+ *   审批前旧步骤前面。
+ */
+export function createResumeSeqNormalizer(
+  baseSeq: number,
+): <T extends Record<string, any>>(data: T) => T {
+  const floor = Number.isFinite(baseSeq) && baseSeq > 0 ? baseSeq : 0;
+  if (floor <= 0) {
+    return <T extends Record<string, any>>(data: T): T => data;
+  }
+  let rebaseOffset: number | null = null;
+  let maxSeenSeq = floor;
+
+  return <T extends Record<string, any>>(data: T): T => {
+    if (!data || typeof data !== "object") return data;
+    const rawSeq = data._seq;
+    if (typeof rawSeq !== "number" || !Number.isFinite(rawSeq)) return data;
+
+    if (rebaseOffset === null) {
+      rebaseOffset = rawSeq <= floor ? floor : 0;
+    } else if (rebaseOffset === 0 && rawSeq <= floor) {
+      rebaseOffset = Math.max(floor, maxSeenSeq);
+    }
+
+    const effectiveSeq = rebaseOffset > 0 ? rawSeq + rebaseOffset : rawSeq;
+    if (effectiveSeq > maxSeenSeq) maxSeenSeq = effectiveSeq;
+    if (rebaseOffset === 0) return data;
+    return { ...data, _seq: effectiveSeq };
+  };
+}
+
 export function selectTimelineRenderableItems(
   items: ProcessTimelineItem[],
-  options: { hideTodo?: boolean } = {},
 ): ProcessTimelineItem[] {
-  const list = items || [];
-  if (options.hideTodo) return list.filter((item) => item.kind !== "todo");
-  let lastTodoIndex = -1;
-  list.forEach((item, index) => {
-    if (item.kind === "todo") lastTodoIndex = index;
-  });
-  return list.filter((item, index) => item.kind !== "todo" || index === lastTodoIndex);
+  return (items || []).filter((item) => item.kind !== "todo");
 }
 
 /**
@@ -644,7 +810,7 @@ function collectLogsByPredicate(
   match: (log: ProcessTimelineLogItem) => boolean,
 ): ProcessTimelineLogItem[] {
   const found: ProcessTimelineLogItem[] = [];
-  // ⚠️ 防环：这是深度优先递归，且每次 props 变化都会跑（模型 / 工具两套汇总各一次）。
+  //  防环：这是深度优先递归，且每次 props 变化都会跑（模型 / 工具两套汇总各一次）。
   // 委派场景的树是「旁白 → 子代理容器 → 步骤 → 子步骤」，容器会按 subagent 元数据
   // 合并、按 parent_id 重挂；一旦某节点被挂到自己下面（或两节点互指），没有 visited
   // 就是**主线程无限递归** → Chrome「页面无响应」，刷新后重新 hydrate 继续卡。
@@ -758,9 +924,19 @@ export function appendProcessNarrationText(existing: string, piece: string): str
   return normalizeProcessNarrationText(prev + next);
 }
 
+/**
+ * 「Agent 回复开始 / 结束」是阶段标记，不是一次工具执行。
+ *
+ * 它们同样带 `category="agent"`，原先被 `isToolLog` 判成工具行，于是在「本轮还没
+ * 有已提交旁白」时和工具一起被吸附进上一轮的旁白 children——用户看到的
+ * 「主专家开始处理」就落在了上一轮末尾（见 attachableNarrationParent 的说明）。
+ */
+const AGENT_LIFECYCLE_TITLE = /^(?:\[.*?\]\s*)?[✨\s]*(?:Agent 回复开始|Agent 回复结束)\s*$/;
+
 function isToolLog(data: { title?: string; category?: string; id?: string | number }): boolean {
   const category = String(data.category || "").toLowerCase();
   if (category === "permission" || category === "external") return false;
+  if (AGENT_LIFECYCLE_TITLE.test(String(data.title || "").trim())) return false;
   if (category === "tool" || category === "sql" || category === "agent" || category === "tool_resolution") return true;
   if (category) return false;
   const title = String(data.title || "").toLowerCase();
@@ -1090,6 +1266,12 @@ function sortBatchRun<T extends ProcessTimelineItem | ProcessTimelineLogItem>(
 export const NON_LIVE_TIMER_CATEGORIES: ReadonlySet<string> = new Set([
   "permission",
   "external",
+  // 向用户追问（user_question）同样是在等人：机器没在跑，秒表一直涨会让用户
+  // 以为还在执行；收尾时也不该被标成 success——它停的是「等回答」，不是「已完成」。
+  "user_question",
+  // 业务数据确认卡（request_user_confirmation）同理：这一轮已经停在等用户点
+  // 确定/取消上，不是还在跑，秒表与呼吸灯都不该继续。
+  "business_confirmation",
 ]);
 
 /**
@@ -1120,20 +1302,24 @@ function isEligibleLiveTimerLog(item: ProcessTimelineLogItem): boolean {
 export function resolveLiveTimerLogId(
   items: ProcessTimelineItem[] | undefined,
 ): string | null {
-  let lastPending: ProcessTimelineLogItem | null = null;
-
-  const walk = (list: ProcessTimelineItem[] | undefined) => {
+  // 用递归返回值而不是在闭包里共享 lastPending：TS 不跟踪闭包内的赋值，
+  // 会一直把它当成 `null`，后面就报 `Property 'id' does not exist on type 'never'`。
+  // 顺带把 `children` 的读取收进 timelineItemChildren（todo 项没有该字段）。
+  const findLastPending = (
+    list: ProcessTimelineItem[] | undefined,
+  ): ProcessTimelineLogItem | null => {
+    let found: ProcessTimelineLogItem | null = null;
     for (const item of list || []) {
       if (!item) continue;
-      if (item.kind === "log" && item.status === "pending") {
-        lastPending = item;
-      }
-      walk(item.children as ProcessTimelineItem[] | undefined);
+      if (item.kind === "log" && item.status === "pending") found = item;
+      // 子树的挂起项更深，按视觉顺序它才是「最后一条」
+      const deeper = findLastPending(timelineItemChildren(item));
+      if (deeper) found = deeper;
     }
+    return found;
   };
 
-  walk(items);
-
+  const lastPending = findLastPending(items);
   if (!lastPending) return null;
   if (!isEligibleLiveTimerLog(lastPending)) return null;
   return String(lastPending.id);
@@ -1155,6 +1341,7 @@ export function resolveLiveTimerLogId(
  */
 export function settlePendingTimelineSteps(
   items: ProcessTimelineItem[] | undefined,
+  settleStatus: Extract<ProcessTimelineStatus, "success" | "interrupted" | "error"> = "success",
 ): number {
   let settled = 0;
 
@@ -1165,7 +1352,7 @@ export function settlePendingTimelineSteps(
         const waitingOnHuman =
           Boolean(item.category) && NON_LIVE_TIMER_CATEGORIES.has(item.category as string);
         if (item.status === "pending" && !waitingOnHuman) {
-          item.status = "success";
+          item.status = settleStatus;
           settled += 1;
         }
       } else if (item.kind === "text") {
@@ -1286,6 +1473,8 @@ export function upsertTimelineLog(
     resolution_status?: ToolResolutionStatus;
     execution_time_ms?: number | null;
     started_at?: number | null;
+    /** 后端事件序号（见 `ProcessTimelineLogItem.seq`）。 */
+    _seq?: number;
     subagent?: SubagentTraceMeta;
     /** 子代理思考：决定渲染成 Markdown 正文而不是工具输出。 */
     reasoning?: boolean;
@@ -1321,6 +1510,8 @@ export function upsertTimelineLog(
     if (data.resolution_status !== undefined) existing.resolution_status = data.resolution_status;
     if (data.execution_time_ms !== undefined) existing.execution_time_ms = data.execution_time_ms;
     if (data.started_at !== undefined) existing.started_at = data.started_at;
+    // 位置由首帧决定：已有序号不覆盖，只在缺失时补（首帧可能走在分配序号之前）。
+    if (existing.seq === undefined && typeof data._seq === "number") existing.seq = data._seq;
     if (data.subagent !== undefined) existing.subagent = data.subagent;
     if (data.reasoning !== undefined) existing.reasoning = data.reasoning;
     // 进度是执行期装饰：条目一结束就必须清掉，否则会被 process_timeline 快照
@@ -1366,7 +1557,20 @@ export function upsertTimelineLog(
     // 「任一派发卡」这条兜底，被并进第一个容器——第二个 run 没有独立容器，还会把
     // 第一个容器的元数据和标题一起覆盖成「续聊 #N」，让首次委派也被标成续聊。
     const matchesDelegationCard = (c: ProcessTimelineLogItem) => {
-      if (targetRunId) return c.subagent?.run_id === targetRunId;
+      if (targetRunId) {
+        if (c.subagent?.run_id === targetRunId) return true;
+        // 派发卡（sub_agent_call / batch 的工具事件）本身可能不带 subagent 字段。
+        // 只认 run_id 的话这类卡永远认领不到：第一次委派留下一张永远 pending 的卡，
+        // 生命周期事件又新建一张，用户看到两张委派卡。这里允许「尚无 run_id 的
+        // 派发卡」被认领一次——认领后立即写入 subagent（见下方），后续委派不会再抢。
+        return (
+          !c.subagent?.run_id &&
+          (c.tool_name === "sub_agent_call" ||
+            c.tool_name === "sub_agent_batch_call" ||
+            String(c.title || "").includes("委派智能体") ||
+            String(c.title || "").includes("sub_agent_call"))
+        );
+      }
       return (
         c.tool_name === "sub_agent_call" ||
         c.title.includes("委派智能体") ||
@@ -1385,9 +1589,11 @@ export function upsertTimelineLog(
       if (existingContainer.kind === "log") {
         containerLog = existingContainer;
       } else if (existingContainer.kind === "text") {
-        containerLog = (existingContainer.children || []).find((c: ProcessTimelineLogItem) =>
-          matchesDelegationCard(c)
-        );
+        // 从后往前取：正向 find 会命中最早的那张委派卡，把新一轮的状态写到
+        // 已经结束的第一个子代理头上。
+        containerLog = [...(existingContainer.children || [])]
+          .reverse()
+          .find((c: ProcessTimelineLogItem) => matchesDelegationCard(c));
       }
       if (containerLog) {
         if (data.execution_time_ms !== undefined) containerLog.execution_time_ms = data.execution_time_ms;
@@ -1413,10 +1619,19 @@ export function upsertTimelineLog(
   }
 
   if (isIncomingSubagentTool) {
+    const incomingToolId = String((data as { id?: unknown }).id ?? "");
+    const matchToolContainer = (c: ProcessTimelineLogItem) => {
+      if (!isDelegationContainerLike(c)) return false;
+      // 同一个 tool_call 的后续帧（start → result）按 id 精确命中
+      if (incomingToolId && String(c.id) === incomingToolId) return true;
+      // 拿不到 id 时**只**认仍在进行中的容器：命中已完成的那张会把第一次委派
+      // 的结果反向改回 pending，用户看到第一个子代理又卡住了。
+      return c.status === "pending";
+    };
     const existingContainer = [...target.processTimeline].reverse().find((item) => {
-      if (item.kind === "log" && isDelegationContainerLike(item)) return true;
+      if (item.kind === "log") return matchToolContainer(item);
       if (item.kind === "text") {
-        return (item.children || []).some((c) => isDelegationContainerLike(c as ProcessTimelineLogItem));
+        return (item.children || []).some((c) => matchToolContainer(c as ProcessTimelineLogItem));
       }
       return false;
     });
@@ -1425,9 +1640,11 @@ export function upsertTimelineLog(
       if (existingContainer.kind === "log") {
         containerLog = existingContainer;
       } else if (existingContainer.kind === "text") {
-        containerLog = (existingContainer.children || []).find((c: ProcessTimelineLogItem) =>
-          isDelegationContainerLike(c)
-        );
+        // 同 lifecycle 分支：取**最后**一张，否则第二次委派的收尾状态会被写到
+        // 第一个子代理的卡上（已完成卡被反向改成 pending，第一个结果看起来卡住了）。
+        containerLog = [...(existingContainer.children || [])]
+          .reverse()
+          .find((c: ProcessTimelineLogItem) => matchToolContainer(c));
       }
       if (containerLog) {
         if (data.execution_time_ms !== undefined) containerLog.execution_time_ms = data.execution_time_ms;
@@ -1461,6 +1678,7 @@ export function upsertTimelineLog(
     // pending 卡必须在创建时刻留下基准，否则「执行中实时秒表」无从计算：
     // msg.logs 侧已在 EmbedChat 里这么做，processTimeline 侧此前一直缺失。
     started_at: data.started_at ?? (data.status === "pending" ? Date.now() : undefined),
+    seq: typeof data._seq === "number" ? data._seq : undefined,
     subagent: data.subagent,
     reasoning: data.reasoning,
     isExpanded: false,
@@ -1498,12 +1716,7 @@ export function upsertTimelineLog(
     }
   }
 
-  const parent = isToolLog(data)
-    ? [...target.processTimeline].reverse().find(
-      (item): item is ProcessTimelineTextItem =>
-        item.kind === "text" && item.textKind === "narration" && !item.pending,
-    )
-    : undefined;
+  const parent = isToolLog(data) ? attachableNarrationParent(target.processTimeline) : undefined;
   if (parent) {
     parent.children ||= [];
     parent.children.push(log);
@@ -1511,6 +1724,33 @@ export function upsertTimelineLog(
     return;
   }
   target.processTimeline.push(log);
+}
+
+/**
+ * 找「可以承接工具行的旁白」。
+ *
+ * 规则只有一条：**必须是时间线最后一个顶层条目，且是已提交的旁白**。
+ *
+ * 早先的判定是「最近一条 narration 且 !pending」，没有任何「本轮 / 本阶段」约束，
+ * 于是只要本轮此刻还没有已提交旁白——模型没说就动手、旁白还在流式、或权限确认
+ * 挂起恢复后直接重试——工具行就会被塞进**上一轮**那段旁白的 children 里。位置
+ * 就此冻结在旧区域，而本轮后续到达的准备类事件（准备容器 / 已启用技能 / 工具预检 /
+ * 会话运行时准备 / Agent 回复开始）作为顶层条目继续往后追加。
+ *
+ * 用户看到的就是：一条「调用工具 · Bash 4ms/300s」卡在中间转圈，下面才是刚发生的
+ * 准备序列，像时间倒挂。授权场景尤其容易踩中——需要确认的工具基本都是「不说废话
+ * 直接执行」的那种，而挂起恢复也不会把已经放错的卡片搬回来（同 id 更新只改状态）。
+ *
+ * 收窄成「最后一条」之后，「旁白引出它下面一串工具」的观感不变，跨轮 / 跨阶段的
+ * 吸附被切断；旁白之后只要发生过任何别的事，新工具就老老实实留在顶层。
+ */
+function attachableNarrationParent(
+  items: ProcessTimelineItem[],
+): ProcessTimelineTextItem | undefined {
+  const last = items[items.length - 1];
+  if (!last || last.kind !== "text") return undefined;
+  if (last.textKind !== "narration" || last.pending) return undefined;
+  return last;
 }
 
 function cloneNestedTimelineValue<T>(
@@ -1808,18 +2048,10 @@ export function countTimelineSteps(items: ProcessTimelineItem[]): number {
   return items.reduce((count, item) => {
     // 任务清单是任务级概览，不是一次执行步骤：不计入「执行过程 · N 步骤」。
     if (item.kind === "todo") return count;
-    if (item.kind === "log" && item.id === ROUTE_TIMELINE_ROOT_ID) {
-      return count + 1 + (item.children?.length || 0);
-    }
-    if (item.kind === "log" && item.id === "preparation:auth_context_capability") {
-      return count + 1 + (item.children || []).reduce((nestedCount, child) => {
-        if (child.id === ROUTE_TIMELINE_ROOT_ID) {
-          return nestedCount + 1 + (child.children?.length || 0);
-        }
-        return nestedCount + 1;
-      }, 0);
-    }
-    return count + 1;
+    // 递归统计子节点：子代理容器（委派 → 子代理内部的每一步）的二级 children
+    // 此前完全不计入，于是「执行过程 · 3 步骤」里明明展开了七八行。
+    const children = (item as { children?: ProcessTimelineItem[] }).children;
+    return count + 1 + countTimelineSteps(children || []);
   }, 0);
 }
 
@@ -1993,7 +2225,10 @@ function reorganizeSubagentItems(items: ProcessTimelineItem[]): ProcessTimelineI
     }
 
     if (item.kind === "log" && isContainer(item)) {
-      if (activeContainer) {
+      // 必须确认是**同一个子代理**才并进当前容器：裸 `if (activeContainer)` 会把
+      // 第二个子代理（run_id 不同）的整张卡并进第一个，界面上少一张卡，元数据
+      // 与标题还被覆盖。缺 run_id 时 isSameSubagentRun 返回 true，保持原行为。
+      if (activeContainer && isSameSubagentRun(activeContainer, item)) {
         activeContainer.execution_time_ms = item.execution_time_ms || activeContainer.execution_time_ms;
         activeContainer.status = item.status || activeContainer.status;
         if (item.details) activeContainer.details = item.details;

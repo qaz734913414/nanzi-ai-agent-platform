@@ -43,6 +43,9 @@ MAX_QUESTION_CLICKS = 500  # 最多记录的问题点击 key 数
 GLOBAL_AGENT_AVATAR_KEY = "agent:branding:default_agent_avatar"
 # 给用户看的模式名称：403 的 detail 直接展示在前端 toast 里
 UI_MODE_LABELS = {"user": "用户模式", "pro": "专业模式"}
+# 登录页视觉风格白名单与默认值：8 套可选风格，默认 F1（双面穿界星盘）
+LOGIN_THEMES = ("f1", "f2", "f3", "f4", "g", "h", "i", "j")
+DEFAULT_LOGIN_THEME = "f1"
 
 
 def _redis_key(user_id: int) -> str:
@@ -82,6 +85,17 @@ class PortalPrefs(BaseModel):
     # 空字符串 = 用户从未选过，读取时按角色给默认值（管理员 pro / 其他 user）。
     # 不用 Literal 是为了兼容历史 JSON 里可能出现的空值。
     ui_mode: str = Field(default="", description="界面模式：user（用户模式）/ pro（专业模式）")
+    # 登录页视觉风格偏好：存 Redis 供跨设备同步，未设置或历史脏值读取时回落默认 f1。
+    login_theme: str = Field(default=DEFAULT_LOGIN_THEME, description="登录页视觉风格：f1/f2/f3/f4/g/h/i/j，默认 f1")
+
+    @field_validator("login_theme", mode="before")
+    @classmethod
+    def _coerce_login_theme(cls, value: Any) -> str:
+        # 容忍 Redis 历史数据里的 null / 大小写 / 脏值，防止整份偏好 JSON 解析失败
+        return _resolve_login_theme(value)
+    # 空字符串 = 从未忽略过任何版本。存归一化后的三段（1.0.24），
+    # 上游出现更大的 tag 时自然失配，「忽略此版本」就自动失效——不是永久静音。
+    ignored_update_version: str = Field(default="", description="用户已忽略提示的版本号（三段，如 1.0.24）")
     agent_avatar: str = Field(default="", description="[历史保留] 旧版个人头像偏好；读取时一律以全局键 agent:branding:default_agent_avatar 为准，写入时恒为空")
     routing_mode: Literal["auto", "expert"] = Field(default="auto", description="Embed 路由模式")
     expert_agent_id: str = Field(default="", description="Embed 默认智能体 ID")
@@ -133,6 +147,20 @@ class UiModeUpdate(BaseModel):
     ui_mode: Literal["user", "pro"]
 
 
+class LoginThemeUpdate(BaseModel):
+    """登录页视觉风格（8 套主题，默认 f1）。
+
+    走专用端点而非全量 PUT，避免旧页面回写覆盖其他偏好字段。
+    """
+
+    login_theme: Literal["f1", "f2", "f3", "f4", "g", "h", "i", "j"]
+
+    @field_validator("login_theme", mode="before")
+    @classmethod
+    def _normalize_input_theme(cls, value: Any) -> Any:
+        return value.strip().lower() if isinstance(value, str) else value
+
+
 class EmbedTourUpdate(BaseModel):
     """功能引导进度（账号级，跨设备）。
 
@@ -169,6 +197,12 @@ def _resolve_ui_mode(value: Any, role: Any, blocked: Any = None) -> str:
     ``blocked`` 是角色级黑名单：偏好被禁时自动落到剩下的那一种。
     """
     return clamp_mode(value, blocked or (), role)
+
+
+def _resolve_login_theme(value: Any) -> str:
+    """登录页风格兜底：只认 8 个合法主题，空值或脏数据一律回落默认 f1。"""
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in LOGIN_THEMES else DEFAULT_LOGIN_THEME
 
 
 async def _load_ui_mode_policy(
@@ -287,6 +321,7 @@ async def get_portal_prefs(
     # 用户没选过界面模式时按角色给默认值，再按角色黑名单夹逼：
     # 前端拿到的一定是「当前确实可用的那一模式」，不需要再自己判断角色与黑名单。
     data["ui_mode"] = _resolve_ui_mode(prefs.ui_mode, user_info.get("role"), policy.blocked)
+    data["login_theme"] = _resolve_login_theme(prefs.login_theme)
     data.update(mode_fields)
     try:
         # 全局键是 AI 头像的唯一权威源：命中则以它为准，未配置则强制置空为默认形象，
@@ -414,6 +449,8 @@ async def update_portal_prefs(
         # 界面模式只允许通过 /ui-mode 更新；旧页面全量回写必须保留现值，
         # 否则用户切好的模式会被一次无关的偏好保存冲回默认。
         ui_mode=existing.ui_mode,
+        # 登录页风格只允许通过 /login-theme 更新；旧页面全量回写必须保留现值。
+        login_theme=_resolve_login_theme(existing.login_theme),
     )
 
     try:
@@ -798,6 +835,55 @@ async def update_ui_mode(
     }
 
 
+@router.put(
+    "/login-theme",
+    response_model=Dict[str, Any],
+    summary="更新当前用户的登录页视觉风格偏好",
+)
+async def update_login_theme(
+    body: LoginThemeUpdate,
+    user_info: Dict[str, Any] = Depends(require_api_key),
+):
+    """只改 login_theme，其余偏好原样保留。
+
+    登录页风格是账号级偏好，长期存在 Redis（无 TTL）以支持跨设备同步；
+    本机 localStorage 由前端同步缓存，保证未登录打开 /login 时首帧无闪烁。
+    """
+    redis = await get_redis()
+    if not redis:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Redis 服务不可用",
+        )
+
+    user_id = int(user_info["user_id"])
+    key = _redis_key(user_id)
+    prefs = PortalPrefs()
+    try:
+        raw = await redis.get(key)
+        if raw:
+            prefs = _parse_portal_prefs(raw)
+    except Exception as e:
+        logger.warning("Failed to read existing portal prefs before login theme update: %s", e)
+
+    prefs.login_theme = _resolve_login_theme(body.login_theme)
+
+    try:
+        await redis.set(key, prefs.model_dump_json())
+    except Exception as e:
+        logger.error("Failed to save login theme to Redis: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="保存登录页风格失败",
+        ) from e
+
+    return {
+        "code": 0,
+        "data": {"login_theme": prefs.login_theme},
+        "message": "登录页风格已保存",
+    }
+
+
 class MarkdownThemeUpdate(BaseModel):
     theme: str
 
@@ -843,6 +929,68 @@ async def update_markdown_theme(
         )
 
     return {"code": 0, "data": {"markdown_theme": prefs.markdown_theme}, "message": "样式偏好已保存"}
+
+
+class IgnoredUpdateVersionUpdate(BaseModel):
+    """「忽略此版本」：存归一化后的三段版本号，空串表示取消忽略。"""
+
+    version: str = Field(default="", max_length=32, description="已忽略的版本号（三段，如 1.0.24）；空串表示清除")
+
+
+@router.put(
+    "/ignored-update-version",
+    response_model=Dict[str, Any],
+    summary="更新当前用户已忽略的新版本提示",
+)
+async def update_ignored_update_version(
+    body: IgnoredUpdateVersionUpdate,
+    user_info: Dict[str, Any] = Depends(require_api_key),
+):
+    """单独一个端点，理由与 ui_mode / markdown_theme 相同：
+
+    全量偏好 PUT 会用请求体里的空值覆盖其他字段，只想「忽略这个版本」不该
+    连带把置顶、侧栏状态写回旧值。
+    """
+
+    from app.services.update_check_service import normalize_version
+
+    redis = await get_redis()
+    if not redis:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Redis 服务不可用",
+        )
+
+    user_id = int(user_info["user_id"])
+    key = _redis_key(user_id)
+
+    prefs = PortalPrefs()
+    try:
+        raw = await redis.get(key)
+        if raw:
+            prefs = _parse_portal_prefs(raw)
+    except Exception as e:
+        logger.warning("Failed to read existing portal prefs before ignored-version update: %s", e)
+
+    # 统一存三段归一化形态：四段的 1.0.24.0 与 tag 的 1.0.24 是同一个版本，
+    # 若原样存四段，下次比对（与 tag 的三段比）就永远不相等，忽略会失效。
+    prefs.ignored_update_version = normalize_version(body.version)
+
+    try:
+        # 与全量偏好一致：不设 TTL，长期保留
+        await redis.set(key, prefs.model_dump_json())
+    except Exception as e:
+        logger.error("Failed to save ignored update version to Redis: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="保存忽略版本失败",
+        ) from e
+
+    return {
+        "code": 0,
+        "data": {"ignored_update_version": prefs.ignored_update_version},
+        "message": "已忽略该版本的更新提示" if prefs.ignored_update_version else "已恢复更新提示",
+    }
 
 
 class AgentAvatarUpdate(BaseModel):

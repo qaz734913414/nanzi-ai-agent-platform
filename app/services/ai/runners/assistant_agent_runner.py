@@ -93,6 +93,7 @@ from app.services.ai.runtime.agentscope.tool_result import (
     build_final_tool_result_context,
     build_tool_result_envelope,
     extract_tool_result_error_reason,
+    image_usage_from_metadata,
     is_tool_result_error,
     normalize_tool_result_state,
     tool_call_id_from_metadata,
@@ -114,6 +115,7 @@ from app.services.ai.runtime.agentscope.session_lock import (
 )
 from app.services.ai.runtime.agentscope.workspace import (
     DockerSandboxUnavailableError,
+    WorkspacePrepareTrace,
     _workspace_native_name_for_spec,
     bind_configured_tools_to_workspace,
     build_host_only_workspace,
@@ -122,6 +124,7 @@ from app.services.ai.runtime.agentscope.workspace import (
     get_workspace_offloader,
 )
 from app.services.ai.runtime.agentscope.k8s_workspace import K8sSandboxUnavailableError
+from app.services.ai.runtime.sandbox_errors import SandboxUnavailableError
 from app.services.ai.runtime.sandbox_degradation import (
     clear_sandbox_degraded,
     set_sandbox_degraded,
@@ -145,6 +148,12 @@ from app.services.ai.time_anchor import filter_redundant_time_tools
 
 logger = logging.getLogger(__name__)
 
+# AgentScope `_agent.py` 在「还有工具停在 ASKING」时构造的 Exit 占位文案。
+# 它来自框架、不是模型输出，被当成助手正文转发/落库就是一条纯垃圾回答。
+_AWAITING_PERMISSION_EXIT_TEXT = (
+    "I'm waiting for your permission or the external execution to finish."
+)
+
 
 _FILE_TOOL_OPERATIONS = {
     "Read": "read",
@@ -153,6 +162,16 @@ _FILE_TOOL_OPERATIONS = {
     "Glob": "search",
     "Grep": "search",
 }
+
+
+def _workspace_trace_details(trace: WorkspacePrepareTrace | None) -> str:
+    """把工作区准备的分段摘要拼成卡片 details 的后缀（没有内容就不加）。
+
+    卡片右侧显示的是整段墙钟，但「为什么这么慢」只有分段摘要能回答：沙箱现场重建、
+    技能全量播种、会话初始化三者代价差两个数量级。
+    """
+    summary = trace.summary() if trace is not None else ""
+    return f"（{summary}）" if summary else ""
 
 
 def _extract_agentscope_tool_call_input(agent: Any, tool_id: str) -> Any:
@@ -1186,19 +1205,21 @@ class AssistantAgentRunner(BaseExecutor):
         from app.services.ai.memory_recall_policy import (
             looks_like_cross_session_recall_query,
         )
+        from app.utils.skill_metadata import extract_plain_user_query
 
+        plain_query = extract_plain_user_query(user_query)
         signal_contracts = (
-            (looks_like_strong_business_data_request(user_query), EvidenceType.INTERNAL_DATA),
+            (looks_like_strong_business_data_request(plain_query), EvidenceType.INTERNAL_DATA),
             (
-                looks_like_web_search_query(user_query)
-                or looks_like_dynamic_public_fact_query(user_query)
-                or looks_like_public_profile_lookup(user_query),
+                looks_like_web_search_query(plain_query)
+                or looks_like_dynamic_public_fact_query(plain_query)
+                or looks_like_public_profile_lookup(plain_query),
                 EvidenceType.PUBLIC_WEB,
             ),
-            (looks_like_runtime_diagnostic_query(user_query), EvidenceType.RUNTIME_STATE),
-            (looks_like_knowledge_query(user_query), EvidenceType.INTERNAL_KNOWLEDGE),
+            (looks_like_runtime_diagnostic_query(plain_query), EvidenceType.RUNTIME_STATE),
+            (looks_like_knowledge_query(plain_query), EvidenceType.INTERNAL_KNOWLEDGE),
             (
-                looks_like_cross_session_recall_query(user_query),
+                looks_like_cross_session_recall_query(plain_query),
                 EvidenceType.CONVERSATION_MEMORY,
             ),
         )
@@ -1312,11 +1333,14 @@ class AssistantAgentRunner(BaseExecutor):
         self,
         history: List[Dict[str, str]]
     ) -> AsyncGenerator[Dict[str, Any], None]:
+        from app.utils.skill_metadata import extract_plain_user_query
+
         user_query = self._current_user_query(history)
+        plain_user_query = extract_plain_user_query(user_query)
         grounding_enabled = self._grounding_enabled()
         run_data_guard = (
             grounding_enabled
-            and self._should_run_data_hallucination_guard(user_query)
+            and self._should_run_data_hallucination_guard(plain_user_query)
         )
         ctx = self._ensure_agent_context()
         shared_ledger = (
@@ -1333,7 +1357,7 @@ class AssistantAgentRunner(BaseExecutor):
         # 才能把正文里的引用反查回正确的切片，避免多次检索导致引用错配。
         new_turn_knowledge_citation_ledger(ctx)
         grounding_requirement = (
-            self._resolve_turn_grounding_requirement(user_query, ctx)
+            self._resolve_turn_grounding_requirement(plain_user_query, ctx)
             if grounding_enabled
             else FactRequirement(required=False, accepted_types=frozenset())
         )
@@ -1872,6 +1896,9 @@ class AssistantAgentRunner(BaseExecutor):
             tools_include_memory_search,
         )
         from app.services.memory_config_service import MemoryConfigService
+        from app.utils.skill_metadata import extract_plain_user_query
+
+        _preflight_user_query = extract_plain_user_query(user_query)
 
         memory_search_available = tools_include_memory_search(tools)
         recall_query_pending = False
@@ -1879,11 +1906,11 @@ class AssistantAgentRunner(BaseExecutor):
             try:
                 enabled = await MemoryConfigService.get_bool("memory_service_enabled", True)
                 recall_query_pending = enabled and looks_like_cross_session_recall_query(
-                    user_query
+                    _preflight_user_query
                 )
             except Exception:
                 recall_query_pending = looks_like_cross_session_recall_query(
-                    user_query
+                    _preflight_user_query
                 )
 
         native_system_content = system_content
@@ -1898,12 +1925,18 @@ class AssistantAgentRunner(BaseExecutor):
         # 模式 agent_tool_preflight_mode：off=关闭；soft=普通工具注入便签；hard=便签+首步强制调用。
         # 证据型只读工具即使在 soft 模式也必须首步取证，避免模型凭上下文直接生成动态事实。
         preflight_tool_choice = None
-        _preflight_user_query = user_query
         from app.services.ai.tool_nudge_policy import (
+            extract_active_skill_state,
             is_automatic_delivery_context,
             is_tool_meta_query,
             looks_like_explicit_user_question_request,
         )
+
+        (
+            _has_active_skills,
+            _has_full_preloaded_skill,
+            _summary_only_skill_ids,
+        ) = extract_active_skill_state(system_content)
 
         _preflight_ctx = self._ensure_agent_context()
         grounding_request_decision = self._resolve_grounding_request_decision(_preflight_user_query)
@@ -1987,9 +2020,13 @@ class AssistantAgentRunner(BaseExecutor):
                             force_first_call=True,
                         )
                     else:
-                        evidence_plan = resolve_tool_nudge_plan(
-                            _preflight_user_query,
-                            tools,
+                        evidence_plan = (
+                            None
+                            if _has_full_preloaded_skill
+                            else resolve_tool_nudge_plan(
+                                _preflight_user_query,
+                                tools,
+                            )
                         )
                         if evidence_plan is not None:
                             evidence_contracts = tuple(
@@ -2002,7 +2039,7 @@ class AssistantAgentRunner(BaseExecutor):
                             )
                         else:
                             tool_nudge = resolve_tool_nudge(
-                                user_query,
+                                _preflight_user_query,
                                 tools,
                                 available_sub_agent_names=available_sub_agent_names,
                                 sub_agent_candidates_by_capability=sub_agent_candidates_by_capability,
@@ -2017,6 +2054,9 @@ class AssistantAgentRunner(BaseExecutor):
                                     else None
                                 ),
                                 allow_explicit_question=interactive_question_allowed,
+                                has_active_skills=_has_active_skills,
+                                has_full_preloaded_skill=_has_full_preloaded_skill,
+                                summary_only_skill_ids=_summary_only_skill_ids,
                             )
                     if tool_nudge is None and grounding_requires_tool:
                         capability_name = next(
@@ -2576,6 +2616,9 @@ class AssistantAgentRunner(BaseExecutor):
         # 真建连，所有策略都要做技能播种与 LocalWorkspace.initialize，整体被 90s 的
         # wait_for 兜着。这段时间执行时间线一个字都不会动，所以先挂一张进度卡。
         prepare_started_at = time.monotonic()
+        # 分段测量：慢在沙箱获取、技能播种还是会话初始化，必须能一眼看出来——这段是
+        # 首 token 前最长、也最不稳定的一段（容器被回收时可能是分钟级）。
+        prepare_trace = WorkspacePrepareTrace()
         await self._emit_workspace_prepare_log(status="pending")
         try:
             workspace = await asyncio.wait_for(
@@ -2587,10 +2630,18 @@ class AssistantAgentRunner(BaseExecutor):
                     skills_custom=bool(getattr(self.config, "skills_custom", False)),
                     allowed_global_skills=list(getattr(self.config, "skills", None) or []),
                     lazy_sandbox=True,
+                    prepare_trace=prepare_trace,
                 ),
                 timeout=90.0,
             )
-        except (DockerSandboxUnavailableError, K8sSandboxUnavailableError, asyncio.TimeoutError) as exc:
+        except (
+            DockerSandboxUnavailableError,
+            K8sSandboxUnavailableError,
+            # 基类兜住 e2b / ssh / local 等其余策略的失败：它们此前静默返回 None，
+            # 会被当成"工作区已就绪"，导致 Bash 落回宿主执行。
+            SandboxUnavailableError,
+            asyncio.TimeoutError,
+        ) as exc:
             if isinstance(exc, asyncio.TimeoutError):
                 logger.warning(
                     "[agent] Sandbox workspace init timed out (conversation=%s); treating as unavailable: %s",
@@ -2636,7 +2687,11 @@ class AssistantAgentRunner(BaseExecutor):
             await self._emit_workspace_prepare_log(
                 status="error",
                 started_at=prepare_started_at,
-                details="沙箱当前不可用，本轮已降级为本地执行（Bash 与脚本工具不可用），沙箱恢复后自动恢复。",
+                details=(
+                    "沙箱当前不可用，本轮已降级为本地执行（Bash 与脚本工具不可用），"
+                    "沙箱恢复后自动恢复。"
+                    + _workspace_trace_details(prepare_trace)
+                ),
             )
             workspace = (
                 None,
@@ -2663,9 +2718,15 @@ class AssistantAgentRunner(BaseExecutor):
             await self._emit_workspace_prepare_log(
                 status="success",
                 started_at=prepare_started_at,
-                details="工作区已就绪。",
+                details=f"工作区已就绪。{_workspace_trace_details(prepare_trace)}",
             )
         build_timer.mark("workspace")
+        # 工作区准备的内部实测（沙箱获取 / 技能播种 / 会话初始化）：父行是本段墙钟，
+        # 子行是那次构建的分段，两者刻意不强求相加相等（见 format_build_details）。
+        for _stage_name, _stage_ms in prepare_trace.stages:
+            build_timer.record(f"workspace:{_stage_name}", _stage_ms)
+        if prepare_trace.joined_inflight:
+            build_timer.record("workspace:joined", prepare_trace.total_ms)
         # 仅挂载 agent 后端配置的工具；已配置的 Bash/Read 等换成会话 workdir 版本，不额外注入未绑定的内置工具。
         tools = await bind_configured_tools_to_workspace(
             workspace,
@@ -2879,6 +2940,9 @@ class AssistantAgentRunner(BaseExecutor):
                 tool_result_state=tool_result_state,
                 sandbox_policy=display_sandbox_policy,
                 logical_root=display_logical_root,
+                # 图像类工具把「出了几张、多大、上游多少 token」挂在结果元数据上
+                # （不进模型上下文），这里原样带进轨迹，按调用维度可查。
+                image_usage=image_usage_from_metadata(event),
             )
             if result.get("log"):
                 log_chunk = result["log"]
@@ -2922,6 +2986,13 @@ class AssistantAgentRunner(BaseExecutor):
             delta = sanitize_assistant_stream_text(str(getattr(event, "delta", "")))
             if not delta:
                 return
+            # AgentScope 在「还有工具停在 ASKING」时用 Exit 收尾，会把框架占位文案
+            # 「I'm waiting for your permission or the external execution to finish.」
+            # 当成助手正文吐出来。它不是模型产出，原样转发会成为本轮回答、还会连库。
+            # 正常路径下 permission_required 帧会让上面的事件循环提前 return，这里是
+            # 兜底（并发审批、快照被覆盖等情况）。
+            if delta.strip() == _AWAITING_PERMISSION_EXIT_TEXT:
+                return
             for chunk in process_narration_events.on_text_delta(state, delta):
                 async for item in self._yield_process_narration_chunk(state, chunk):
                     yield item
@@ -2964,6 +3035,18 @@ class AssistantAgentRunner(BaseExecutor):
                 yield chunk
                 if is_interrupt_sse_chunk(chunk):
                     return
+
+        # 兜底：正文里如果只剩下框架的「等待授权」占位语，说明这一轮其实停在
+        # ASKING 上、并没有真实产出（on_text_block_delta 已吞掉那句话，这里处理
+        # 它混在其他文本里或走了别的通道情况）。按中断收尾——不合成正文、不让
+        # 调用方把这份 AgentState 存回去（存回去会让下次恢复接着这份半死状态）。
+        if str(state.get("full_content") or "").strip() == _AWAITING_PERMISSION_EXIT_TEXT:
+            yield {
+                "type": "error",
+                "status": "error",
+                "content": "本轮在等待工具授权时提前结束，请重新发起该任务。",
+            }
+            return
 
         async for chunk in self._reconcile_reply_after_stream(
             agent=agent,
@@ -3973,6 +4056,7 @@ class AssistantAgentRunner(BaseExecutor):
         tool_result_state: Any = None,
         sandbox_policy: str | None = None,
         logical_root: str = "/workspace",
+        image_usage: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         is_error = is_tool_result_error(
             tool_name,
@@ -4029,10 +4113,18 @@ class AssistantAgentRunner(BaseExecutor):
             model=t_model, temperature=t_temp, tool_name=tool_name, tool_input=tool_args,
             tool_output=tool_output if isinstance(tool_output, (dict, list)) else {"raw": str(tool_output)},
             execution_time_ms=duration_tool, status="success" if not is_error else "error",
+            # 超时来源与用量都写进 meta_info：一个是「这次为什么等这么久」，
+            # 一个是「这次花了多少」，排查成本与超时都从这一列入手。
             meta_info=(
-                {"timeout_seconds": t_timeout, "timeout_source": t_timeout_source}
-                if t_timeout is not None
-                else None
+                {
+                    **(
+                        {"timeout_seconds": t_timeout, "timeout_source": t_timeout_source}
+                        if t_timeout is not None
+                        else {}
+                    ),
+                    **({"image_usage": image_usage} if image_usage else {}),
+                }
+                or None
             ),
             timestamp=datetime.fromtimestamp(time.time() - duration_tool / 1000)
         )
@@ -4060,6 +4152,10 @@ class AssistantAgentRunner(BaseExecutor):
         if t_timeout is not None:
             log_event["timeout_seconds"] = t_timeout
             log_event["timeout_source"] = t_timeout_source
+        if image_usage:
+            # 图片这次调用的张数与上游 token 单独上报：它不进 LLM 的 total_tokens
+            # （那个数驱动月度配额），但消息的「用量」tooltip 要看得到真实消耗。
+            log_event["image_usage"] = image_usage
         # 工具入参单独承载（Bash 即命令原文），不占用 details 的输出截断预算。
         display_args = format_tool_args_for_display(tool_args, tool_name=tool_name)
         if display_args:

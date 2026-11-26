@@ -25,6 +25,7 @@ from app.services.ai.runtime.agentscope.tool_timeout import (
 )
 from app.services.ai.runtime.agentscope.stream_reconcile import truncate_for_context
 from app.services.ai.runtime.agentscope.tool_result import (
+    IMAGE_USAGE_METADATA_KEY,
     attach_tool_call_id_metadata,
     build_tool_result_envelope,
     is_tool_execution_success,
@@ -91,6 +92,32 @@ def _format_runtime_tool_result(result: Any) -> str:
         except (TypeError, ValueError):
             text = str(result)
     return truncate_for_context(text)
+
+
+def _split_image_usage(result: Any) -> tuple[Any, dict[str, Any] | None]:
+    """把计量字段从工具结果里摘出来，改由 ToolChunk 元数据带走。
+
+    返回 ``(干净结果, 计量字典)``。不是 dict、或没这个键时原样返回，多一次拷贝都不做。
+    """
+    if not isinstance(result, dict) or IMAGE_USAGE_METADATA_KEY not in result:
+        return result, None
+    usage = result.get(IMAGE_USAGE_METADATA_KEY)
+    clean = {
+        key: value for key, value in result.items() if key != IMAGE_USAGE_METADATA_KEY
+    }
+    if not isinstance(usage, dict) or not usage:
+        return clean, None
+    return clean, usage
+
+
+def _tool_chunk_metadata(
+    call_id: str, image_usage: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """ToolChunk 元数据：凭证 ID 必带，计量信息有才带。"""
+    metadata: dict[str, Any] = {"nanzi_call_id": call_id}
+    if image_usage:
+        metadata[IMAGE_USAGE_METADATA_KEY] = image_usage
+    return metadata
 
 
 def _new_tool_call_id(tool_name: str) -> str:
@@ -859,6 +886,20 @@ class AgentScopeRuntimeTool:
             return blacklist_decision
 
         if deletion_decision:
+            # 删除类确认带 bypass_immune：AgentScope 语义里连 allow 规则都覆盖不了，
+            # 所以「本会话总是允许」对它无效（卡片也不该给这个按钮）。但「允许这一次」
+            # 必须有效——子智能体的交接是「写令牌 → 父专家 resume → 子代理重跑同一
+            # 调用」，令牌若也穿不过这层，用户会陷入「点允许 → 又弹 → 再点」的死循环。
+            # 令牌绑定工具名 + 参数指纹，语义正是「就这一条命令、就这一次」。
+            once_decision = await _delegation_once_grant_decision(
+                tool_name=self.name,
+                user_id=getattr(self, "user_id", None),
+                conversation_id=self.conversation_id,
+                tool_input=tool_input,
+                context=context,
+            )
+            if once_decision is not None:
+                return once_decision
             return deletion_decision
 
         if self.name in {
@@ -913,10 +954,19 @@ class AgentScopeRuntimeTool:
         auto_approved = _auto_approve_decision(self.name)
         if auto_approved is not None:
             return auto_approved
-        grant_decision = await _session_grant_decision(
+        once_grant = await _delegation_once_grant_decision(
             tool_name=self.name,
             user_id=self.user_id,
             conversation_id=self.conversation_id,
+            tool_input=tool_input,
+            context=context,
+        )
+        if once_grant is not None:
+            return once_grant
+        grant_decision = await _session_grant_decision(
+            tool_name=self.name,
+            user_id=self.user_id,
+            conversation_id=_grant_scope_conversation_id(self.conversation_id),
         )
         if grant_decision is not None:
             return grant_decision
@@ -953,14 +1003,22 @@ class AgentScopeRuntimeTool:
                     call_id=call_id,
                     arguments=kwargs,
                 )
+            # 与流式路径同一套处理：先把计量摘走，再交给格式化。
+            #
+            # 这条是**普通 async 工具**的返回路径，`generate_image` / `edit_image`
+            # 走的正是它。原来这里直接 `_format_runtime_tool_result(res)` 就返回了，
+            # 于是用量跟着结果整段进了模型上下文（白花 token），却没进元数据——
+            # 轨迹的 meta_info、消息上的用量、Token 统计页的图片用量因此全是空的，
+            # 而且不报错。两条路径必须共用同一套摘取与元数据组装。
+            clean_result, image_usage = _split_image_usage(res)
             return ToolChunk(
-                content=[TextBlock(text=_format_runtime_tool_result(res))],
+                content=[TextBlock(text=_format_runtime_tool_result(clean_result))],
                 state=(
                     ToolResultState.SUCCESS
                     if is_tool_execution_success(res)
                     else ToolResultState.ERROR
                 ),
-                metadata={"nanzi_call_id": call_id},
+                metadata=_tool_chunk_metadata(call_id, image_usage),
             )
         except Exception as exc:
             if isinstance(exc, PermissionError):
@@ -1071,10 +1129,11 @@ class AgentScopeRuntimeTool:
                 )
                 return
 
-            result = attach_tool_call_id_metadata(
-                final_result if has_result else None,
-                call_id,
+            # 先把计量摘走，再交给格式化：模型看到的结果里不该有用量字段。
+            clean_result, image_usage = _split_image_usage(
+                final_result if has_result else None
             )
+            result = attach_tool_call_id_metadata(clean_result, call_id)
             result_ok = await self.spec.finish_streamed(
                 result,
                 call_id=call_id,
@@ -1087,7 +1146,7 @@ class AgentScopeRuntimeTool:
                 ],
                 state=ToolResultState.SUCCESS if result_ok else ToolResultState.ERROR,
                 is_last=True,
-                metadata={"nanzi_call_id": call_id},
+                metadata=_tool_chunk_metadata(call_id, image_usage),
             )
         finally:
             reset_active_tool_timeout_seconds(timeout_token)
@@ -1175,6 +1234,17 @@ class AgentScopeNativeApprovalTool:
             return blacklist_decision
 
         if deletion_decision:
+            # 同 RuntimeTool：删除保护不接受会话授权，但必须认「允许这一次」的令牌，
+            # 否则子智能体续聊后重跑同一条删除命令会再次被拦，卡就一直在弹。
+            once_decision = await _delegation_once_grant_decision(
+                tool_name=self.name,
+                user_id=self.user_id,
+                conversation_id=self.conversation_id,
+                tool_input=tool_input,
+                context=context,
+            )
+            if once_decision is not None:
+                return once_decision
             return deletion_decision
 
         path_checker = getattr(self.native_tool, "check_path_access", None)
@@ -1216,6 +1286,9 @@ class AgentScopeNativeApprovalTool:
                 decision_reason=f"runtime approval mode: {self.approval_mode}",
                 bypass_immune=True,
             )
+        # 原生判定在前：它自己的 safety ASK（`bypass_immune`）与 DONT_ASK 语义不能
+        # 被任何授权覆盖。一次性令牌与会话授权的降级都收在 `_session_grant_override`
+        # 内部统一把关，所以这里不再是「排在后面就命中不到」的处境。
         native_check = getattr(self.native_tool, "check_permissions", None)
         if native_check:
             result = native_check(tool_input, context)
@@ -1227,7 +1300,8 @@ class AgentScopeNativeApprovalTool:
                     context=context,
                     tool_name=self.name,
                     user_id=self.user_id,
-                    conversation_id=self.conversation_id,
+                    conversation_id=_grant_scope_conversation_id(self.conversation_id),
+                    tool_input=tool_input,
                 )
                 if grant_decision is not None:
                     return grant_decision
@@ -1235,10 +1309,19 @@ class AgentScopeNativeApprovalTool:
         auto_approved = _auto_approve_decision(self.name)
         if auto_approved is not None:
             return auto_approved
-        grant_decision = await _session_grant_decision(
+        once_grant = await _delegation_once_grant_decision(
             tool_name=self.name,
             user_id=self.user_id,
             conversation_id=self.conversation_id,
+            tool_input=tool_input,
+            context=context,
+        )
+        if once_grant is not None:
+            return once_grant
+        grant_decision = await _session_grant_decision(
+            tool_name=self.name,
+            user_id=self.user_id,
+            conversation_id=_grant_scope_conversation_id(self.conversation_id),
         )
         if grant_decision is not None:
             return grant_decision
@@ -1964,6 +2047,34 @@ def _shell_deletion_permission_decision(
     return None
 
 
+def shell_deletion_needs_confirmation(
+    tool_name: str,
+    tool_input: Any,
+    *,
+    cwd: str | None = None,
+) -> bool:
+    """该调用是否命中删除保护（`bypass_immune` 的那类确认）。
+
+    `bypass_immune` 在 AgentScope 语义里连 allow 规则都覆盖不了，所以：
+
+    - 「本会话总是允许」对它永远无效 —— 卡片不该给这个按钮（见 event_stream 的
+      `supports_session_grant`）；
+    - 确认端点不能把「总是允许」写成会话授权，那会留下一条永不生效的记录
+      （见 resume 的 `_handoff_subagent_permission`）。
+
+    「允许这一次」是例外：令牌绑定工具名 + 参数指纹，语义正是「就这一条命令、
+    就这一次」，能穿过删除保护。
+    """
+    if not is_shell_like_tool_name(tool_name):
+        return False
+
+    from app.services.ai.runtime.shell_deletion_policy import assess_shell_deletion
+
+    command = str((tool_input or {}).get("command", "") if isinstance(tool_input, dict) else "")
+    assessment = assess_shell_deletion(command, cwd=cwd or os.getcwd())
+    return assessment.action in {"ask", "deny"}
+
+
 def resolve_tool_conversation_id(explicit: Any = None) -> str | None:
     """会话级授权使用的会话标识：显式传入优先，其次取当前 Agent 上下文。"""
 
@@ -2020,6 +2131,96 @@ def consume_session_grant_auto_approved(tool_name: str) -> bool:
     return True
 
 
+async def _delegation_once_grant_decision(
+    *,
+    tool_name: str,
+    user_id: Any,
+    conversation_id: Any,
+    tool_input: Any,
+    context: Any,
+) -> Any:
+    """父会话「允许这一次」在子智能体续聊时的落地。
+
+    子智能体没有自己的用户交互面：确认卡在主会话上弹出，授权写进父会话作用域的
+    一次性令牌，等父专家 resume 子智能体、子智能体重跑到同一个调用时才被消费。
+    只放行签名完全一致的那一次（工具名 + 参数指纹），用过即删。
+
+    主会话自身的确认不走这里：它的恢复流里 `confirmed` 已经是事实，无需令牌。
+    """
+
+    # 委派身份只能从平台上下文取：check_permissions 的 `context` 参数是 AgentScope 的
+    # PermissionContext（只有 mode / rules / working_directories），上面没有父会话。
+    from app.core.context import get_current_agent_context
+
+    agent_ctx = get_current_agent_context()
+    parent_conversation_id = str(getattr(agent_ctx, "parent_conversation_id", "") or "")
+    if not parent_conversation_id:
+        return None
+
+    # 无人值守（定时任务 / 后台运行）不认交互式授权：一次性令牌来自用户当场点卡片，
+    # 而 DONT_ASK 语义是「没人能回答就别问」，放行等于放宽无人值守的安全边界。
+    try:
+        from agentscope.permission import PermissionMode
+
+        if getattr(context, "mode", None) == PermissionMode.DONT_ASK:
+            return None
+    except Exception:
+        pass
+
+    from agentscope.permission import PermissionBehavior, PermissionDecision
+
+    from app.services.ai.runtime.agentscope.session_permission_grants import (
+        delegation_grant_scope,
+        once_permission_grants,
+        tool_args_fingerprint,
+    )
+
+    scope = delegation_grant_scope(
+        parent_conversation_id,
+        getattr(agent_ctx, "agent_name", "") or conversation_id,
+    )
+    if not scope:
+        return None
+    consumed = await once_permission_grants.consume(
+        user_id,
+        scope,
+        tool_name,
+        tool_args_fingerprint(tool_input),
+    )
+    if not consumed:
+        return None
+    return PermissionDecision(
+        behavior=PermissionBehavior.ALLOW,
+        message=f"Tool '{tool_name}' was approved once by the user in the parent session.",
+        decision_reason="delegation_once_grant",
+    )
+
+
+def _grant_scope_conversation_id(tool_conversation_id: Any) -> str:
+    """授权查询用的会话作用域：子智能体落到「父会话 + 子智能体」，主会话保持不变。
+
+    父会话与子代理名只能从平台 `AgentContext` 取：`check_permissions` 收到的
+    `context` 是 AgentScope 的 `PermissionContext`，没有委派信息，据此判断会一路
+    退回 `child_session_*`，子代理的「本会话总是允许」在续聊里永远查不到。
+    """
+    from app.core.context import get_current_agent_context
+
+    agent_ctx = get_current_agent_context()
+    parent_conversation_id = str(getattr(agent_ctx, "parent_conversation_id", "") or "")
+    if parent_conversation_id:
+        from app.services.ai.runtime.agentscope.session_permission_grants import (
+            delegation_grant_scope,
+        )
+
+        scope = delegation_grant_scope(
+            parent_conversation_id,
+            getattr(agent_ctx, "agent_name", "") or tool_conversation_id,
+        )
+        if scope:
+            return scope
+    return str(tool_conversation_id or "")
+
+
 async def _session_grant_decision(
     *,
     tool_name: str,
@@ -2064,6 +2265,7 @@ async def _session_grant_override(
     tool_name: str,
     user_id: Any,
     conversation_id: Any,
+    tool_input: Any = None,
 ) -> Any:
     """原生工具的决策是否可以被会话授权降级为 ALLOW。
 
@@ -2093,6 +2295,17 @@ async def _session_grant_override(
         return None
     if getattr(context, "mode", None) == PermissionMode.DONT_ASK:
         return None
+    # 一次性授权走同一道门禁：它同样是「把 ASK/PASSTHROUGH 降级成 ALLOW」，
+    # 不能绕过 bypass_immune 的 safety ASK 与无人值守的 DONT_ASK。
+    once_decision = await _delegation_once_grant_decision(
+        tool_name=tool_name,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        tool_input=tool_input,
+        context=context,
+    )
+    if once_decision is not None:
+        return once_decision
     return await _session_grant_decision(
         tool_name=tool_name,
         user_id=user_id,
@@ -2101,13 +2314,29 @@ async def _session_grant_override(
 
 
 def supports_session_grant(tool: Any) -> bool:
-    """该工具是否适合提供「本会话总是允许」选项（只读与危险工具不提供）。"""
+    """该工具是否适合提供「本会话总是允许」选项（只读、危险与 shell 类工具不提供）。
+
+    shell 类工具（原生 Bash、``execute_system_command``、沙箱的
+    ``mcp_sandbox_bash_<hash>``）单独禁掉的原因：会话授权是**按工具名**记忆的，
+    而一个 shell 工具名下能跑的命令是无限的。用户为了 ``ls`` 点一次「本会话总是
+    允许」，此后 ``curl … | bash``、``cat ~/.ssh/id_rsa`` 都不再确认。原生 Bash 还有
+    命令替换、敏感路径这类 bypass_immune 复核，平台的沙箱 shell 只有删除命令与命令
+    黑名单两道，粒度根本撑不起这个承诺。
+    """
 
     scope = getattr(tool, "permission_scope", None)
     if scope is None:
         spec = getattr(tool, "spec", None)
         scope = getattr(spec, "permission_scope", None)
-    return str(scope or "ask") not in {"read", "dangerous"}
+    if str(scope or "ask") in {"read", "dangerous"}:
+        return False
+    tool_name = str(getattr(tool, "name", "") or "")
+    if tool_name:
+        from app.services.ai.runtime.command_policy import is_shell_like_tool_name
+
+        if is_shell_like_tool_name(tool_name):
+            return False
+    return True
 
 
 async def enforce_tool_forbidden(

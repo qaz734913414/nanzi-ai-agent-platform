@@ -1,12 +1,20 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { formatContextTokens } from "@/composables/useContextUsage";
+import type { MessageImageUsage } from "@/utils/tokenFormat";
 
 const props = defineProps<{
   visible: boolean;
   loading: boolean;
   stats: any[];
   expanded: Record<string, boolean>;
+  /**
+   * 本条消息里图像工具的累计消耗。
+   *
+   * 图像调用**不在** /model_calls 里（那张表只记 LLM 推理），所以不单独列出来，
+   * 用户点开「用量」会以为这次生图没花钱。口径见 `MessageImageUsage`。
+   */
+  imageUsage?: MessageImageUsage | null;
 }>();
 
 const emit = defineEmits<{
@@ -94,12 +102,12 @@ const contextBreakdownItems = (stat: any) => [
   {
     label: "工具 schema",
     value: Number(stat.context_breakdown?.tools_tokens || 0),
-    color: "bg-violet-400",
+    color: "bg-primary",
   },
   {
     label: "对话消息",
     value: Number(stat.context_breakdown?.conversation_tokens || 0),
-    color: "bg-blue-400",
+    color: "bg-primary",
   },
 ];
 
@@ -164,8 +172,30 @@ const statsSummary = computed(() => {
         </div>
       </div>
 
-      <!-- Empty state -->
-      <div v-else-if="stats.length === 0" class="text-center py-8 text-gray-400 dark:text-gray-500 text-sm">
+      <!-- 图片消耗：图像工具是真正花钱的那次调用，但它不属于「大模型调用」，
+           不在这里列出来就会被当成没花钱。
+           注意这里是**独立**的 v-if，不能与下面的空态 / 明细组成 v-if / v-else 链：
+           一条消息完全可能既有模型调用又有生图调用，两者必须同时可见。
+           （曾经写成链，结果带图片的消息一打开弹窗就只剩这一行，明细整块不渲染。） -->
+      <div
+        v-if="!loading && imageUsage && imageUsage.calls"
+        class="rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-amber-900"
+      >
+        <span class="text-[10px] font-bold text-amber-700/80 uppercase tracking-wider">图片消耗</span>
+        <span>
+          出图 {{ imageUsage.images }} 张<template v-if="imageUsage.requested > imageUsage.images">（请求 {{ imageUsage.requested }} 张）</template>
+        </span>
+        <span>{{ imageUsage.calls }} 次调用</span>
+        <span v-if="imageUsage.tokens > 0">{{ formatTokens(imageUsage.tokens) }} tok</span>
+        <span v-else class="text-amber-700/70">上游未返回 token 用量</span>
+        <span v-if="imageUsage.size" class="font-mono">{{ imageUsage.size }}</span>
+      </div>
+
+      <!-- Empty state：只说明「没有大模型调用明细」，与上面的图片块互不影响 -->
+      <div
+        v-if="!loading && stats.length === 0"
+        class="text-center py-8 text-gray-400 dark:text-gray-500 text-sm"
+      >
         <svg class="w-12 h-12 mx-auto mb-2 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
         </svg>
@@ -173,7 +203,7 @@ const statsSummary = computed(() => {
       </div>
 
       <!-- Content -->
-      <div v-else class="space-y-4">
+      <div v-if="!loading && stats.length > 0" class="space-y-4">
         <!-- Summary stats -->
         <div class="grid grid-cols-5 gap-1.5 sm:gap-2 text-center">
           <div class="bg-gray-50 dark:bg-gray-900/40 p-2 rounded-lg border border-gray-100/50 dark:border-gray-700/30">
@@ -248,7 +278,7 @@ const statsSummary = computed(() => {
                   </span>
                   <span
                     v-if="stat.subagent"
-                    class="inline-flex items-center px-1.5 py-0.2 rounded text-[10px] font-medium bg-violet-50 text-violet-600 dark:bg-violet-950/40 dark:text-violet-300 border border-violet-200/60 dark:border-violet-800/40"
+                    class="inline-flex items-center px-1.5 py-px rounded text-[10px] font-medium bg-primary/5 text-primary dark:bg-primary-dark/40 dark:text-primary-hover border border-primary/20 dark:border-primary-dark/40"
                     :title="'委派子代理消耗（临时会话 ' + (stat.child_session_id || '') + '）'"
                   >
                     子代理
@@ -283,13 +313,13 @@ const statsSummary = computed(() => {
                   {{ stat.input_tokens }}
                   <template v-if="stat.cache_input_tokens > 0">
                     <span
-                      class="inline-flex items-center px-1.5 py-0.2 rounded text-[10px] font-sans font-medium bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-400 border border-emerald-200/60 dark:border-emerald-800/40"
+                      class="inline-flex items-center px-1.5 py-px rounded text-[10px] font-sans font-medium bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-400 border border-emerald-200/60 dark:border-emerald-800/40"
                       :title="'命中上下文缓存 Token: ' + stat.cache_input_tokens"
                     >
                       缓存 {{ stat.cache_input_tokens }}
                     </span>
                     <span
-                      class="inline-flex items-center px-1.5 py-0.2 rounded text-[10px] font-sans font-medium bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300 border border-gray-200/60 dark:border-gray-700/40"
+                      class="inline-flex items-center px-1.5 py-px rounded text-[10px] font-sans font-medium bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300 border border-gray-200/60 dark:border-gray-700/40"
                       :title="'未缓存输入 Token: ' + uncachedTokens(stat)"
                     >
                       未缓存 {{ uncachedTokens(stat) }}
@@ -316,7 +346,7 @@ const statsSummary = computed(() => {
                   <span
                     v-for="tName in stat.tool_names"
                     :key="tName"
-                    class="bg-blue-50 dark:bg-blue-900/30 text-blue-500 border border-blue-100/50 dark:border-blue-800/30 px-1 py-0.5 rounded text-[9px] font-mono"
+                    class="bg-primary/5 dark:bg-primary-dark/30 text-primary border border-primary/10 dark:border-primary-dark/30 px-1 py-0.5 rounded text-[9px] font-mono"
                   >
                     {{ tName }}
                   </span>
@@ -331,7 +361,7 @@ const statsSummary = computed(() => {
               <!-- Tool Call Arguments Details -->
               <div v-if="stat.tool_calls && stat.tool_calls.length > 0" class="bg-gray-100/60 dark:bg-gray-950/40 p-2 rounded-lg text-[10px] font-mono text-gray-600 dark:text-gray-400 border border-gray-100 dark:border-gray-800 space-y-1 max-h-[100px] overflow-y-auto">
                 <div v-for="(call, cIdx) in stat.tool_calls" :key="cIdx" class="break-all whitespace-pre-wrap">
-                  <span class="text-blue-500 dark:text-blue-400 font-bold">{{ call.name }}</span>(<span class="text-gray-600 dark:text-gray-400">{{ formatToolArgs(call.arguments) }}</span>)
+                  <span class="text-primary dark:text-primary font-bold">{{ call.name }}</span>(<span class="text-gray-600 dark:text-gray-400">{{ formatToolArgs(call.arguments) }}</span>)
                 </div>
               </div>
             </div>
@@ -431,7 +461,7 @@ const statsSummary = computed(() => {
             <div v-if="stat.reasoning_content || stat.response_text" class="pt-1 border-t border-gray-100/50 dark:border-gray-700/20">
               <button
                 @click="emit('toggle', stat.call_index)"
-                class="text-[10px] text-primary dark:text-blue-400 hover:underline flex items-center space-x-1 font-bold focus:outline-none cursor-pointer"
+                class="text-[10px] text-primary dark:text-primary hover:underline flex items-center space-x-1 font-bold focus:outline-none cursor-pointer"
               >
                 <span>{{ expanded[stat.call_index] ? '收起思考与输出' : '展开思考与输出' }}</span>
                 <svg class="w-3 h-3 transform transition-transform" :class="expanded[stat.call_index] ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24">

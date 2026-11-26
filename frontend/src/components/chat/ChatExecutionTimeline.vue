@@ -821,11 +821,13 @@ import {
   resolveLiveTimerDurationMs,
   resolveLiveTimerLogId,
   resolveTimelineCurrentStep,
+  orderTimelineBySeq,
   selectTimelineRenderableItems,
   sortParallelBatchItems,
   timelineHasPending,
   PREPARATION_TIMELINE_PARENT_ID,
   isWorkspacePrewarmPending,
+  timelineItemChildren,
   type FileToolMetadata,
   type ProcessTimelineItem,
   type ProcessTimelineLogItem,
@@ -844,7 +846,8 @@ const props = withDefaults(defineProps<{
     parent_id?: string | number;
     title: string;
     details: string;
-    status: "pending" | "success" | "error" | "warning";
+    // 与 ProcessTimelineStatus 对齐：被中止的挂起行以 "interrupted" 落定。
+    status: "pending" | "success" | "error" | "warning" | "interrupted";
     error_reason?: string;
     category?: string;
     tool_args?: string;
@@ -879,8 +882,6 @@ const props = withDefaults(defineProps<{
   darkMode?: boolean;
   /** 权限卡已承载确认详情时，隐藏其上方重复的权限时间线行。 */
   suppressPermissionLogs?: boolean;
-  /** 当前轮的清单正由输入框上方的 banner 卡片展示时，时间线内不再重复渲染。 */
-  hideTodo?: boolean;
   /**
    * 本轮工具调用的实际超时上限（秒，版本级优先、否则全局）。
    * 挂起中的工具行显示「已耗时 / 上限」，让用户知道还要等多久才算超时。
@@ -964,12 +965,15 @@ function suppressPermissionLogs(items: ProcessTimelineItem[]): ProcessTimelineIt
   // timelineItems 的依赖，导致每条工具进度都触发整棵时间线重算。
   return items.flatMap((item): ProcessTimelineItem[] => {
     if (item.kind === "log" && item.category === "permission") return [];
-    const children = item.children;
-    if (children?.length) {
-      const suppressed = suppressPermissionLogs(children as ProcessTimelineItem[]);
+    const children = timelineItemChildren(item);
+    if (children.length) {
+      const suppressed = suppressPermissionLogs(children);
       if (suppressed !== children) {
-        const projection = Object.create(item) as ProcessTimelineItem;
-        projection.children = suppressed;
+        // 仍然用原型投影（展开运算符会把 progress 登记成依赖）；topic 项的 children
+        // 只在投影对象上出现，因此赋值走 Object.assign 而不是直接写属性。
+        const projection = Object.assign(Object.create(item), {
+          children: suppressed,
+        }) as ProcessTimelineItem;
         return [projection];
       }
     }
@@ -1090,9 +1094,9 @@ const baseTimelineItems = computed(() => {
     ? mergeTimelineLogs(props.timeline, props.logs, { clone: true })
     : buildLegacyProcessTimeline(props);
   const visibleItems = props.suppressPermissionLogs ? suppressPermissionLogs(merged) : merged;
-  // 当前轮由 banner 负责时隐藏清单，其余情况（含没有 settled 标记的旧快照）
-  // 都归档到执行过程里，保证历史消息仍然查得到。
-  return selectTimelineRenderableItems(visibleItems, { hideTodo: props.hideTodo });
+  // 清单一律不进明细：它只属于输入框上方的横幅（见 selectTimelineRenderableItems）。
+  // 再按后端事件序排一次：位置不能只靠「首次到达」，并发/补发会偶发乱序。
+  return orderTimelineBySeq(selectTimelineRenderableItems(visibleItems));
 });
 
 const timelineItems = computed(() => {
@@ -1149,6 +1153,14 @@ const headerSkillSummary = computed(() =>
 );
 
 /** 关键动作摘要：提炼出工具调用与深度思考动作，供 Header 直观展示 */
+/** 从「调用工具: Read」这类标题里回退解析工具名（后端旧版本不下发 tool_name）。 */
+function toolNameFromTitle(title?: string): string {
+  const text = String(title || "");
+  const matched = text.match(/^调用工具[:：]\s*(.+)$/);
+  // tsconfig 开了 noUncheckedIndexedAccess：matched[1] 是 string | undefined。
+  return matched?.[1]?.trim() || "";
+}
+
 const actionSummary = computed(() => {
   if (props.isThinking && !props.hasAnswer) return "";
   const toolCounts: Record<string, number> = {};
@@ -1159,8 +1171,12 @@ const actionSummary = computed(() => {
       hasReasoning = true;
     }
     if (it.kind === "log") {
-      if (it.tool_name) {
-        const name = String(it.tool_name).trim();
+      // 后端 start_log 早先不带 tool_name，于是除 Bash 外的工具全被漏统计，
+      // 摘要常年是「深度思考」一项。这里按 category 回退解析标题。
+      const explicit = String(it.tool_name || "").trim();
+      const fallback = it.category === "tool" ? toolNameFromTitle(it.title) : "";
+      const name = explicit || fallback;
+      if (name) {
         toolCounts[name] = (toolCounts[name] || 0) + 1;
       } else if (it.title?.includes("Bash")) {
         toolCounts["Bash"] = (toolCounts["Bash"] || 0) + 1;
@@ -1334,7 +1350,7 @@ function findWorkspacePrewarmPending(items: ProcessTimelineItem[]): boolean {
   // 因此不能只检查前两层，需递归检查每个 text/log 节点及其所有后代。
   const walk = (node: ProcessTimelineItem): boolean => {
     if (isWorkspacePrewarmPending(node)) return true;
-    for (const child of node.children || []) {
+    for (const child of timelineItemChildren(node)) {
       if (walk(child)) return true;
     }
     return false;

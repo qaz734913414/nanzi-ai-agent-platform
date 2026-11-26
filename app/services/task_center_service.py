@@ -2,7 +2,7 @@ import logging
 from typing import List, Optional, Dict, Any
 from sqlalchemy import select, update, delete, desc, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 
 from app.models.task import AgentScheduledTask
@@ -15,6 +15,11 @@ from app.services.cron_compat import validate_standard_crontab
 from app.models.audit import AgentExecutionHistory
 
 logger = logging.getLogger(__name__)
+
+
+def _escape_like(value: str) -> str:
+    """转义 SQL LIKE 通配符，防止搜索关键词中的 % / _ 变成通配匹配。"""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def attach_task_metrics(task: AgentScheduledTask) -> AgentScheduledTask:
@@ -77,7 +82,11 @@ class TaskCenterService:
         # Sync to scheduler
         await scheduler_service.upsert_task(new_task)
         # 回填下次执行时间，让 Web 响应与 AI 工具返回值能反映调度是否真的生效
-        new_task.next_run_at = scheduler_service.get_next_run_time(new_task.id)
+        new_task.next_run_at = scheduler_service.get_next_run_time(
+            new_task.id,
+            cron_expr=new_task.cron_expr,
+            status=new_task.status,
+        )
         
         return new_task
 
@@ -112,11 +121,89 @@ class TaskCenterService:
             # We attach creator_name and agent_name attribute for Pydantic to pick up
             task_obj.creator_name = real_name or user_name or f"User:{task_obj.user_id}"
             task_obj.agent_name = agent_name or task_obj.agent_id or "Unknown Agent"
-            task_obj.next_run_at = scheduler_service.get_next_run_time(task_obj.id)
+            task_obj.next_run_at = scheduler_service.get_next_run_time(
+                task_obj.id,
+                cron_expr=task_obj.cron_expr,
+                status=task_obj.status,
+            )
             attach_task_metrics(task_obj)
             tasks.append(task_obj)
             
+        await TaskCenterService.attach_recent_runs(db, tasks)
         return tasks
+
+    @staticmethod
+    async def attach_recent_runs(
+        db: AsyncSession,
+        tasks: List[Any],
+        limit: int = 7,
+        days: int = 60,
+    ) -> None:
+        """给任务对象挂上「最近 N 次执行」的状态序列，供列表页画健康趋势。
+
+        为什么单独查：列表接口只有聚合计数（成功率），看不出「成功率 98% 但最近三次全失败」。
+        逐次结果在 ``ai_agent_execution_history``，按会话前缀聚合（与执行记录页同一口径），
+        所以这里一次性把这批任务的会话全部捞回来，再在内存里按任务分组取前 N 条。
+        """
+        if not tasks:
+            return
+
+        exact_to_task: Dict[str, int] = {}
+        prefix_to_task: Dict[str, int] = {}
+        for task in tasks:
+            conversation_id = getattr(task, "conversation_id", None)
+            if not conversation_id:
+                continue
+            exact_to_task[str(conversation_id)] = task.id
+            prefix = _task_run_conversation_prefix(str(conversation_id))
+            if prefix:
+                prefix_to_task[prefix] = task.id
+
+        if not exact_to_task and not prefix_to_task:
+            return
+
+        filters = [AgentExecutionHistory.conversation_id == cid for cid in exact_to_task]
+        filters += [
+            AgentExecutionHistory.conversation_id.like(f"{prefix}_run_%")
+            for prefix in prefix_to_task
+        ]
+
+        # 时间下界把扫描量钉住：列表只关心「最近」的表现，更早的历史在这里没有展示价值。
+        since = datetime.now() - timedelta(days=days)
+        stmt = (
+            select(
+                AgentExecutionHistory.conversation_id,
+                AgentExecutionHistory.status,
+                AgentExecutionHistory.created_at,
+            )
+            .where(or_(*filters), AgentExecutionHistory.created_at >= since)
+            .order_by(desc(AgentExecutionHistory.created_at))
+            .limit(limit * len(tasks) * 4)
+        )
+        rows = (await db.execute(stmt)).all()
+
+        buckets: Dict[int, List[Dict[str, Any]]] = {}
+        for conversation_id, status, created_at in rows:
+            conversation_id = conversation_id or ""
+            task_id = exact_to_task.get(conversation_id)
+            if task_id is None:
+                for prefix, mapped_id in prefix_to_task.items():
+                    if conversation_id.startswith(f"{prefix}_run_"):
+                        task_id = mapped_id
+                        break
+            if task_id is None:
+                continue
+            bucket = buckets.setdefault(task_id, [])
+            if len(bucket) >= limit:
+                continue
+            bucket.append({
+                "status": str(status or "unknown").lower(),
+                "at": created_at.isoformat() if created_at else None,
+            })
+
+        for task in tasks:
+            # 查询按时间倒序，展示要「旧 → 新」，这里翻回正序
+            task.recent_runs = list(reversed(buckets.get(task.id, [])))
 
     @staticmethod
     async def get_task(db: AsyncSession, task_id: int) -> Optional[AgentScheduledTask]:
@@ -124,7 +211,11 @@ class TaskCenterService:
         result = await db.execute(stmt)
         task = result.scalar_one_or_none()
         if task:
-            task.next_run_at = scheduler_service.get_next_run_time(task.id)
+            task.next_run_at = scheduler_service.get_next_run_time(
+                task.id,
+                cron_expr=task.cron_expr,
+                status=task.status,
+            )
             attach_task_metrics(task)
         return task
 
@@ -136,9 +227,9 @@ class TaskCenterService:
     ) -> Optional[AgentScheduledTask]:
         if "cron_expr" in updates:
             validate_standard_crontab(str(updates.get("cron_expr") or ""))
-        if updates.get("status") == 1:
-            # 启动前确认库内表达式可调度：历史脏数据若直接启用，调度器只会打日志跳过，
-            # 用户（或 AI）会以为「已启动」而任务永远不跑。
+        elif updates.get("status") == 1:
+            # 仅在未同时提交新 cron_expr 时才校验库内旧表达式：
+            # 否则「同时把历史脏 cron 改合法并启用」会被旧值挡死，永远修不好。
             current_cron = (
                 await db.execute(
                     select(AgentScheduledTask.cron_expr).where(AgentScheduledTask.id == task_id)
@@ -169,6 +260,12 @@ class TaskCenterService:
         updated_task = await TaskCenterService.get_task(db, task_id)
         if updated_task:
             await scheduler_service.upsert_task(updated_task)
+            # 必须在 upsert_task 之后刷新 next_run_at，否则响应体返回的是修改前的旧调度时间
+            updated_task.next_run_at = scheduler_service.get_next_run_time(
+                updated_task.id,
+                cron_expr=updated_task.cron_expr,
+                status=updated_task.status,
+            )
         return updated_task
 
     @staticmethod
@@ -315,12 +412,12 @@ class TaskCenterService:
         if end_at is not None:
             stmt = stmt.where(AgentExecutionHistory.created_at <= end_at)
         if keyword:
-            like = f"%{keyword}%"
+            like = f"%{_escape_like(keyword)}%"
             history_text_match = or_(
-                AgentExecutionHistory.query.like(like),
-                AgentExecutionHistory.summary.like(like),
-                AgentExecutionHistory.trace_id.like(like),
-                AgentExecutionHistory.username.like(like),
+                AgentExecutionHistory.query.like(like, escape="\\"),
+                AgentExecutionHistory.summary.like(like, escape="\\"),
+                AgentExecutionHistory.trace_id.like(like, escape="\\"),
+                AgentExecutionHistory.username.like(like, escape="\\"),
             )
             if keyword_matched_task_ids:
                 matched_conv_filters = []

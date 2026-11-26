@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
 
@@ -15,6 +16,29 @@ from app.services.ai.runtime.session_run_lane import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _tool_input_from_snapshot(pending: Any) -> Any:
+    """从挂起快照还原工具参数，供一次性授权计算指纹。
+
+    快照里存的是模型原始输出的 JSON 字符串，运行时 `check_permissions` 拿到的
+    却是解析后的 dict。两边必须还原成同一形状，否则令牌永远命不中——用户点了
+    「允许这一次」，子智能体续聊时却又弹一次卡。
+    """
+    snapshot = getattr(pending, "snapshot", None)
+    tool_call = getattr(snapshot, "tool_call", None) or {}
+    if not isinstance(tool_call, dict):
+        return {}
+    raw = tool_call.get("input")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {"input": raw}
+        return parsed if isinstance(parsed, dict) else {"input": parsed}
+    return {}
 
 
 class AgentScopeResumeHandler:
@@ -186,6 +210,22 @@ class AgentScopeResumeHandler:
                 if on_lane_acquired is not None:
                     await on_lane_acquired()
 
+                # 子智能体发起的确认先分流：授权要落到「父会话 + 子智能体」作用域，
+                # 不能走下面的 `_grant_session_permission`——那个用的是快照里的会话
+                # （子智能体的内部子会话），写进去是一条永远不会被查询到的脏记录。
+                delegation = dict(getattr(pending.snapshot, "delegation", None) or {})
+                if not is_external and delegation:
+                    async for chunk in cls._handoff_subagent_permission(
+                        pending,
+                        request_id=request_id,
+                        delegation=delegation,
+                        confirmed=confirmed,
+                        grant_scope=grant_scope,
+                        user_id=lane_user_id,
+                    ):
+                        yield chunk
+                    return
+
                 session_grant: Optional[Dict[str, Any]] = None
                 if not is_external and confirmed and grant_scope == "session":
                     session_grant = await cls._grant_session_permission(
@@ -216,12 +256,22 @@ class AgentScopeResumeHandler:
                 # 持锁复核后、重建重型 runner 前先发回执，避免首字节在装配工具与上下文阶段干等。
                 yield initial_chunk
 
+                reused_in_process_runner = getattr(pending, "runner", None) is not None
                 runner = cls.build_agentscope_runner_from_pending(pending, user_info=user_info)
                 await cls.restore_runner_execution_context(
                     agent_service,
                     runner,
                     pending,
                     user_info=user_info,
+                )
+                # 同进程恢复复用了原 runner，其 trace_buffer 保留了挂起轮已落库的前半段步骤：
+                # 记下基线长度，收尾时只把恢复阶段新增切片写入 trace 表（Token 仍按全量聚合）；
+                # 跨进程恢复新建了空 trace_buffer，只含后半段，需在 upsert 历史时累加前序 Token
+                # 并顺延 trace step_number。耗时在两种模式下都是本恢复阶段的增量，统一累加。
+                prior_trace_count = (
+                    len(getattr(runner, "trace_buffer", None) or [])
+                    if reused_in_process_runner
+                    else 0
                 )
                 execution_results = (
                     cls.build_external_execution_results(results or [])
@@ -241,7 +291,9 @@ class AgentScopeResumeHandler:
                 async def _finalize_persisted_turn(
                     *,
                     status_value: str,
+                    final_content: str,
                     final_timeline: Optional[List[Dict[str, Any]]],
+                    final_reasoning: Optional[str],
                     should_persist: bool,
                     p_tokens: int,
                     c_tokens: int,
@@ -260,7 +312,7 @@ class AgentScopeResumeHandler:
                         persist_coro = _persist_assistant_message_and_summary(
                             user_id=persist_user_id,
                             conversation_id=conversation_id,
-                            content=full_response_content,
+                            content=final_content,
                             trace_id=pending.trace_id,
                             agent_name=handled_by,
                             agent_type=_public_agent_type(agent_config),
@@ -270,7 +322,7 @@ class AgentScopeResumeHandler:
                             prompt_tokens=p_tokens,
                             completion_tokens=c_tokens,
                             total_tokens=t_tokens,
-                            reasoning_content=full_reasoning_content or None,
+                            reasoning_content=final_reasoning or None,
                             process_timeline=final_timeline,
                             tool_run_text=tool_run_text,
                             merge_summary=status_value == "success",
@@ -289,18 +341,28 @@ class AgentScopeResumeHandler:
                             await persist_coro
 
                     duration = (asyncio.get_running_loop().time() - start_time) * 1000
+                    incremental_traces = (
+                        list(trace_buffer[prior_trace_count:])
+                        if (reused_in_process_runner and trace_buffer)
+                        else trace_buffer
+                    )
                     audit_coro = AuditManager.log_transaction(
                         pending.trace_id,
                         agent_config,
                         user_query,
-                        full_response_content,
+                        final_content,
                         user_info,
                         status_value,
                         duration,
                         trace_buffer,
                         conversation_id=conversation_id,
-                        reasoning_content=full_reasoning_content or None,
+                        reasoning_content=final_reasoning or None,
                         process_timeline=final_timeline,
+                        trace_logs_to_save=incremental_traces,
+                        accumulate_tokens=not reused_in_process_runner,
+                        accumulate_duration=True,
+                        dedup_trace_logs=True,
+                        offset_trace_steps=not reused_in_process_runner,
                     )
                     if cancelling:
                         # 同上传工厂；返回的是 Optional[bool]，不能当二元组解包。
@@ -342,12 +404,25 @@ class AgentScopeResumeHandler:
                     # 被中断/取消时保留挂起快照（不 pop），用户仍可在断线/取消后检查或重试。
                     cancelling = current_task_cancelling()
                     final_timeline = _final_process_timeline(process_timeline_state)
+                    final_reasoning = full_reasoning_content or None
+                    final_content = full_response_content
+                    if not cancelling:
+                        final_timeline, final_reasoning, final_content = (
+                            await cls._merge_prior_turn_snapshot(
+                                user_id=persist_user_id,
+                                conversation_id=conversation_id,
+                                trace_id=pending.trace_id,
+                                current_timeline=final_timeline,
+                                current_reasoning=final_reasoning,
+                                current_content=final_content,
+                            )
+                        )
                     should_persist = bool(
                         conversation_id
                         and _should_persist_turn_history(
-                            full_response_content,
+                            final_content,
                             final_timeline,
-                            full_reasoning_content,
+                            final_reasoning or "",
                         )
                     )
                     if not cancelling:
@@ -359,7 +434,9 @@ class AgentScopeResumeHandler:
                         }
                     await _finalize_persisted_turn(
                         status_value="cancelled",
+                        final_content=final_content,
                         final_timeline=final_timeline,
+                        final_reasoning=final_reasoning,
                         should_persist=should_persist,
                         p_tokens=0,
                         c_tokens=0,
@@ -419,12 +496,24 @@ class AgentScopeResumeHandler:
                     }
 
                 final_process_timeline = _final_process_timeline(process_timeline_state)
+                (
+                    final_process_timeline,
+                    merged_reasoning_content,
+                    merged_response_content,
+                ) = await cls._merge_prior_turn_snapshot(
+                    user_id=persist_user_id,
+                    conversation_id=conversation_id,
+                    trace_id=pending.trace_id,
+                    current_timeline=final_process_timeline,
+                    current_reasoning=full_reasoning_content or None,
+                    current_content=full_response_content,
+                )
                 should_persist_history = bool(
                     conversation_id
                     and _should_persist_turn_history(
-                        full_response_content,
+                        merged_response_content,
                         final_process_timeline,
-                        full_reasoning_content,
+                        merged_reasoning_content or "",
                     )
                 )
                 yield {
@@ -436,7 +525,9 @@ class AgentScopeResumeHandler:
                 # 落库与审计留在同一把会话锁内完成，防止下一轮并发消息在历史尚未写入前读库或清日志。
                 audit_persisted = await _finalize_persisted_turn(
                     status_value=execution_status,
+                    final_content=merged_response_content,
                     final_timeline=final_process_timeline,
+                    final_reasoning=merged_reasoning_content,
                     should_persist=should_persist_history,
                     p_tokens=p_tokens,
                     c_tokens=c_tokens,
@@ -463,6 +554,89 @@ class AgentScopeResumeHandler:
                 "content": "当前会话正在处理中，请稍后再试。",
             }
             return
+
+    @classmethod
+    async def _merge_prior_turn_snapshot(
+        cls,
+        *,
+        user_id: Any,
+        conversation_id: Optional[str],
+        trace_id: Optional[str],
+        current_timeline: Optional[List[Dict[str, Any]]],
+        current_reasoning: Optional[str],
+        current_content: str = "",
+    ) -> tuple[Optional[List[Dict[str, Any]]], Optional[str], str]:
+        """落库前回捞同一 `trace_id` 挂起前已写入会话历史的时间线、思考正文与回答正文并合并。
+
+        挂起轮（`awaiting_permission` / `awaiting_external_execution`）已把前半段过程明细、
+        思考正文与已输出正文写入 Redis 会话历史，但审计表落库延后至恢复轮；若恢复轮直接用
+        仅含后半段的快照写审计表，前端终态同步与历史回放会把审批前步骤及前半段正文整体
+        抹掉。这里按顺序归并最近窗口内同 `trace_id` 的全部前序 assistant 快照（兼容单轮内
+        多次审批），任何读取异常仅告警并回退当前阶段快照，绝不阻断落库。
+        """
+        if not user_id or not conversation_id or not trace_id:
+            return current_timeline, current_reasoning, current_content
+        try:
+            from app.services.ai.memory_service import memory_service
+            from app.services.ai.runtime.agentscope.process_timeline_snapshot import (
+                merge_process_timeline_sequence,
+                merge_reasoning_contents,
+                merge_text_contents,
+            )
+
+            # 同 trace 挂起消息必在会话尾部，限定窗口为 20 条即可覆盖单轮连续多次审批，
+            # 避免长会话每次恢复都全量反序列化 100 条历史消息。
+            history = await memory_service.get_history(
+                str(user_id),
+                conversation_id,
+                limit=20,
+            )
+        except Exception as exc:  # noqa: BLE001 - 回捞失败不得阻断落库与审计
+            logger.warning(
+                "[AgentScopeResume] 回捞同 trace 前序时间线失败 conversation=%s trace_id=%s: %s",
+                conversation_id,
+                trace_id,
+                exc,
+            )
+            return current_timeline, current_reasoning, current_content
+
+        target_trace = str(trace_id)
+        prior_timelines: List[List[Dict[str, Any]]] = []
+        prior_reasonings: List[str] = []
+        prior_contents: List[str] = []
+        for entry in history or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("role") != "assistant":
+                continue
+            if str(entry.get("trace_id") or "") != target_trace:
+                continue
+            timeline = entry.get("process_timeline")
+            if isinstance(timeline, list) and timeline:
+                prior_timelines.append(timeline)
+            reasoning = entry.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning.strip():
+                prior_reasonings.append(reasoning)
+            content = entry.get("content")
+            if isinstance(content, str) and content.strip():
+                prior_contents.append(content)
+
+        merged_timeline = (
+            merge_process_timeline_sequence([*prior_timelines, current_timeline])
+            if prior_timelines
+            else current_timeline
+        )
+        merged_reasoning = (
+            merge_reasoning_contents([*prior_reasonings, current_reasoning])
+            if prior_reasonings
+            else current_reasoning
+        )
+        merged_content = (
+            merge_text_contents([*prior_contents, current_content])
+            if prior_contents
+            else current_content
+        )
+        return merged_timeline, merged_reasoning, merged_content
 
     @classmethod
     async def restore_runner_execution_context(
@@ -514,6 +688,164 @@ class AgentScopeResumeHandler:
                 context.published_download_urls = restored_urls
 
     @classmethod
+    async def _handoff_subagent_permission(
+        cls,
+        pending: Any,
+        *,
+        request_id: str,
+        delegation: Dict[str, Any],
+        confirmed: bool,
+        grant_scope: str,
+        user_id: Any,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """子智能体的权限确认：写授权，再把「续聊子智能体」的指令交回主会话。
+
+        为什么确认后不直接 resume 子智能体：挂起快照属于内部子会话
+        （`child_session_*`），直接恢复只会在那个内部会话里跑完——用户在主会话里
+        既看不到回答，父专家也没有汇总的机会。授权写进「父会话 + 子智能体」作用域
+        后，由父会话自己用 `sub_agent_call(resume=True)` 续聊；子智能体重跑到同一个
+        调用时命中授权（一次性令牌按工具名 + 参数指纹精确匹配，会话授权按工具名）。
+        """
+        from app.services.ai.runtime.agentscope.permission_directives import (
+            SUBAGENT_PERMISSION_DENY_PREFIX,
+            SUBAGENT_PERMISSION_GRANT_PREFIX,
+        )
+        from app.services.ai.runtime.agentscope.session_permission_grants import (
+            delegation_grant_scope,
+            once_permission_grants,
+            session_permission_grants,
+            tool_args_fingerprint,
+        )
+
+        parent_conversation_id = str(delegation.get("parent_conversation_id") or "")
+        agent_name = str(
+            delegation.get("agent_name") or getattr(pending.snapshot, "agent_name", "") or ""
+        )
+        tool_name = str(getattr(pending.tool_call, "name", "") or "")
+        tool_call_id = getattr(pending.tool_call, "id", None)
+        scope = delegation_grant_scope(parent_conversation_id, agent_name)
+        session_scope = str(grant_scope or "").strip().lower() == "session"
+
+        # 快照的消费必须放在授权写入**之后**（见下方 pop_async 调用处）：
+        # 这里的顺序决定了 grant 失败时用户还能不能重试。
+
+        # 删除类确认带 bypass_immune，会话授权对它无效。用户点「本会话总是允许」时
+        # 若照写会话授权，只会留下一条永远不生效的记录，下次照样弹——所以这类一律
+        # 退化成一次性令牌（按参数指纹绑定，正好对应「就这条命令、就这一次」）。
+        from app.services.ai.runtime.agentscope.tools import (
+            shell_deletion_needs_confirmation,
+        )
+
+        tool_input_for_grant = _tool_input_from_snapshot(pending)
+        deletion_only_once = shell_deletion_needs_confirmation(tool_name, tool_input_for_grant)
+        # shell 类工具一律只给一次性令牌，与主会话路径（`_grant_session_permission`
+        # 里 `supports_session_grant` 直接拒绝）保持同一口径：会话授权按工具名记忆，
+        # 一个 shell 工具名下能跑的命令是无限的，写成「本会话」等于把后续所有命令
+        # 一起放行。卡片本就不给这个按钮，这里再挡一次，防止客户端伪造 scope=session。
+        from app.services.ai.runtime.command_policy import is_shell_like_tool_name
+
+        effective_session = (
+            session_scope and not deletion_only_once and not is_shell_like_tool_name(tool_name)
+        )
+
+        granted = False
+        if confirmed and scope and tool_name:
+            if effective_session:
+                granted = await session_permission_grants.grant(user_id, scope, tool_name)
+            else:
+                granted = await once_permission_grants.grant(
+                    user_id,
+                    scope,
+                    tool_name,
+                    tool_args_fingerprint(tool_input_for_grant),
+                )
+
+        if confirmed and not granted:
+            # 授权没落库还让父专家续聊，子智能体会在同一个调用上再被拦一次，
+            # 用户看到的是一张卡反复弹。这里如实告诉模型「授权没成功」。
+            yield {
+                "type": "error",
+                "status": "error",
+                "content": "授权记录未能写入（可能是存储不可用），请重试或改用「自动批准」模式重发。",
+                "permission_request_id": request_id,
+            }
+            yield {
+                "type": "run_status",
+                "status": "error",
+                "trace_id": str(getattr(pending, "trace_id", "") or ""),
+            }
+            return
+
+        # 授权已经落库（或用户明确拒绝）才消费快照。反过来的话，grant 失败时快照
+        # 已被 pop，模型收到「请重试」而用户再点按钮只会拿到「请求不存在」——
+        # 这一轮彻底无法继续，只能让用户重发整条消息。
+        #
+        # 连点确认仍然安全：两种 grant 都是按 key 覆盖写（幂等），重复写只是把
+        # 同一个 key 的 TTL 刷新一次；快照也只会在成功路径上被 pop 一次。
+        await pending_agentscope_confirmations.pop_async(request_id, user_id=user_id)
+
+        yield {
+            "type": "permission_result",
+            "status": "success" if confirmed else "rejected",
+            "permission_request_id": request_id,
+            "tool_call_id": tool_call_id,
+            "session_grant": (
+                {
+                    "granted": True,
+                    "tool_name": tool_name,
+                    "conversation_id": scope,
+                }
+                if confirmed and effective_session
+                else None
+            ),
+        }
+
+        resume_hint = (
+            f'请用 sub_agent_call(agent_name="{agent_name}", resume=True) 让同一个子智能体'
+            "接着上次的进度继续完成任务"
+        )
+        if confirmed:
+            if deletion_only_once:
+                # 别让模型以为「已获本会话允许」：删除类只认这一次，重发同一条命令
+                # 还会再弹一张卡。
+                grant_phrase = "仅这一次（删除类命令每次都需要确认，本会话不记忆）"
+            else:
+                grant_phrase = "本会话内有效" if effective_session else "仅这一次"
+            directive = (
+                f"{SUBAGENT_PERMISSION_GRANT_PREFIX}「{agent_name}」请求执行的工具 {tool_name} 已获允许"
+                f"（{grant_phrase}）。"
+                f"{resume_hint}，不要从头重跑，也不要重复申请同一授权。"
+            )
+        else:
+            directive = (
+                f"{SUBAGENT_PERMISSION_DENY_PREFIX}「{agent_name}」执行工具 {tool_name} 的请求。"
+                f"{resume_hint}，并让子智能体改用不需要该工具权限的方式完成任务；"
+                "不要重复申请同一授权。"
+            )
+
+        yield {
+            "type": "subagent_permission_handoff",
+            "status": "approved" if confirmed else "rejected",
+            "permission_request_id": request_id,
+            "parent_conversation_id": parent_conversation_id,
+            "subagent": {
+                "display_name": agent_name,
+                "run_id": str(delegation.get("run_id") or ""),
+            },
+            "grant": {
+                "scope": "session" if effective_session else "once",
+                "granted": bool(granted),
+                "deletion_only_once": deletion_only_once,
+            },
+            "directive": directive,
+        }
+        yield {
+            "type": "run_status",
+            "status": "success" if confirmed else "rejected",
+            "trace_id": str(getattr(pending, "trace_id", "") or ""),
+        }
+
+    @classmethod
     async def _grant_session_permission(
         cls,
         pending: Any,
@@ -534,9 +866,11 @@ class AgentScopeResumeHandler:
         tool_name = str(getattr(pending.tool_call, "name", "") or "").strip()
         conversation_id = str(pending.snapshot.conversation_id or "").strip()
 
-        # 与卡片按钮同源：只读/危险工具不写授权，避免「接口能写、按钮不给」两套口径。
-        # 跨进程恢复时挂起句柄里没有工具定义，此时放行——真正的降级仍受 tools.py 里
-        # 先于判定返回的 DENY 顺序约束，写进去也只是一条永远不会被用到的记录。
+        # 与卡片按钮同源：只读/危险/shell 类工具不写授权，避免「接口能写、按钮不给」
+        # 两套口径。跨进程恢复时挂起句柄里没有工具定义（target 为 None），此时对
+        # shell 类工具仍然拒绝——否则客户端可以手工构造 scope=session 把任意
+        # ``mcp_sandbox_bash_*`` / ``execute_system_command`` 写进授权表，之后该会话里
+        # 所有命令全程免确认（沙箱 shell 没有命令替换/敏感路径复核，粒度撑不起这个承诺）。
         target = next(
             (
                 tool
@@ -545,7 +879,13 @@ class AgentScopeResumeHandler:
             ),
             None,
         )
-        if target is not None and not supports_session_grant(target):
+        if target is not None:
+            grantable = supports_session_grant(target)
+        else:
+            from app.services.ai.runtime.command_policy import is_shell_like_tool_name
+
+            grantable = not is_shell_like_tool_name(tool_name)
+        if not grantable:
             return {
                 "granted": False,
                 "tool_name": tool_name,

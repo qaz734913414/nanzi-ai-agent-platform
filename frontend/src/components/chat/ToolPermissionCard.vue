@@ -85,6 +85,19 @@ onUnmounted(() => {
   if (expiryTimer) window.clearInterval(expiryTimer);
   expiryTimer = null;
 });
+
+// 卡片一旦落到终态（已批准 / 已拒绝 / 已放弃 / 已过期）就停掉秒级 tick。
+// 只靠 onUnmounted 清理是不够的：挂起卡片常常在会话里留存很久（用户可能几分钟
+// 后才继续对话），这期间 timer 每秒空转、nowSeconds 每秒触发一次重渲染。
+watch(
+  () => props.payload.status,
+  (status) => {
+    if (status !== "pending" && expiryTimer) {
+      window.clearInterval(expiryTimer);
+      expiryTimer = null;
+    }
+  },
+);
 const isSubmitting = computed(() => Boolean(props.payload.isSubmitting));
 const locked = computed(
   () => Boolean(props.disabled) || !isPending.value || isSubmitting.value || isExpired.value,
@@ -96,7 +109,7 @@ const cardContainerClass = computed(() => {
     return "border-gray-200/80 bg-gray-50/75 text-gray-800 dark:border-gray-800/80 dark:bg-gray-900/40 dark:text-gray-200";
   }
   if (display.value.riskTone === "low") {
-    return "border-sky-200 bg-sky-50/90 text-sky-950 dark:border-sky-900/50 dark:bg-sky-900/20 dark:text-sky-100";
+    return "border-sky-200 bg-sky-50/90 text-primary-dark dark:border-primary-dark/50 dark:bg-primary-dark/20 dark:text-sky-100";
   }
   return "border-amber-200 bg-amber-50/90 text-amber-950 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-100";
 });
@@ -112,7 +125,7 @@ const iconContainerClass = computed(() => {
     return "bg-red-100 text-red-600 dark:bg-red-950/50 dark:text-red-300";
   }
   return display.value.riskTone === "low"
-    ? "bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300"
+    ? "bg-sky-100 text-primary-dark dark:bg-primary-dark/40 dark:text-sky-300"
     : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300";
 });
 
@@ -219,8 +232,22 @@ function discard() {
 
 // 过期必须“落”到状态上：卡片自己只是 computed，父组件的待确认锁看的是 status，
 // 不通知就会锁死输入框。父组件据此把 status 置为 expired，锁随之解除。
+//
 watch(isExpired, (expired) => {
   if (expired && props.payload.status === "pending" && !props.payload.discarded) {
+    emit("expire");
+  }
+});
+
+// 从流快照还原时卡片可能**已经**过了 TTL：此时 isExpired 初值就是 true，上面的
+// watch 只观察变化、回调永远不触发，那一轮照样锁死输入框（卡片写着「已超时」但父
+// 组件还在等确认）。所以挂载后再补一次判定。
+//
+// 用 onMounted 而不是 `watch(..., { immediate: true })`：immediate 会在父组件渲染
+// 子组件的**同一帧**里同步 emit，父侧 handler 随即改 msg 状态，等于在渲染期改响应式
+// 数据。挂载后触发就没有这个时序问题。
+onMounted(() => {
+  if (isExpired.value && props.payload.status === "pending" && !props.payload.discarded) {
     emit("expire");
   }
 });
@@ -287,7 +314,7 @@ watch(
         <!-- 头部点击栏 -->
         <div
           class="flex cursor-pointer select-none items-center justify-between gap-2 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-offset-2"
-          :class="display.riskTone === 'low' ? 'focus-visible:ring-sky-500' : 'focus-visible:ring-amber-500'"
+          :class="display.riskTone === 'low' ? 'focus-visible:ring-primary' : 'focus-visible:ring-amber-500'"
           role="button"
           tabindex="0"
           :aria-expanded="expanded"
@@ -302,10 +329,16 @@ watch(
               <span class="text-[10px] font-semibold uppercase tracking-wide opacity-60">{{ isPending ? "需要确认执行" : "工具执行结果" }}</span>
               <h3 class="truncate text-xs font-bold leading-5 sm:text-sm">{{ cardTitle }}</h3>
               <span
-                class="shrink-0 rounded-full border px-1.5 py-0.2 text-[10px] font-semibold"
+                v-if="payload.subagent?.display_name"
+                class="shrink-0 rounded-full border border-primary/20 bg-primary/10 px-1.5 py-px text-[10px] font-semibold text-primary-dark dark:border-primary-dark dark:bg-primary-dark/40 dark:text-primary-hover"
+              >
+                来自子智能体 {{ payload.subagent.display_name }}
+              </span>
+              <span
+                class="shrink-0 rounded-full border px-1.5 py-px text-[10px] font-semibold"
                 :class="isPending
                   ? (display.riskTone === 'low'
-                    ? 'border-sky-200 bg-sky-100 text-sky-700 dark:border-sky-800 dark:bg-sky-900/40 dark:text-sky-300'
+                    ? 'border-sky-200 bg-sky-100 text-primary-dark dark:border-primary-dark dark:bg-primary-dark/40 dark:text-sky-300'
                     : 'border-amber-200 bg-amber-100 text-amber-700 dark:border-amber-800 dark:bg-amber-900/40 dark:text-amber-300')
                   : 'border-gray-200 bg-gray-100 text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300'"
               >
@@ -324,7 +357,7 @@ watch(
               class="rounded-full px-2 py-0.5 text-[10px] font-bold"
               aria-live="polite"
               :class="{
-                'bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300': display.riskTone === 'low' && isPending,
+                'bg-sky-100 text-primary-dark dark:bg-primary-dark/40 dark:text-sky-300': display.riskTone === 'low' && isPending,
                 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300': display.riskTone === 'standard' && isPending,
                 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300': props.payload.status === 'approved' || props.payload.status === 'approved_session',
                 'bg-gray-200/80 text-gray-600 dark:bg-gray-800 dark:text-gray-300': props.payload.status === 'rejected',
@@ -357,7 +390,7 @@ watch(
               <span class="font-semibold">{{ display.scopeLabel }} · {{ scopeSuffix }}</span>
             </div>
 
-            <div v-if="hasDetails" class="flex min-w-0 items-center gap-2 rounded-lg border border-current/15 bg-white/70 px-2.5 py-1.5 dark:bg-gray-950/40">
+            <div v-if="hasDetails" class="flex min-w-0 items-center gap-2 rounded-lg border border-[color-mix(in_srgb,currentColor_15%,transparent)] bg-white/70 px-2.5 py-1.5 dark:bg-gray-950/40">
               <span class="shrink-0 text-[10px] font-semibold opacity-60">命令详情</span>
               <pre class="min-w-0 flex-1 whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed">{{ display.commandText || display.parameterText }}</pre>
               <button
@@ -373,7 +406,7 @@ watch(
 
           <!-- 标准布局：极简元信息条 + 终端代码预览 -->
           <template v-else>
-            <div class="flex flex-wrap items-center gap-x-2.5 gap-y-1 rounded-md border border-current/10 bg-black/[0.02] px-2.5 py-1 text-[11px] dark:bg-white/[0.03]">
+            <div class="flex flex-wrap items-center gap-x-2.5 gap-y-1 rounded-md border border-[color-mix(in_srgb,currentColor_10%,transparent)] bg-black/[0.02] px-2.5 py-1 text-[11px] dark:bg-white/[0.03]">
               <div class="flex items-center gap-1">
                 <span class="opacity-60">风险等级</span>
                 <span class="font-semibold">{{ display.riskLabel }}</span>
@@ -385,8 +418,8 @@ watch(
               </div>
             </div>
 
-            <div v-if="hasDetails" class="mt-2 overflow-hidden rounded-lg border border-current/15 bg-white/80 shadow-2xs dark:bg-gray-950/50">
-              <div class="flex min-h-7 items-center justify-between border-b border-current/10 bg-black/[0.02] px-2.5 py-1 dark:bg-white/[0.02]">
+            <div v-if="hasDetails" class="mt-2 overflow-hidden rounded-lg border border-[color-mix(in_srgb,currentColor_15%,transparent)] bg-white/80 shadow-2xs dark:bg-gray-950/50">
+              <div class="flex min-h-7 items-center justify-between border-b border-[color-mix(in_srgb,currentColor_10%,transparent)] bg-black/[0.02] px-2.5 py-1 dark:bg-white/[0.02]">
                 <button
                   type="button"
                   class="flex items-center gap-1.5 py-0.5 text-left font-semibold opacity-85 transition hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current"
@@ -472,7 +505,7 @@ watch(
             </button>
             <button
               type="button"
-              class="inline-flex min-h-[2.75rem] w-full items-center justify-center rounded-lg border border-current/20 bg-white/75 px-3 py-1.5 text-xs font-semibold opacity-80 shadow-2xs transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current disabled:cursor-not-allowed disabled:opacity-45 sm:min-h-[2rem] sm:w-auto dark:bg-gray-800/80 dark:hover:bg-gray-800"
+              class="inline-flex min-h-[2.75rem] w-full items-center justify-center rounded-lg border border-[color-mix(in_srgb,currentColor_20%,transparent)] bg-white/75 px-3 py-1.5 text-xs font-semibold opacity-80 shadow-2xs transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current disabled:cursor-not-allowed disabled:opacity-45 sm:min-h-[2rem] sm:w-auto dark:bg-gray-800/80 dark:hover:bg-gray-800"
               :disabled="locked"
               aria-label="拒绝执行本次工具调用"
               @click="submit(false)"
@@ -482,7 +515,7 @@ watch(
             <button
               v-if="props.payload.supports_session_grant"
               type="button"
-              class="inline-flex min-h-[2.75rem] w-full items-center justify-center rounded-lg border border-current/25 bg-white/60 px-3 py-1.5 text-xs font-semibold opacity-85 shadow-2xs transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current disabled:cursor-not-allowed disabled:opacity-45 sm:min-h-[2rem] sm:w-auto dark:bg-gray-800/60 dark:hover:bg-gray-800"
+              class="inline-flex min-h-[2.75rem] w-full items-center justify-center rounded-lg border border-[color-mix(in_srgb,currentColor_25%,transparent)] bg-white/60 px-3 py-1.5 text-xs font-semibold opacity-85 shadow-2xs transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current disabled:cursor-not-allowed disabled:opacity-45 sm:min-h-[2rem] sm:w-auto dark:bg-gray-800/60 dark:hover:bg-gray-800"
               :disabled="locked"
               aria-label="本会话内总是允许该工具调用"
               title="本会话内该工具不再逐条确认，危险命令与黑名单仍会被拦截"
@@ -493,7 +526,7 @@ watch(
             <button
               type="button"
               class="inline-flex min-h-[2.75rem] w-full items-center justify-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold text-white shadow-2xs transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-45 sm:min-h-[2rem] sm:w-auto"
-              :class="display.riskTone === 'low' ? 'bg-sky-600 hover:bg-sky-700 focus-visible:ring-sky-600' : 'bg-amber-600 hover:bg-amber-700 focus-visible:ring-amber-600'"
+              :class="display.riskTone === 'low' ? 'bg-primary hover:bg-primary-dark focus-visible:ring-primary' : 'bg-amber-600 hover:bg-amber-700 focus-visible:ring-amber-600'"
               :disabled="locked"
               aria-label="仅本次允许执行工具调用"
               @click="submit(true)"

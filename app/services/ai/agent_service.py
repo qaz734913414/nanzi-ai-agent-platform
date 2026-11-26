@@ -444,10 +444,26 @@ def _turn_status_signal(chunk: Dict[str, Any]) -> Optional[str]:
     """
     chunk_type = str(chunk.get("type") or "")
     if chunk_type == "permission_required":
+        # 子代理转发上来的审批（chunk 带 subagent / source_agent_display_name）必须
+        # 与 user_question 同构地映射成 awaiting_user，当场落库。
+        #
+        # 原因：子代理的挂起快照属于内部子会话（child_session_*），父轮次在转发这一帧
+        # 后就已经结束——用户确认时 resume.py 走 `_handoff_subagent_permission` 写完
+        # 授权直接 return，全程不会再有一次收尾机会。若沿用 awaiting_permission，这一轮
+        # 会被 AUDIT_DEFERRED_STATUSES 跳过不写审计表，刷新后原始提问、主专家前半段
+        # 思考时间线、以及 batch 里其余已完成子代理的结果全部消失，只能看到一条突兀的
+        # 【用户授权】消息。
+        if chunk.get("subagent") or chunk.get("source_agent_display_name"):
+            return "awaiting_user"
         return "awaiting_permission"
     if chunk_type == "external_execution_required":
         return "awaiting_external_execution"
     if chunk_type == "user_question":
+        return "awaiting_user"
+    if chunk_type == "business_confirmation":
+        # 业务确认卡与主动提问同构：用户点「确定/取消」会以新消息开**新**轮次，
+        # 本轮不会再有收尾机会，必须当场落库（awaiting_user 不在
+        # AUDIT_DEFERRED_STATUSES 里），否则这一轮的历史与侧栏会话都会消失。
         return "awaiting_user"
     if chunk_type == "error":
         return "error"
@@ -1233,6 +1249,11 @@ class AgentService:
                 lane_user_id, conversation_id
             ) as run_handle:
                 pipeline_context.run_handle = run_handle
+                if run_handle is not None:
+                    # 记下本轮持有的 lane 令牌（= hold 用的 trace_id）：客户端断开后
+                    # 清理残留锁时必须拿它做 compare-and-delete，否则会误删下一轮
+                    # 刚抢到的锁，让两个 run 并发操作同一 AgentState。
+                    run_handle.lane_token = trace_id
                 if callable(on_lane_acquired):
                     callback_result = on_lane_acquired()
                     if asyncio.iscoroutine(callback_result):
@@ -1870,6 +1891,7 @@ class AgentService:
         user_info: Optional[dict[str, Any]] = None,
         skills_log_callback: Optional[callable] = None,
         resource_scope: Optional[dict[str, Any]] = None,
+        conversation_id: Optional[str] = None,
     ) -> list[str]:
         """挂载与自动匹配技能，委托给 SkillInjector。"""
         return await SkillInjector.inject_skills(
@@ -1879,6 +1901,7 @@ class AgentService:
             user_info=user_info,
             skills_log_callback=skills_log_callback,
             resource_scope=resource_scope,
+            conversation_id=conversation_id,
         )
 
     async def _load_memory_context(
@@ -2087,17 +2110,12 @@ class AgentService:
                 )
                 from app.services.ai.runtime.agentscope.workspace import (
                     get_local_workspace,
+                    WorkspacePrepareTrace,
                     SANDBOX_POLICY_LOCAL,
                     SANDBOX_POLICY_DOCKER,
                     SANDBOX_POLICY_K8S,
                     SANDBOX_POLICY_E2B,
                     SANDBOX_POLICY_SSH,
-                    _docker_workspace_cache,
-                    _k8s_workspace_cache,
-                    _workspace_cache,
-                    resolve_workspace_root,
-                    resolve_session_workdir,
-                    _resolve_sandbox_user_key,
                 )
 
                 policy = resolve_effective_sandbox_policy(
@@ -2119,46 +2137,13 @@ class AgentService:
                     str(raw_user_name).strip() if raw_user_name is not None else None
                 )
 
-                was_cached = False
-                try:
-                    root = await resolve_workspace_root()
-                    if policy in (SANDBOX_POLICY_DOCKER, SANDBOX_POLICY_K8S):
-                        sandbox_user_key = _resolve_sandbox_user_key(
-                            user_id=runtime_user_id,
-                            user_name=runtime_user_name,
-                            user_info=user_info,
-                        )
-                        if sandbox_user_key:
-                            cache_dict = _docker_workspace_cache if policy == SANDBOX_POLICY_DOCKER else _k8s_workspace_cache
-                            sandbox_cache_key = f"{os.path.abspath(root)}::{sandbox_user_key}::{policy}"
-                            cached_ws = cache_dict.get(sandbox_cache_key)
-                            if cached_ws is not None and getattr(cached_ws, "is_alive", True):
-                                was_cached = True
-                    else:
-                        workdir = resolve_session_workdir(
-                            root=root,
-                            user_id=runtime_user_id,
-                            user_name=runtime_user_name,
-                            user_info=user_info,
-                            conversation_id=conversation_id,
-                        )
-                        skills_custom = bool(getattr(agent_config, "skills_custom", False))
-                        allowed_global_skills = list(getattr(agent_config, "skills", None) or [])
-                        skills_fp = (
-                            f"custom:{','.join(sorted(str(s) for s in allowed_global_skills if str(s).strip()))}"
-                            if skills_custom
-                            else "all"
-                        )
-                        cache_key = f"{workdir}::{skills_fp}::{policy}"
-                        if cache_key in _workspace_cache:
-                            was_cached = True
-                except Exception:
-                    pass
-
-                # 按需拉起策略：若为 Docker/K8s 且沙箱尚未存活，本轮不再提前拉起沙箱，
-                # 静默跳过并等待后续具体调用 Bash 工具时按需拉起并推流。
-                if policy in (SANDBOX_POLICY_DOCKER, SANDBOX_POLICY_K8S) and not was_cached:
-                    return None
+                # 不再自判「缓存里有没有」：真实缓存键是
+                # ``{root}::{user_key}::{技能集合令牌}::{policy}``，早先手写的
+                # ``{workdir}::{custom:…}::{policy}`` 与之格式不同、永远不命中，等于把
+                # docker/k8s 的预热整段跳过。现在直接调 ``get_local_workspace``：命中
+                # 缓存是几十毫秒，未命中拿到的是惰性代理（不建容器），两种情况都不需要
+                # 这层预判；「是否命中」由这次的 prepare_trace 如实反映。
+                prewarm_trace = WorkspacePrepareTrace()
 
                 # E2B/SSH 远程云沙箱需保留更长建连超时，Docker/K8s/Local 10s 即可
                 prewarm_timeout = 60.0 if policy in (SANDBOX_POLICY_E2B, SANDBOX_POLICY_SSH) else 10.0
@@ -2172,9 +2157,12 @@ class AgentService:
                             skills_custom=bool(getattr(agent_config, "skills_custom", False)),
                             allowed_global_skills=list(getattr(agent_config, "skills", None) or []),
                             lazy_sandbox=True,
+                            prepare_trace=prewarm_trace,
                         ),
                         timeout=prewarm_timeout,
                     )
+                # stages 为空 = 走的是缓存命中路径，没进 _build_pair
+                was_cached = not prewarm_trace.stages
                 elapsed_ms = (time.monotonic() - start_time) * 1000.0
                 return _build_workspace_sandbox_log(
                     policy=policy,
@@ -2191,12 +2179,21 @@ class AgentService:
                     err,
                 )
                 is_sandbox = policy in ("docker", "k8s", "e2b", "ssh")
+                # 预热超时不再等于「白干了」：工作区构建跑在独立任务里（单飞），
+                # 构建段会接续同一次工作。这里说清楚，别让用户以为链路坏了。
+                if isinstance(err, asyncio.TimeoutError):
+                    error_message = (
+                        f"预热 {elapsed_ms / 1000:.1f}s 未完成，工作区仍在后台准备，"
+                        "本轮构建会自动接续"
+                    )
+                else:
+                    error_message = str(err)
                 return _build_workspace_sandbox_log(
                     policy=policy,
                     is_sandbox=is_sandbox,
                     cached=False,
                     status="error",
-                    error_message=str(err),
+                    error_message=error_message,
                     execution_time_ms=elapsed_ms,
                 )
         matched_skills_to_log: List[tuple] = []
@@ -2221,6 +2218,7 @@ class AgentService:
                         user_info=user_info,
                         skills_log_callback=skills_log_callback,
                         resource_scope=(execution_options or {}).get("resource_scope"),
+                        conversation_id=conversation_id,
                     )
             except Exception as err:
                 logger.warning(f"Error in concurrent _inject_skills: {err}")

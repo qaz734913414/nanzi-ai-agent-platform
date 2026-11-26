@@ -20,6 +20,7 @@ import {
   NON_LIVE_TIMER_CATEGORIES,
   normalizeProcessNarrationText,
   promoteTimelineNarration,
+  settlePendingTimelineSteps,
   timelineHasPending,
   upsertTimelineLog,
   upsertTimelineTodo,
@@ -47,17 +48,41 @@ export interface PendingToolPermission {
     args?: Record<string, unknown>;
   };
   status: "pending" | "approved" | "approved_session" | "rejected" | "expired" | "error";
+  /**
+   * 后端 `PENDING_CONFIRMATION_TTL_SECONDS` 对应的**绝对**秒级过期时间戳。
+   *
+   * ToolPermissionCard 靠它算倒计时并 emit("expire")。这两个字段此前没有从 SSE
+   * 事件里抄过来，导致 `expiresAt` 恒为 0、`isExpired` 恒为 false——「10 分钟自动
+   * 失效」在界面上完全不存在：后端快照早已被 TTL 销毁，卡片还显示「待确认」、
+   * 按钮仍可点，点下去只会拿到一个「请求不存在」的错误。
+   */
+  expires_at?: number;
+  expires_in_seconds?: number;
   isSubmitting?: boolean;
   expanded?: boolean;
   /** 后端判定该工具可以提供「本会话总是允许」选项。 */
   supports_session_grant?: boolean;
   /** 用户已点过「撤销本会话授权」：卡片据此给一句明确回执。 */
   sessionGrantRevoked?: boolean;
-  /** 挂起确认的绝对过期时间（unix 秒）：刷新/恢复后仍能判断卡片是否已失效。 */
-  expires_at?: number;
-  expires_in_seconds?: number;
+  /**
+   * 这条「本会话总是允许」写在了哪个作用域上。
+   *
+   * 子智能体授权落在 `父会话::sub::子代理`，撤销时必须用这个键——沿用主会话 ID
+   * 会删除一个根本不存在的记录，界面却显示撤销成功，用户以为授权已经收回。
+   */
+  sessionGrantScope?: string;
   /** 用户主动「放弃本轮」：命令没有执行，卡片显示放弃回执而不是「已拒绝」。 */
   discarded?: boolean;
+  /**
+   * 这条确认来自子智能体：卡片要写清是哪个子代理在请求授权，
+   * 因为授权对象是「父会话 + 该子代理」，用户得知道自己在放行谁。
+   */
+  subagent?: {
+    display_name?: string;
+    run_id?: string;
+  };
+  /** 确认后要发回父会话的续聊指令（子智能体场景）。 */
+  resumeDirective?: string;
 }
 
 export interface PendingExternalExecution {
@@ -106,7 +131,9 @@ export interface AgentStreamLog {
   id: string | number;
   title: string;
   details: string;
-  status: "pending" | "success" | "error" | "warning";
+  // 与 ProcessTimelineStatus 对齐：流被用户中止时挂起行以 "interrupted" 落定
+  // （见 finalizeAllPendingStreamLogs 的 settleStatus），少这一支会写不进去。
+  status: "pending" | "success" | "error" | "warning" | "interrupted";
   error_reason?: string;
   isExpanded?: boolean;
   category?: string;
@@ -125,6 +152,8 @@ export interface AgentStreamLog {
   isRouter?: boolean;
   subagent?: SubagentTraceMeta;
 }
+
+import type { MessageImageUsage } from "./tokenFormat";
 
 export interface AgentStreamMessage {
   trace_id?: string;
@@ -146,6 +175,8 @@ export interface AgentStreamMessage {
   turnType?: string;
   prompt_tokens?: number;
   completion_tokens?: number;
+  /** 本条消息里图像工具的累计消耗；不进 total_tokens，见 MessageImageUsage 的说明 */
+  image_usage?: MessageImageUsage;
   pendingPermission?: PendingToolPermission;
   pendingExternalExecution?: PendingExternalExecution;
   toolResultData?: Record<string, ToolResultDataBlock[]>;
@@ -159,15 +190,27 @@ export type AddStreamLogFn<T extends AgentStreamMessage = AgentStreamMessage> = 
   data: Record<string, unknown>,
 ) => void;
 
+/**
+ * 主轮次 trace_id 形如 UUID；子智能体/嵌套委派用的是 `subagent_*` 这类非 UUID 串。
+ * 只有这种形状差异能可靠区分「本轮编排」与「某一步委派」。
+ */
+const MAIN_TRACE_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export function applyStreamTraceId<T extends AgentStreamMessage>(
   msg: T,
   data: Record<string, any>,
 ): boolean {
-  // Preserve the original page behavior: a nested sub-agent trace overrides
-  // the outer orchestration trace when both are present.
-  const traceId = data.data?.trace_id || data.trace_id;
-  if (!traceId) return false;
-  msg.trace_id = traceId as T["trace_id"];
+  // 顶层字段优先：嵌套事件把 trace_id 放在 data.data 里，它属于子智能体。
+  const incoming = String(data?.trace_id || data?.data?.trace_id || "").trim();
+  if (!incoming) return false;
+  const current = String(msg.trace_id || "").trim();
+  // 主轮次 trace 已经确定时，任何非 UUID 的「子代理 trace」都不能覆盖它：
+  // 覆盖后产物归集、断线重放、取消都对不上真正的那一轮，整条链路的 trace 断言失效。
+  if (MAIN_TRACE_ID_PATTERN.test(current) && !MAIN_TRACE_ID_PATTERN.test(incoming)) {
+    return false;
+  }
+  msg.trace_id = incoming as T["trace_id"];
   return true;
 }
 
@@ -230,11 +273,21 @@ export function handlePermissionRequired<T extends AgentStreamMessage>(
     status: "pending",
     expanded: true,
     supports_session_grant: Boolean(data.supports_session_grant),
+    subagent: data.subagent as PendingToolPermission["subagent"],
+    // 必须从事件里抄过来（后端 event_stream 已经在发）：漏抄就等于关掉了整块过期逻辑。
+    expires_at: typeof data.expires_at === "number" ? data.expires_at : undefined,
+    expires_in_seconds:
+      typeof data.expires_in_seconds === "number" ? data.expires_in_seconds : undefined,
   };
   msg.isThinking = false;
+  const subagentLabel = String(
+    (data.subagent as { display_name?: string } | undefined)?.display_name || "",
+  );
   addLog(msg, {
     id: `permission_${requestId}`,
-    title: String(data.title || "工具调用需要确认"),
+    title: subagentLabel
+      ? `[${subagentLabel}] ${String(data.title || "工具调用需要确认")}`
+      : String(data.title || "工具调用需要确认"),
     details: String(data.details || ""),
     status: "pending",
     category: "permission",
@@ -389,18 +442,25 @@ export function isLiveThoughtStepTimer(
 export function finalizeAllPendingStreamLogs(
   msg: AgentStreamMessage,
   now = Date.now(),
+  settleStatus: "success" | "interrupted" | "error" = "success",
 ) {
   // 流异常结束/用户中止时，最后一小段旁白可能还停在合帧缓冲里；收尾前先落盘。
   flushTimelineNarrationDelta(msg);
   for (const log of msg.logs || []) {
     if (log.status !== "pending") continue;
     if (log.category && NON_LIVE_TIMER_CATEGORIES.has(log.category)) continue;
-    log.status = "success";
+    log.status = settleStatus;
     const durationMs = resolveStreamLogDurationMs(log, undefined, now);
     if (durationMs !== undefined) {
       log.execution_time_ms = durationMs;
     }
   }
+  // `msg.logs` 只是时间线的一个子集：深度思考、过程旁白以及「快照还原后 logs 为空」
+  // 的消息，挂起节点只存在于 processTimeline。不在这里一并落定，停止生成/网络中断
+  // 后呼吸灯（timelineHasPending 恒 true）与思考流式光标会永久闪烁。
+  settlePendingTimelineSteps(msg.processTimeline, settleStatus);
+  // 推理项还要补一个 execution_time_ms，否则冻结后显示 0ms。
+  finishTimelineReasoning(msg);
 }
 
 const STALE_PENDING_CATEGORIES = new Set(["model", "agent", "tool", "sql", "knowledge", "default"]);
@@ -427,11 +487,11 @@ export function markStalePendingStreamLogs(
       : resolveAgentMaxToolcallTimeoutMs(msg);
   const staleSeconds = Math.max(1, Math.round(effectiveStaleMs / 1000));
   let changed = false;
-  for (const log of msg.logs || []) {
-    if (log.status !== "pending") continue;
-    if (log.category && NON_LIVE_TIMER_CATEGORIES.has(log.category)) continue;
-    if (log.category && !STALE_PENDING_CATEGORIES.has(log.category)) continue;
-    if (!log.started_at || now - log.started_at < effectiveStaleMs) continue;
+  const markStale = (log: AgentStreamLog) => {
+    if (log.status !== "pending") return;
+    if (log.category && NON_LIVE_TIMER_CATEGORIES.has(log.category)) return;
+    if (log.category && !STALE_PENDING_CATEGORIES.has(log.category)) return;
+    if (!log.started_at || now - log.started_at < effectiveStaleMs) return;
     log.status = "error";
     const durationMs = resolveStreamLogDurationMs(log, undefined, now);
     if (durationMs !== undefined) {
@@ -440,7 +500,20 @@ export function markStalePendingStreamLogs(
     const suffix = `（超过 ${staleSeconds} 秒无响应，可能模型或工具调用超时）`;
     log.details = log.details ? `${log.details}\n${suffix}` : suffix;
     changed = true;
+  };
+  for (const log of msg.logs || []) {
+    markStale(log);
   }
+  // 快照还原的消息 `logs` 是空的，挂起工具行只存在于 processTimeline：不同步标记，
+  // 那些行会永远是「进行中」，500ms 秒表在组件存活期间一直空转。
+  const walkTimeline = (list: ProcessTimelineItem[] | undefined) => {
+    for (const item of list || []) {
+      if (!item) continue;
+      if (item.kind === "log") markStale(item as unknown as AgentStreamLog);
+      walkTimeline((item as { children?: ProcessTimelineItem[] }).children);
+    }
+  };
+  walkTimeline(msg.processTimeline);
   return changed;
 }
 
@@ -491,7 +564,7 @@ export function handleModelFallbackEvent<T extends AgentStreamMessage>(
   const fallbackModel = String(data.fallback_model || "unknown");
   const notice = String(
     data.content ||
-      `> ⚠️ 主模型 \`${primaryModel}\` 调用失败，本次回答由 fallback 模型 \`${fallbackModel}\` 生成。\n\n`,
+      `> 主模型 \`${primaryModel}\` 调用失败，本次回答由 fallback 模型 \`${fallbackModel}\` 生成。\n\n`,
   );
   if (!notice || msg.fallbackNotice === notice.trim()) return;
 
@@ -791,6 +864,9 @@ export function syncProcessTimelineLog<T extends AgentStreamMessage>(
         ? undefined
         : Number(data.temperature),
     tool_result_state: data.tool_result_state === undefined ? undefined : String(data.tool_result_state),
+    // 事件序号：后端 journal 分配的会话维度单调递增值，执行明细按它稳定排序
+    // （见 processTimeline.orderTimelineBySeq）。缺失时排序层保持原序。
+    _seq: typeof data._seq === "number" ? data._seq : undefined,
     // 这条调用真实的超时（工具级可能把 180s 收紧成 10s）。这里是一层显式字段映射：
     // 漏一个字段，后端下发了也进不了时间线条目，界面只能退回版本级快照。
     timeout_seconds:
@@ -806,6 +882,48 @@ export function syncProcessTimelineLog<T extends AgentStreamMessage>(
     // 子代理思考走日志通道，靠这个标记决定用 Markdown 渲染而不是当工具输出。
     reasoning: data.reasoning === true ? true : undefined,
   });
+
+  // 图像工具的计量单独累加到消息上：消息的「用量」只统计 LLM token，
+  // 图片这次调用的张数与上游 token 不进 total_tokens，但 tooltip 要看得到。
+  accumulateImageUsage(msg, data.image_usage);
+}
+
+/**
+ * 累加一次图像工具调用的消耗。
+ *
+ * 一条消息里可能生好几次图（多轮工具调用），所以是累加而不是覆盖。
+ * 上游不返回 usage 时 tokens 保持 0，但张数照样要记——「生成了几张」本身就是成本线索。
+ */
+export function accumulateImageUsage<T extends AgentStreamMessage>(
+  msg: T,
+  raw: unknown,
+): void {
+  const usage = raw as
+    | {
+        requested_count?: number;
+        succeeded_count?: number;
+        size?: string;
+        upstream_tokens?: { total_tokens?: number } | null;
+      }
+    | null
+    | undefined;
+  if (!usage || typeof usage !== "object") return;
+
+  const succeeded = Number(usage.succeeded_count ?? 0);
+  const requested = Number(usage.requested_count ?? succeeded);
+  const prev = msg.image_usage ?? {
+    calls: 0,
+    images: 0,
+    requested: 0,
+    tokens: 0,
+  };
+  msg.image_usage = {
+    calls: prev.calls + 1,
+    images: prev.images + succeeded,
+    requested: prev.requested + requested,
+    tokens: prev.tokens + Number(usage.upstream_tokens?.total_tokens ?? 0),
+    size: usage.size || prev.size,
+  };
 }
 
 /**
@@ -1013,7 +1131,7 @@ export function dispatchAgentscopeStreamEvent<T extends AgentStreamMessage>(
       return true;
     case "permission_result": {
       const sessionGrant = data.session_grant as
-        | { granted?: boolean; tool_name?: string }
+        | { granted?: boolean; tool_name?: string; conversation_id?: string }
         | undefined;
       if (msg.pendingPermission) {
         if (data.status === "rejected") {
@@ -1022,6 +1140,10 @@ export function dispatchAgentscopeStreamEvent<T extends AgentStreamMessage>(
           msg.pendingPermission.status = "approved_session";
         } else {
           msg.pendingPermission.status = "approved";
+        }
+        if (sessionGrant?.conversation_id) {
+          // 撤销入口据此回到真正写入授权的作用域（子智能体是 `父会话::sub::子代理`）。
+          msg.pendingPermission.sessionGrantScope = String(sessionGrant.conversation_id);
         }
         msg.pendingPermission.expanded = false;
         // 回执一到就解除卡片的提交态：后续还要跑完整个 Agent 轮次，流可能持续

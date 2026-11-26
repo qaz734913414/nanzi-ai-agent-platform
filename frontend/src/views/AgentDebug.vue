@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ChartBarIcon, BookOpenIcon, Cog6ToothIcon, CircleStackIcon, DocumentIcon } from "@heroicons/vue/24/outline";
 // ... imports ...
 import { ref, nextTick, watch, onUnmounted, reactive, onMounted, computed } from "vue";
 import { useRoute, useRouter } from "vue-router";
@@ -67,6 +68,7 @@ import {
   appendAssistantBodyDelta,
   createBufferedStreamEventPump,
   dispatchAgentscopeStreamEvent,
+  finalizeAllPendingStreamLogs,
   formatExternalExecutionStatus,
   markStalePendingStreamLogs,
   mergeStreamCitations,
@@ -77,7 +79,13 @@ import {
   type GroundingBlockedAction,
   type GroundingBlockedPayload,
 } from "@/utils/agentscopeSseHandlers";
-import { hydrateHistoryProcessTimeline, resolveBannerTodoTimeline, timelineHasPending } from "@/utils/processTimeline";
+import {
+  createResumeSeqNormalizer,
+  hydrateHistoryProcessTimeline,
+  maxTimelineSeq,
+  resolveBannerTodoTimeline,
+  timelineHasPending,
+} from "@/utils/processTimeline";
 import { normalizeSubagentTraceMeta, type SubagentTraceMeta } from "@/utils/subagentTrace";
 import {
   buildBusinessConfirmationUserMessage,
@@ -353,7 +361,6 @@ const continueChatFromTrace = () => {
         showToast("无法继续：该会话可能未正确保存或仅为单次追踪记录。", "error");
     }
 };
-
 
 import { modelApi, type AIModel, type ReasoningEffort } from "../api/model";
 
@@ -1466,7 +1473,7 @@ const executeSavedReportWithOptions = async (reportArg?: SavedReportPayload | nu
   messages.value.push({
     id: Date.now(),
     role: "user",
-    content: `📌 执行固化 SQL 报表: ${report.title}`,
+    content: `执行固化 SQL 报表: ${report.title}`,
     timestamp: new Date().toISOString(),
   });
 
@@ -1568,7 +1575,7 @@ const executeSavedReportWithOptions = async (reportArg?: SavedReportPayload | nu
 
     const errorMsg = extractSavedReportExecuteErrorMessage(error);
 
-    agentMsg.value.content = `### ❌ 报表执行失败\n\n在直连执行 SQL 报表时遇到错误：\n\n\`\`\`\n${errorMsg}\n\`\`\``;
+    agentMsg.value.content = `### [FAIL] 报表执行失败\n\n在直连执行 SQL 报表时遇到错误：\n\n\`\`\`\n${errorMsg}\n\`\`\``;
     agentMsg.value.logs = [
       {
         id: `log_${Date.now()}`,
@@ -1795,6 +1802,11 @@ interface Message {
   agentType?: string;
   isSavedReportResult?: boolean;
   isThoughtExpanded?: boolean; // Toggle for the logs block
+  /**
+   * 本次工具调用的生效超时秒数（后端 `agent_max_toolcall_timeout_seconds` 三级解析后的值）。
+   * agentscopeSseHandlers 在收到 run_config 时写到消息上，时间线据此显示「超时 x 秒」。
+   */
+  agentMaxToolcallTimeoutSeconds?: number;
   thoughtStartTime?: number; // Timestamp when thinking started
   thoughtDuration?: string; // Duration in seconds (formatted)
   thinkingText?: string; // Dynamic thinking text
@@ -1893,16 +1905,30 @@ const manualCompactDebugContext = async (retainRatio: 0.25 | 0.5 | 0.75 = 0.5, m
 // useSandboxWorkspace 内部 watch(..., { immediate: true }) 会立即读取 isProcessing，
 // 因此 isProcessing 必须在沙箱组合式函数调用之前完成声明，否则触发 TDZ 运行时崩溃。
 const isProcessing = ref(false);
+// 写入方令牌：每次开流（主发送 / 权限确认 / 外部执行恢复）时自增，防止被接管中止的旧流
+// 在 finally 里踩踏新流的 isProcessing。主动停止（stopGeneration）刻意**不**自增：
+// 停止后恢复流仍要走完自己的 flush() 与 logs 定稿，令牌一变就整段跳过了。
+let liveWriterToken = 0;
+// 子智能体授权交接锁：确保确认流结束到自动续聊指令发出之间输入框保持锁定。
+const subagentHandoffPending = ref(false);
+// 交接轮询代次：主动停止或切会话时自增，正在 300ms 等待中的 dispatchResumeDirective 立即作废。
+let handoffGeneration = 0;
+watch(conversationId, () => {
+  subagentHandoffPending.value = false;
+  handoffGeneration += 1;
+});
+const hasActivePendingPermission = () =>
+  messages.value.some(
+    (item: any) =>
+      item.pendingPermission?.status === "pending"
+      || item.pendingExternalExecution?.status === "pending",
+  );
 /**
  * 有待处理确认卡时保持锁定：挂起确认后后端这一轮已停下（SSE 流结束、run_status 回报
  * 不在跑），只看 isProcessing 会把输入框误判为空闲。由卡片上的「放弃本轮」显式解除。
  */
 const pendingPermissionLocking = computed(() =>
-  messages.value.some(
-    (item: any) =>
-      item.pendingPermission?.status === "pending"
-      || item.pendingExternalExecution?.status === "pending",
-  ),
+  subagentHandoffPending.value || hasActivePendingPermission(),
 );
 
 const {
@@ -1947,7 +1973,6 @@ watch(
   () => void refreshDebugContextCompactions(true),
   { immediate: true },
 );
-
 
 const loadingConfig = ref(false);
 const loadCurrentPrompt = async () => {
@@ -2001,13 +2026,6 @@ const clearContext = (key?: string) => {
 const openFullLogs = (traceId: string) => {
   activeTraceId.value = traceId;
   showFullLogViewer.value = true;
-};
-
-const openRawPrompt = (msg: Message) => {
-  if (msg.rawPrompt) {
-    selectedRawPrompt.value = msg.rawPrompt;
-    showRawPromptModal.value = true;
-  }
 };
 
 const openExecutionDetail = (msg: Message) => {
@@ -2430,7 +2448,6 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize);
 });
-
 
 /** 知识库问答专家候选（capability 或名称命中） */
 const listKnowledgeExpertAgents = () => {
@@ -2964,7 +2981,15 @@ const handleChatBIResultAction = async (
   }
 };
 
-const handleQuickQuestion = async (question: string, action: "send" | "fill" = "send", sourceContent?: string) => {
+const handleQuickQuestion = async (
+  // MessageRenderer 在消息带 quickContext 时发的是
+  // `{ question, quick_context }` 对象而不是裸字符串。这里只收字符串的话，
+  // 对象会被当成问题正文直接发出去——所以按联合类型收，再取出 question。
+  payload: string | { question: string; quick_context?: unknown },
+  action: "send" | "fill" = "send",
+  sourceContent?: string,
+) => {
+  const question = typeof payload === "string" ? payload : payload.question;
   if (!question) return;
   if (action === "send" && (isProcessing.value || remoteRunBusy.value || pendingPermissionLocking.value || sendLocked.value)) return;
   const selectedSource = sourceContent?.trim();
@@ -3467,7 +3492,6 @@ const copyCitationContent = async (content: string) => {
   }
 };
 
-
 const handleFeedback = async (msg: Message, type: "up" | "down") => {
   const oldFeedback = msg.feedback;
   if (msg.feedback === type) {
@@ -3499,7 +3523,6 @@ const handleFeedback = async (msg: Message, type: "up" | "down") => {
     msg.feedback = oldFeedback;
   }
 };
-
 
 type StopGenerationOptions = {
   /**
@@ -3534,6 +3557,8 @@ const stopGeneration = (options?: StopGenerationOptions) => {
     abortController = null;
   }
   isProcessing.value = false;
+  subagentHandoffPending.value = false;
+  handoffGeneration += 1;
 
   // Stop thinking timer if active
   if (thoughtTimer) {
@@ -3619,7 +3644,7 @@ const tryLocalChartOptionPatch = (userText: string): boolean => {
             messages.value.push({
               id: Date.now() + 1,
               role: "agent",
-              content: `✨ 已为您本地秒级重绘图表，将图表形式调整为：${newType === 'line' ? '折线图' : newType === 'bar' ? '柱状图' : newType === 'pie' ? '饼图' : '标红调整'}。`,
+              content: `已为您本地秒级重绘图表，将图表形式调整为：${newType === 'line' ? '折线图' : newType === 'bar' ? '柱状图' : newType === 'pie' ? '饼图' : '标红调整'}。`,
               timestamp: new Date().toISOString(),
               logs: [],
               citations: [],
@@ -3757,6 +3782,7 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
   // SSE 可能因切后台/网络变化提前结束；在状态接口确认释放前继续阻止新一轮发送。
   // 用 markRunStarted 而非裸置位：必须同时复位上一轮的「输出已完成」。
   markRunStarted();
+  const streamToken = ++liveWriterToken;
   abortController = new AbortController();
   ragRetrievalMeta.value = null;
 
@@ -4188,18 +4214,19 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
     }
 
     // Final cleanup of pending logs
-    if (agentMsg.value.logs) {
-      agentMsg.value.logs.forEach(log => {
-        if (log.status === 'pending' && log.category !== 'permission') {
-          log.status = 'success'; // Assume success if stream finished normally
-        }
-      });
-    }
+    // 统一收尾入口：排除 permission/external，并同步落定 processTimeline 里的
+    // 旁白与推理节点（只遍历 logs 会漏掉它们，呼吸灯与思考光标就此常亮）。
+    finalizeAllPendingStreamLogs(agentMsg.value);
 
     // Refresh history sidebar
     fetchHistory();
   } catch (error: any) {
-    if (error.name === "AbortError") return;
+    if (error.name === "AbortError") {
+      // 用户点停止：此前这里直接 return，一个挂起节点都不收敛，思考卡片会永久
+      // 转圈。中断不是「成功」，按 interrupted 落定。
+      finalizeAllPendingStreamLogs(agentMsg.value, Date.now(), "interrupted");
+      return;
+    }
 
     agentMsg.value.content += `\n[异常中断: ${error.message}]`;
     agentMsg.value.isThinking = false;
@@ -4209,16 +4236,12 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
     }
 
     // Mark pending logs as error
-    if (agentMsg.value.logs) {
-      agentMsg.value.logs.forEach(log => {
-        if (log.status === 'pending') {
-          log.status = 'error';
-        }
-      });
-    }
+    finalizeAllPendingStreamLogs(agentMsg.value, Date.now(), "error");
   } finally {
-    isProcessing.value = agentMsg.value.pendingPermission?.status === "pending" || agentMsg.value.pendingExternalExecution?.status === "pending";
-    void refreshCurrentRunStatus();
+    if (liveWriterToken === streamToken) {
+      isProcessing.value = agentMsg.value.pendingPermission?.status === "pending" || agentMsg.value.pendingExternalExecution?.status === "pending";
+      void refreshCurrentRunStatus();
+    }
     void refreshDebugContextUsage();
     void refreshDebugContextCompactions(true);
   }
@@ -4301,21 +4324,24 @@ const submitPendingExternalExecution = async (msg: Message) => {
   const pending = msg.pendingExternalExecution;
   if (!pending || pending.status !== "pending" || pending.isSubmitting) return;
   pending.isSubmitting = true;
+  markRunStarted();
   isProcessing.value = true;
   msg.isThinking = true;
   msg.thoughtStartTime = Date.now();
   msg.thoughtDuration = "0.0";
   msg.thinkingText = "正在提交外部执行结果...";
+  const resumeToken = ++liveWriterToken;
   const resumeAbort = new AbortController();
   if (abortController) {
     abortController.abort();
   }
   abortController = resumeAbort;
 
+  const normalizeResumeSeq = createResumeSeqNormalizer(maxTimelineSeq(msg.processTimeline));
   const resumeEventPump = createBufferedStreamEventPump(
     (data) => {
-      if (debugUnmounted) return;
-      applyPermissionStreamEvent(msg, data);
+      if (liveWriterToken !== resumeToken || debugUnmounted) return;
+      applyPermissionStreamEvent(msg, normalizeResumeSeq(data));
       if (data.type !== "model_call" && data.type !== "run_config" && data.type !== "keepalive") {
         scrollToBottom();
       }
@@ -4324,7 +4350,7 @@ const submitPendingExternalExecution = async (msg: Message) => {
       hasReasoning: () => Boolean(msg.reasoningContent),
       hasContent: () => Boolean(msg.content),
       onFlush: () => {
-        if (!debugUnmounted) scrollToBottom();
+        if (liveWriterToken === resumeToken && !debugUnmounted) scrollToBottom();
       },
     },
   );
@@ -4341,7 +4367,7 @@ const submitPendingExternalExecution = async (msg: Message) => {
     // 先刷缓冲再写提示，否则残留正文会排到失败提示后面
     resumeEventPump.flush();
     if (error?.name === "AbortError") {
-      if (!debugUnmounted) msg.content += "\n[已取消提交外部执行结果]";
+      if (liveWriterToken === resumeToken && !debugUnmounted) msg.content += "\n[已取消提交外部执行结果]";
     } else {
       pending.status = "error";
       msg.content += `\n[外部执行恢复失败: ${error.message || "Unknown error"}]`;
@@ -4350,26 +4376,33 @@ const submitPendingExternalExecution = async (msg: Message) => {
     if (abortController === resumeAbort) {
       abortController = null;
     }
-    if (!debugUnmounted) {
-      resumeEventPump.flush();
+    pending.isSubmitting = false;
+    if (liveWriterToken === resumeToken) {
+      if (!debugUnmounted) {
+        resumeEventPump.flush();
+      } else {
+        resumeEventPump.cancel();
+      }
+      isProcessing.value = msg.pendingExternalExecution?.status === "pending" || msg.pendingPermission?.status === "pending";
+      if (!debugUnmounted) {
+        void refreshCurrentRunStatus();
+      }
+      msg.isThinking = false;
+      if (thoughtTimer) {
+        clearInterval(thoughtTimer);
+        thoughtTimer = null;
+      }
+      if (msg.logs) {
+        msg.logs.forEach((log) => {
+          if (log.status === "pending" && log.category !== "permission" && log.category !== "external") {
+            log.status = "success";
+          }
+        });
+      }
+      scrollToBottom();
     } else {
       resumeEventPump.cancel();
     }
-    pending.isSubmitting = false;
-    isProcessing.value = msg.pendingExternalExecution?.status === "pending" || msg.pendingPermission?.status === "pending";
-    msg.isThinking = false;
-    if (thoughtTimer) {
-      clearInterval(thoughtTimer);
-      thoughtTimer = null;
-    }
-    if (msg.logs) {
-      msg.logs.forEach((log) => {
-        if (log.status === "pending" && log.category !== "permission" && log.category !== "external") {
-          log.status = "success";
-        }
-      });
-    }
-    scrollToBottom();
   }
 };
 
@@ -4380,6 +4413,22 @@ const applyPermissionStreamEvent = (msg: Message, data: any) => {
   applyStreamTraceId(msg, data);
   if (data.agent_name && !msg.agentName) msg.agentName = data.agent_name;
   if (data.agent_display_name && !msg.agentDisplayName) msg.agentDisplayName = data.agent_display_name;
+
+  if (data?.type === "subagent_permission_handoff") {
+    if (msg.pendingPermission) {
+      if (
+        data.subagent
+        && typeof data.subagent === "object"
+        && !msg.pendingPermission.subagent?.display_name
+      ) {
+        msg.pendingPermission.subagent = data.subagent;
+      }
+      if (typeof data.directive === "string" && data.directive.trim()) {
+        msg.pendingPermission.resumeDirective = data.directive;
+      }
+    }
+    return;
+  }
 
   if (data?.type === "run_status") {
     // 恢复流末尾的 run_status 终态：status 为 success / rejected / error 等真实结果，
@@ -4616,6 +4665,38 @@ const submitUserQuestion = async (
   await sendMessage();
 };
 
+const dispatchResumeDirective = async (msg: Message, directive: string) => {
+  const originConversationId = String(conversationId.value || "");
+  const handoffGen = ++handoffGeneration;
+  subagentHandoffPending.value = true;
+  try {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (debugUnmounted || handoffGeneration !== handoffGen) return;
+      if (String(conversationId.value || "") !== originConversationId) return;
+      const busy =
+        isProcessing.value
+        || remoteRunBusy.value
+        || hasActivePendingPermission()
+        || sendLocked.value;
+      if (!busy) {
+        if (debugUnmounted || handoffGeneration !== handoffGen) return;
+        if (String(conversationId.value || "") !== originConversationId) return;
+        subagentHandoffPending.value = false;
+        await sendMessage({ content: directive });
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    if (debugUnmounted || handoffGeneration !== handoffGen) return;
+    msg.content +=
+      "\n\n[授权已记录，但本轮仍在运行，没能自动唤回子智能体。请稍等片刻后发送「继续」，子智能体会接着跑完。]";
+  } finally {
+    if (handoffGeneration === handoffGen) {
+      subagentHandoffPending.value = false;
+    }
+  }
+};
+
 const confirmPendingPermission = async (
   msg: Message,
   confirmed: boolean,
@@ -4624,6 +4705,7 @@ const confirmPendingPermission = async (
   const pending = msg.pendingPermission;
   if (!pending || pending.status !== "pending" || pending.isSubmitting) return;
   pending.isSubmitting = true;
+  markRunStarted();
   isProcessing.value = true;
   if (confirmed) {
     msg.isThinking = true;
@@ -4631,16 +4713,18 @@ const confirmPendingPermission = async (
     msg.thoughtDuration = "0.0";
     msg.thinkingText = "正在继续执行...";
   }
+  const resumeToken = ++liveWriterToken;
   const resumeAbort = new AbortController();
   if (abortController) {
     abortController.abort();
   }
   abortController = resumeAbort;
 
+  const normalizeResumeSeq = createResumeSeqNormalizer(maxTimelineSeq(msg.processTimeline));
   const permissionEventPump = createBufferedStreamEventPump(
     (data) => {
-      if (debugUnmounted) return;
-      applyPermissionStreamEvent(msg, data);
+      if (liveWriterToken !== resumeToken || debugUnmounted) return;
+      applyPermissionStreamEvent(msg, normalizeResumeSeq(data));
       if (data.type !== "model_call" && data.type !== "run_config" && data.type !== "keepalive") {
         scrollToBottom();
       }
@@ -4649,7 +4733,7 @@ const confirmPendingPermission = async (
       hasReasoning: () => Boolean(msg.reasoningContent),
       hasContent: () => Boolean(msg.content),
       onFlush: () => {
-        if (!debugUnmounted) scrollToBottom();
+        if (liveWriterToken === resumeToken && !debugUnmounted) scrollToBottom();
       },
     },
   );
@@ -4711,7 +4795,7 @@ const confirmPendingPermission = async (
     permissionEventPump.flush();
     if (error?.name === "AbortError") {
       msg.isThinking = false;
-      if (!debugUnmounted) msg.content += "\n[已终止工具确认流]";
+      if (liveWriterToken === resumeToken && !debugUnmounted) msg.content += "\n[已终止工具确认流]";
     } else {
       pending.status = "error";
       msg.isThinking = false;
@@ -4721,26 +4805,41 @@ const confirmPendingPermission = async (
     if (abortController === resumeAbort) {
       abortController = null;
     }
-    if (!debugUnmounted) {
-      permissionEventPump.flush();
+    pending.isSubmitting = false;
+    if (liveWriterToken === resumeToken) {
+      if (!debugUnmounted) {
+        permissionEventPump.flush();
+      } else {
+        permissionEventPump.cancel();
+      }
+      const resumeDirective = pending.resumeDirective;
+      const hasSubagentHandoff = Boolean(resumeDirective && !pending.discarded);
+      if (hasSubagentHandoff) {
+        subagentHandoffPending.value = true;
+      }
+      isProcessing.value = Boolean(
+        msg.pendingPermission?.status === "pending" || msg.pendingExternalExecution?.status === "pending",
+      );
+      msg.isThinking = false;
+      if (thoughtTimer) {
+        clearInterval(thoughtTimer);
+        thoughtTimer = null;
+      }
+      if (msg.logs) {
+        msg.logs.forEach(log => {
+          if (log.status === "pending" && log.category !== "permission") {
+            log.status = "success";
+          }
+        });
+      }
+      if (resumeDirective && !pending.discarded) {
+        pending.resumeDirective = undefined;
+        void dispatchResumeDirective(msg, resumeDirective);
+      } else if (!debugUnmounted) {
+        void refreshCurrentRunStatus();
+      }
     } else {
       permissionEventPump.cancel();
-    }
-    pending.isSubmitting = false;
-    isProcessing.value = Boolean(
-      msg.pendingPermission?.status === "pending" || msg.pendingExternalExecution?.status === "pending",
-    );
-    msg.isThinking = false;
-    if (thoughtTimer) {
-      clearInterval(thoughtTimer);
-      thoughtTimer = null;
-    }
-    if (msg.logs) {
-      msg.logs.forEach(log => {
-        if (log.status === "pending" && log.category !== "permission") {
-          log.status = "success";
-        }
-      });
     }
   }
 };
@@ -4748,7 +4847,7 @@ const confirmPendingPermission = async (
 /** 撤销「本会话总是允许」：撤销后该工具在会话内重新逐次确认。 */
 const revokeSessionPermission = async (msg: Message) => {
   const pending = msg.pendingPermission;
-  const conversation = String(conversationId.value || "").trim();
+  const conversation = String(pending?.sessionGrantScope || conversationId.value || "").trim();
   const toolName = String(pending?.tool_call?.name || "").trim();
   if (!pending || !toolName) return;
   if (!conversation) {
@@ -4783,6 +4882,11 @@ const expirePendingPermission = (msg: Message) => {
   // 只用本地状态收尾：服务端快照本来就已过期，不再发请求。
   pending.status = "expired";
   pending.isSubmitting = false;
+  // 这条路径不发起恢复流，事后没有任何东西会复位锁态：不显式解锁，输入框会被
+  // sendMessage 的 isProcessing 判断永久拦死，只能刷新页面。
+  isProcessing.value =
+    msg.pendingExternalExecution?.status === "pending" ||
+    msg.pendingPermission?.status === "pending";
 };
 
 const discardPendingPermission = (msg: Message) => {
@@ -4792,6 +4896,9 @@ const discardPendingPermission = (msg: Message) => {
   pending.status = "rejected";
   pending.isSubmitting = false;
   pending.expanded = false;
+  isProcessing.value =
+    msg.pendingExternalExecution?.status === "pending" ||
+    msg.pendingPermission?.status === "pending";
 };
 
 let debugUnmounted = false;
@@ -4838,14 +4945,14 @@ onUnmounted(() => {
               <!-- Header -->
               <div class="px-4 py-3 sm:px-6 sm:py-4 border-b border-gray-100 dark:border-gray-700 flex justify-between items-center bg-gray-50/50 dark:bg-gray-800/50 flex-shrink-0">
                   <div class="flex items-center gap-3">
-                      <h3 class="text-sm sm:text-lg font-black text-gray-800 dark:text-gray-100 truncate">会话概览 (Session Preview)</h3>
-                      <span v-if="conversationTurns.length" class="px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 text-xs font-bold">{{ conversationTurns.length }} Rounds</span>
+                      <h3 class="text-sm sm:text-lg font-bold text-gray-800 dark:text-gray-100 truncate">会话概览 (Session Preview)</h3>
+                      <span v-if="conversationTurns.length" class="px-2 py-0.5 rounded-full bg-primary/10 text-primary-dark text-xs font-bold">{{ conversationTurns.length }} Rounds</span>
                   </div>
                   <div class="flex items-center gap-2 flex-shrink-0">
                       <button
                           v-if="conversationTurns.length > 0"
                           @click.stop="continueChatFromTrace"
-                          class="flex items-center space-x-1.5 px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary hover:text-white rounded-lg transition-all text-xs font-black border border-primary/20"
+                          class="flex items-center space-x-1.5 px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary hover:text-white rounded-lg transition-all text-xs font-bold border border-primary/20"
                       >
                           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
                           <span>继续调试</span>
@@ -4867,19 +4974,19 @@ onUnmounted(() => {
                            :class="{'ring-2 ring-primary/20': turn.trace_id === activeTraceId}"
                       >
                           <div class="flex justify-between items-center mb-4">
-                              <span class="text-[10px] font-black text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
-                                  <span class="w-2 h-2 rounded-full bg-blue-500"></span>
+                              <span class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
+                                  <span class="w-2 h-2 rounded-full bg-primary"></span>
                                   回合 #{{ tIdx + 1 }}
                               </span>
                               <span class="text-[9px] text-gray-400 font-mono">{{ formatDate(turn.created_at) }}</span>
                           </div>
                           <div class="space-y-4">
                               <div>
-                                  <div class="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1 opacity-70">用户</div>
+                                  <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1 opacity-70">用户</div>
                                   <div class="text-gray-800 dark:text-gray-200 text-sm font-bold bg-gray-50 p-2 rounded-lg border border-gray-100">{{ turn.query }}</div>
                               </div>
                               <div>
-                                  <div class="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1 opacity-70">智能体</div>
+                                  <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1 opacity-70">智能体</div>
                                   <div class="text-gray-600 dark:text-gray-300 text-xs sm:text-sm"><MessageRenderer :content="stripInternalContextBlocks(turn.summary || 'N/A')" @open-canvas="handleOpenCanvas" @preview-generated-file="previewGeneratedFileInCanvas" /></div>
                               </div>
                           </div>
@@ -4888,7 +4995,7 @@ onUnmounted(() => {
                           <div class="mt-4 pt-3 border-t border-gray-50">
                               <div class="flex items-center justify-between">
                                   <button @click="toggleTurnSteps(turn)" class="flex items-center p-2 rounded-lg hover:bg-gray-50 transition-all group">
-                                      <span class="text-[10px] font-black text-gray-500 group-hover:text-primary transition-colors uppercase tracking-widest">执行步骤 (Steps)</span>
+                                      <span class="text-[10px] font-bold text-gray-500 group-hover:text-primary transition-colors uppercase tracking-widest">执行步骤 (Steps)</span>
                                       <div class="flex items-center ml-2">
                                           <div v-if="turn.loading" class="w-3 h-3 border-2 border-primary/30 border-t-primary rounded-full animate-spin mr-2"></div>
                                           <svg class="w-4 h-4 text-gray-400 transform transition-transform duration-300" :class="{ 'rotate-180': turn.isExpanded }" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 9l-7 7-7-7" /></svg>
@@ -4898,7 +5005,7 @@ onUnmounted(() => {
                                   <!-- Link to Full Trace Viewer -->
                                   <button
                                       @click.stop="openFullLogs(turn.trace_id)"
-                                      class="px-3 py-1.5 text-[10px] font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded border border-indigo-100 transition-colors uppercase tracking-widest flex items-center gap-1"
+                                      class="px-3 py-1.5 text-[10px] font-bold text-primary bg-primary/5 hover:bg-primary/10 rounded border border-primary/10 transition-colors uppercase tracking-widest flex items-center gap-1"
                                   >
                                       <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>
                                       完整链路
@@ -4909,7 +5016,7 @@ onUnmounted(() => {
                                   <div v-if="turn.steps && turn.steps.length > 0" class="space-y-3">
                                       <div v-for="(step, sIdx) in turn.steps" :key="sIdx" class="bg-white p-3 rounded-xl border border-gray-100 shadow-sm text-xs">
                                           <div class="flex justify-between items-center mb-2">
-                                              <span class="text-[9px] font-black px-1.5 py-0.5 rounded uppercase bg-blue-100 text-blue-700">{{ step.event_type }}</span>
+                                              <span class="text-[9px] font-bold px-1.5 py-0.5 rounded uppercase bg-primary/10 text-primary-dark">{{ step.event_type }}</span>
                                               <span class="text-[8px] text-gray-400 font-mono">{{ step.execution_time_ms?.toFixed(0) }}ms</span>
                                           </div>
                                           <div v-if="step.tool_output?.content" class="text-gray-600 leading-relaxed break-words">{{ step.tool_output.content.slice(0, 300) + (step.tool_output.content.length > 300 ? '...' : '') }}</div>
@@ -4953,11 +5060,11 @@ onUnmounted(() => {
         v-if="!isFullScreen"
         class="px-4 sm:px-6 py-2 bg-sky-50 border-b border-sky-100 flex items-start sm:items-center gap-2 flex-shrink-0"
       >
-        <svg class="w-4 h-4 text-sky-600 shrink-0 mt-0.5 sm:mt-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <svg class="w-4 h-4 text-primary shrink-0 mt-0.5 sm:mt-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
         </svg>
         <div class="flex-1 min-w-0 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-          <p class="text-xs sm:text-sm text-sky-800 leading-relaxed">
+          <p class="text-xs sm:text-sm text-primary-dark leading-relaxed">
             当前是<strong class="font-semibold">智能体开发调试</strong>模块，可展示更详尽的运行日志与链路信息，便于开发排查与调试。
             <template v-if="showFullscreenTip">
               建议使用右上角<strong class="font-semibold">全屏</strong>，调试视野更完整。
@@ -4967,7 +5074,7 @@ onUnmounted(() => {
             <button
               type="button"
               @click="enterFullScreenFromTip"
-              class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-white bg-sky-600 hover:bg-sky-700 rounded-md transition-colors"
+              class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-white bg-primary hover:bg-primary-dark rounded-md transition-colors"
             >
               <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4M20 4l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
@@ -4977,7 +5084,7 @@ onUnmounted(() => {
             <button
               type="button"
               @click="dismissFullscreenTip"
-              class="text-xs text-sky-600/80 hover:text-sky-900 px-1.5 py-1 transition-colors"
+              class="text-xs text-primary/80 hover:text-primary-dark px-1.5 py-1 transition-colors"
             >
               知道了
             </button>
@@ -5053,8 +5160,8 @@ onUnmounted(() => {
             :class="isFullScreen
               ? 'bg-primary/10 text-primary border border-primary/20 px-2.5 py-1.5 rounded-lg hover:bg-primary/20'
               : showFullscreenTip
-                ? 'bg-sky-50 text-sky-700 border border-sky-200 px-2.5 py-1.5 rounded-lg hover:bg-sky-100 ring-2 ring-sky-200/60 animate-pulse'
-                : 'text-gray-500 hover:text-blue-600 px-2 py-1.5 rounded-lg hover:bg-gray-50'"
+                ? 'bg-primary/5 text-primary border border-primary/25 px-2.5 py-1.5 rounded-lg hover:bg-primary/10'
+                : 'text-gray-500 hover:text-primary px-2 py-1.5 rounded-lg hover:bg-gray-50'"
             v-tooltip="isFullScreen ? '退出全屏（Esc）' : '全屏调试，获得更大视野'"
           >
             <svg
@@ -5197,7 +5304,7 @@ onUnmounted(() => {
                         <svg class="w-3 h-3 transform transition-transform duration-200 group-open/sys:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M9 5l7 7-7 7" />
                         </svg>
-                        <span>⚙️ 附加系统元数据说明 (点击展开)</span>
+                        <span>附加系统元数据说明 (点击展开)</span>
                       </summary>
                       <div class="mt-1.5 p-2 rounded bg-black/15 text-white/85 font-mono text-[10px] leading-relaxed whitespace-pre-wrap break-all select-text selection:bg-white/20">
                         {{ parts.contextPart }}
@@ -5219,25 +5326,15 @@ onUnmounted(() => {
                           @click="openImagePreview"
                         />
                         <!-- Skill Icon -->
-                        <div v-else-if="file.type === 'skill'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2 font-mono">
-                            ⚙️
-                        </div>
+                        <div v-else-if="file.type === 'skill'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2 font-mono"><Cog6ToothIcon class="h-4 w-4" aria-hidden="true" /></div>
                         <!-- Metadata Dataset Icon -->
-                        <div v-else-if="file.type === 'metadata_dataset'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2">
-                            📊
-                        </div>
+                        <div v-else-if="file.type === 'metadata_dataset'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2"><ChartBarIcon class="h-4 w-4" aria-hidden="true" /></div>
                         <!-- Knowledge Base Icon -->
-                        <div v-else-if="file.type === 'knowledge_base'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2">
-                            📚
-                        </div>
+                        <div v-else-if="file.type === 'knowledge_base'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2"><BookOpenIcon class="h-4 w-4" aria-hidden="true" /></div>
                         <!-- Memory Icon -->
-                        <div v-else-if="file.type === 'memory'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2">
-                            🧠
-                        </div>
+                        <div v-else-if="file.type === 'memory'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2"><CircleStackIcon class="h-4 w-4" aria-hidden="true" /></div>
                         <!-- File Icon -->
-                        <div v-else class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2">
-                            📄
-                        </div>
+                        <div v-else class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2"><DocumentIcon class="h-4 w-4" aria-hidden="true" /></div>
                         <div class="flex-1 min-w-0 flex flex-col">
                             <span v-if="file.type === 'skill' || file.type === 'knowledge_base' || file.type === 'metadata_dataset' || file.type === 'memory'" class="text-xs font-bold text-white truncate">{{ file.filename }}</span>
                             <a v-else :href="file.url" target="_blank" class="text-xs font-bold text-white hover:underline truncate">{{ file.filename }}</a>
@@ -5309,7 +5406,7 @@ onUnmounted(() => {
           <!-- Agent Message -->
           <div v-else class="flex space-x-3 items-start max-w-[90%] group">
             <div
-              class="w-10 h-10 rounded-full bg-blue-600 flex-shrink-0 flex items-center justify-center text-white shadow-md border border-blue-100"
+              class="w-10 h-10 rounded-full bg-primary flex-shrink-0 flex items-center justify-center text-white shadow-md border border-primary/10"
             >
               <svg
                 class="w-6 h-6"
@@ -5332,7 +5429,7 @@ onUnmounted(() => {
                 <div
                   class="flex items-center space-x-1 px-2 py-1 text-xs font-medium rounded-md select-none transition-all duration-300 border"
                   :class="msg.agentName
-                    ? 'text-blue-600 bg-blue-50 border-blue-100'
+                    ? 'text-primary bg-primary/5 border-primary/10'
                     : 'text-gray-400 bg-gray-50 border-gray-100 italic animate-pulse'"
                 >
                   <svg
@@ -5373,7 +5470,6 @@ onUnmounted(() => {
                   </svg>
                   <span>执行详情</span>
                 </button>
-
 
                 <!-- Regenerate Button -->
                 <div
@@ -5431,7 +5527,6 @@ onUnmounted(() => {
                 :skill-summary="getSkillFlowSummaryForMessage(msg, messages)"
                 :skill-badges="getSkillFlowBadgesForMessage(msg, messages)"
                 :suppress-permission-logs="Boolean(msg.pendingPermission)"
-                :hide-todo="activeTodoTimeline === msg.processTimeline"
                 :tool-timeout-seconds="msg.agentMaxToolcallTimeoutSeconds"
                 bordered
                 @stop="stopGeneration({ notifySuccess: true })"
@@ -5451,7 +5546,7 @@ onUnmounted(() => {
                 class="mt-3 rounded-lg border border-sky-200 bg-sky-50/80 p-3 text-xs transition-all"
               >
                 <div class="flex items-start gap-2">
-                  <div class="mt-0.5 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md bg-sky-100 text-sky-700">
+                  <div class="mt-0.5 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md bg-sky-100 text-primary-dark">
                     <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4M14 4h6m0 0v6m0-6L10 14" />
                     </svg>
@@ -5464,25 +5559,25 @@ onUnmounted(() => {
                       @click="msg.pendingExternalExecution.expanded = !(msg.pendingExternalExecution.expanded ?? (msg.pendingExternalExecution.status === 'pending'))"
                     >
                       <div class="flex min-w-0 flex-1 items-center gap-2">
-                        <div class="font-bold text-sky-900 shrink-0">
+                        <div class="font-bold text-primary-dark shrink-0">
                           {{ msg.pendingExternalExecution.title || '外部工具执行' }}
                         </div>
                         <!-- Collapsed summary preview -->
                         <span
                           v-if="!(msg.pendingExternalExecution.expanded ?? (msg.pendingExternalExecution.status === 'pending')) && (msg.pendingExternalExecution.tool_call?.name || msg.pendingExternalExecution.details)"
-                          class="min-w-0 flex-1 truncate text-[11px] text-sky-800/70 font-normal"
+                          class="min-w-0 flex-1 truncate text-[11px] text-primary-dark/70 font-normal"
                         >
                           {{ msg.pendingExternalExecution.tool_call?.name ? `${msg.pendingExternalExecution.tool_call.name}${msg.pendingExternalExecution.tool_call.args ? ': ' + JSON.stringify(msg.pendingExternalExecution.tool_call.args) : ''}` : msg.pendingExternalExecution.details }}
                         </span>
                       </div>
                       <div class="flex items-center gap-1.5 shrink-0">
-                        <span class="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase bg-sky-100 text-sky-700">
+                        <span class="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase bg-sky-100 text-primary-dark">
                           {{ formatExternalExecutionStatus(msg.pendingExternalExecution.status) }}
                         </span>
                         <!-- Fold/Unfold Arrow -->
                         <button
                           type="button"
-                          class="flex h-5 w-5 items-center justify-center rounded text-sky-600 hover:text-sky-900 transition-colors"
+                          class="flex h-5 w-5 items-center justify-center rounded text-primary hover:text-primary-dark transition-colors"
                           :aria-label="(msg.pendingExternalExecution.expanded ?? (msg.pendingExternalExecution.status === 'pending')) ? '收起执行' : '展开执行'"
                           @click.stop="msg.pendingExternalExecution.expanded = !(msg.pendingExternalExecution.expanded ?? (msg.pendingExternalExecution.status === 'pending'))"
                         >
@@ -5501,14 +5596,14 @@ onUnmounted(() => {
 
                     <!-- Expanded Content -->
                     <div v-show="msg.pendingExternalExecution.expanded ?? (msg.pendingExternalExecution.status === 'pending')" class="mt-2">
-                      <div class="text-sky-800/80 break-words">
+                      <div class="text-primary-dark/80 break-words">
                         {{ msg.pendingExternalExecution.details }}
                       </div>
                       <div
                         v-if="msg.pendingExternalExecution.tool_call?.name"
                         class="mt-2 rounded-md bg-white/80 border border-sky-100 p-2 font-mono text-[10px] text-gray-600 overflow-x-auto max-h-56 overflow-y-auto"
                       >
-                        <div class="font-semibold text-sky-900 mb-0.5">{{ msg.pendingExternalExecution.tool_call.name }}</div>
+                        <div class="font-semibold text-primary-dark mb-0.5">{{ msg.pendingExternalExecution.tool_call.name }}</div>
                         <pre v-if="msg.pendingExternalExecution.tool_call.args" class="whitespace-pre-wrap break-all font-mono">{{ JSON.stringify(msg.pendingExternalExecution.tool_call.args, null, 2) }}</pre>
                       </div>
                       <div v-if="msg.pendingExternalExecution.status === 'pending'" class="mt-3 space-y-2">
@@ -5521,7 +5616,7 @@ onUnmounted(() => {
                         <button
                           @click="submitPendingExternalExecution(msg)"
                           :disabled="msg.pendingExternalExecution.isSubmitting"
-                          class="inline-flex items-center gap-1.5 rounded-md bg-sky-600 px-3 py-1.5 text-xs font-bold text-white shadow-sm hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-60"
+                          class="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-bold text-white shadow-sm hover:bg-primary-dark disabled:cursor-not-allowed disabled:opacity-60"
                         >
                           提交结果并继续
                         </button>
@@ -5649,7 +5744,7 @@ onUnmounted(() => {
                       type="button"
                       @click.stop="copyContent(visibleStreamBody(msg), $event)"
                       v-tooltip="'复制'"
-                      class="flex h-7 w-7 shrink-0 items-center justify-center rounded hover:bg-blue-50 text-gray-400 hover:text-primary transition-colors"
+                      class="flex h-7 w-7 shrink-0 items-center justify-center rounded hover:bg-primary/5 text-gray-400 hover:text-primary transition-colors"
                       aria-label="复制"
                     >
                       <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="1.75" viewBox="0 0 24 24">
@@ -5676,7 +5771,7 @@ onUnmounted(() => {
                   <button
                     v-if="msg.trace_id"
                     @click="exportData(msg.trace_id, 'xlsx')"
-                    class="flex items-center space-x-1 p-1 rounded hover:bg-blue-50 text-gray-400 hover:text-primary transition-colors"
+                    class="flex items-center space-x-1 p-1 rounded hover:bg-primary/5 text-gray-400 hover:text-primary transition-colors"
                     v-tooltip="'导出数据 (Excel)'"
                   >
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -5720,20 +5815,6 @@ onUnmounted(() => {
                   class="typing-cursor"
                 ></span>
               </div>
-
-              <style scoped>
-              .typing-cursor::after {
-                content: '▋';
-                animation: blink 1s step-start infinite;
-                display: inline-block;
-                margin-left: 2px;
-                vertical-align: baseline;
-                color: #2563eb; /* Primary blue */
-              }
-              @keyframes blink {
-                50% { opacity: 0; }
-              }
-              </style>
               </div>
 
               <!-- Thinking Indicator (Removed in favor of dynamic timeline indicator) -->
@@ -5903,8 +5984,8 @@ onUnmounted(() => {
                   class="text-xs font-bold uppercase tracking-wider px-2 py-0.5 rounded"
                   :class="{
                     'bg-green-900 text-green-300': msg.role === 'system',
-                    'bg-blue-900 text-blue-300': msg.role === 'user',
-                    'bg-purple-900 text-purple-300': msg.role === 'assistant',
+                    'bg-primary-dark text-white': msg.role === 'user',
+                    'bg-primary-dark text-white/85': msg.role === 'assistant',
                     'bg-yellow-900 text-yellow-300': msg.role === 'tool',
                   }"
                 >
@@ -5974,7 +6055,7 @@ onUnmounted(() => {
                   <input
                     v-model="editingCommand.label"
                     type="text"
-                    placeholder="显示名称 (e.g. 🏢 列表)"
+                    placeholder="显示名称 (e.g. 列表)"
                     class="w-full text-xs border-gray-300 rounded focus:ring-primary focus:border-primary"
                   />
                 </div>
@@ -6024,7 +6105,7 @@ onUnmounted(() => {
                 @drop="onDrop($event, index)"
                 class="flex items-center justify-between p-3 border border-gray-100 rounded-lg hover:bg-gray-50 group transition-all duration-200"
                 :class="{
-                  'opacity-50 scale-[0.98] bg-blue-50 border-blue-200': draggedItemIndex === index,
+                  'opacity-50 scale-[0.98] bg-primary/5 border-blue-200': draggedItemIndex === index,
                   'cursor-move': currentUser && (currentUser.role === 'admin' || cmd.created_by === currentUser.user_name),
                   'cursor-default': !(currentUser && (currentUser.role === 'admin' || cmd.created_by === currentUser.user_name))
                 }"
@@ -6057,8 +6138,8 @@ onUnmounted(() => {
                       >{{ cmd.label }}</span
                     >
                     <!-- Badges -->
-                    <span v-if="['system', 'admin'].includes(cmd.created_by)" class="px-1.5 py-0.5 rounded text-[10px] bg-purple-100 text-purple-700 border border-purple-200 font-medium">System</span>
-                    <span v-else-if="currentUser && cmd.created_by === currentUser.user_name" class="px-1.5 py-0.5 rounded text-[10px] bg-blue-100 text-blue-700 border border-blue-200 font-medium">Mine</span>
+                    <span v-if="['system', 'admin'].includes(cmd.created_by)" class="px-1.5 py-0.5 rounded text-[10px] bg-primary/10 text-primary-dark border border-primary/20 font-medium">System</span>
+                    <span v-else-if="currentUser && cmd.created_by === currentUser.user_name" class="px-1.5 py-0.5 rounded text-[10px] bg-primary/10 text-primary-dark border border-primary/20 font-medium">Mine</span>
                   </div>
 
                   <span class="text-xs text-gray-500 truncate max-w-xs">{{
@@ -6071,7 +6152,7 @@ onUnmounted(() => {
                 >
                   <button
                     @click="editCommand(cmd)"
-                    class="text-xs text-blue-600 hover:text-blue-800 underline"
+                    class="text-xs text-primary hover:text-primary-dark underline"
                   >
                     编辑
                   </button>
@@ -6273,18 +6354,17 @@ onUnmounted(() => {
   transform: translateX(-20px);
   opacity: 0;
 }
-.animate-fade-in-up {
-  animation: fadeInUp 0.3s ease-out;
+
+.typing-cursor::after {
+  content: '▋';
+  animation: blink 1s step-start infinite;
+  display: inline-block;
+  margin-left: 2px;
+  vertical-align: baseline;
+  color: var(--color-primary, #1677ff);
 }
-@keyframes fadeInUp {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+@keyframes blink {
+  50% { opacity: 0; }
 }
 
 /* Markdown Styles */
@@ -6313,25 +6393,13 @@ onUnmounted(() => {
 :deep(.markdown-body pre) {
   margin-top: 1em;
   margin-bottom: 1em;
-  padding: 1.25em 1em 1em 1em;
+  padding: 0.875em 1em;
   background-color: #ffffff;
   border: 1px solid #e5e7eb;
   border-radius: 8px;
   overflow: auto;
   position: relative;
   box-shadow: none;
-}
-:deep(.markdown-body pre):before {
-  content: "";
-  position: absolute;
-  top: 10px;
-  left: 12px;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background-color: #ff5f56;
-  box-shadow: 16px 0 0 #ffbd2e, 32px 0 0 #27c93f;
-  z-index: 1;
 }
 :deep(.markdown-body pre code) {
   background-color: transparent;

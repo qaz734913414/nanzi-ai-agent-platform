@@ -33,6 +33,26 @@
       </div>
     </div>
 
+    <!-- 二级 Tab：两个 Tab 共用页头同一个时间选择器，切 Tab 不重置区间 -->
+    <div class="flex items-center gap-1 border-b border-gray-200">
+      <button
+        v-for="tab in statsTabs"
+        :key="tab.key"
+        type="button"
+        class="-mb-px border-b-2 px-3.5 py-2 text-sm transition-colors"
+        :class="
+          activeTab === tab.key
+            ? 'border-primary font-bold text-gray-900'
+            : 'border-transparent text-gray-500 hover:text-gray-800'
+        "
+        @click="activeTab = tab.key"
+      >
+        {{ tab.label }}
+      </button>
+    </div>
+
+    <template v-if="activeTab === 'token'">
+
     <!-- Statistics Cards -->
     <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
       <!-- Token 主卡：总量 + 输入/输出两行 -->
@@ -42,7 +62,7 @@
           <!-- 完整数字与大数同行：它只是大数的精确值，独占一行会把四张卡一起撑高
                （栅格内卡片等高，高度由内容最多的这张决定）。 -->
           <div class="flex items-baseline gap-2 flex-wrap">
-            <h3 class="text-2xl sm:text-3xl font-black text-gray-900 tabular-nums leading-none">
+            <h3 class="text-2xl sm:text-3xl font-bold text-gray-900 tabular-nums leading-none">
               {{ formatTokenCompact(summaryData.total_tokens) }}
             </h3>
             <span
@@ -54,7 +74,7 @@
           </div>
           <!-- 输入/输出是并列关系，同行展示；「历史未拆分」是补充信息，仍单独占位 -->
           <div class="flex items-center flex-wrap gap-x-3 gap-y-0.5 text-xs leading-relaxed">
-            <span class="text-sky-700" :title="formatTokenFull(summaryData.prompt_tokens)">
+            <span class="text-primary-dark" :title="formatTokenFull(summaryData.prompt_tokens)">
               <span class="text-gray-400">输入</span>
               {{ formatTokenCompact(summaryData.prompt_tokens) }}
             </span>
@@ -81,10 +101,10 @@
       <div class="bg-white rounded-2xl p-5 border border-gray-100 shadow-sm flex items-center justify-between gap-3">
         <div class="min-w-0 flex-1 space-y-1">
           <span class="text-sm font-medium text-gray-500">对话交互</span>
-          <h3 class="text-2xl sm:text-3xl font-black text-gray-900 tabular-nums leading-none">{{ formatNumber(summaryData.calls) }}</h3>
+          <h3 class="text-2xl sm:text-3xl font-bold text-gray-900 tabular-nums leading-none">{{ formatNumber(summaryData.calls) }}</h3>
           <p class="text-xs text-gray-400">会话发起次数</p>
         </div>
-        <div class="flex-shrink-0 p-3.5 rounded-2xl bg-purple-50/80 text-purple-600">
+        <div class="flex-shrink-0 p-3.5 rounded-2xl bg-primary/5 text-primary">
           <svg class="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
           </svg>
@@ -95,7 +115,7 @@
         <div class="min-w-0 flex-1 space-y-1">
           <span class="text-sm font-medium text-gray-500">平均单次</span>
           <h3
-            class="text-2xl sm:text-3xl font-black text-gray-900 tabular-nums leading-none"
+            class="text-2xl sm:text-3xl font-bold text-gray-900 tabular-nums leading-none"
             :title="formatTokenFull(summaryData.avg_tokens)"
           >{{ formatTokenCompact(summaryData.avg_tokens) }}</h3>
           <p class="text-xs text-gray-400">Token / 会话</p>
@@ -110,7 +130,7 @@
       <div class="bg-white rounded-2xl p-5 border border-gray-100 shadow-sm flex items-center justify-between gap-3">
         <div class="min-w-0 flex-1 space-y-1">
           <span class="text-sm font-medium text-gray-500">活跃智能体</span>
-          <h3 class="text-2xl sm:text-3xl font-black text-gray-900 tabular-nums leading-none">{{ agentData.length }}</h3>
+          <h3 class="text-2xl sm:text-3xl font-bold text-gray-900 tabular-nums leading-none">{{ agentData.length }}</h3>
           <p class="text-xs text-gray-400">有 Token 记录</p>
         </div>
         <div class="flex-shrink-0 p-3.5 rounded-2xl bg-green-50/80 text-green-600">
@@ -194,7 +214,7 @@
               <tr v-for="agent in agentData" :key="agent.agent_id" class="hover:bg-gray-50/50 transition-colors">
                 <td class="py-3 px-4 font-medium text-gray-900 max-w-[12rem] truncate" :title="agent.name">{{ agent.name }}</td>
                 <td class="py-3 px-4 text-right tabular-nums">{{ formatNumber(agent.calls) }}</td>
-                <td class="py-3 px-4 text-right tabular-nums text-sky-700" :title="formatTokenFull(agent.prompt_tokens || 0)">{{ formatTokenCompact(agent.prompt_tokens || 0) }}</td>
+                <td class="py-3 px-4 text-right tabular-nums text-primary-dark" :title="formatTokenFull(agent.prompt_tokens || 0)">{{ formatTokenCompact(agent.prompt_tokens || 0) }}</td>
                 <td class="py-3 px-4 text-right tabular-nums text-rose-700" :title="formatTokenFull(agent.completion_tokens || 0)">{{ formatTokenCompact(agent.completion_tokens || 0) }}</td>
                 <td class="py-3 px-4 text-right tabular-nums font-semibold" :title="formatTokenFull(effectiveAgentTokens(agent))">{{ formatTokenCompact(effectiveAgentTokens(agent)) }}</td>
                 <td class="py-3 px-4 text-right tabular-nums text-gray-500" :title="formatTokenFull(Math.round(effectiveAgentTokens(agent) / Math.max(agent.calls, 1)))">{{ formatTokenCompact(Math.round(effectiveAgentTokens(agent) / Math.max(agent.calls, 1))) }}</td>
@@ -241,14 +261,14 @@
               <td class="py-3.5 px-4 font-medium text-gray-900">{{ userItem.username }}</td>
               <td class="py-3.5 px-4 text-gray-600">{{ userItem.real_name || '-' }}</td>
               <td class="py-3.5 px-4 text-right tabular-nums">{{ formatNumber(userItem.calls) }}</td>
-              <td class="py-3.5 px-4 text-right tabular-nums text-sky-700" :title="formatTokenFull(userItem.prompt_tokens || 0)">{{ formatTokenCompact(userItem.prompt_tokens || 0) }}</td>
+              <td class="py-3.5 px-4 text-right tabular-nums text-primary-dark" :title="formatTokenFull(userItem.prompt_tokens || 0)">{{ formatTokenCompact(userItem.prompt_tokens || 0) }}</td>
               <td class="py-3.5 px-4 text-right tabular-nums text-rose-700" :title="formatTokenFull(userItem.completion_tokens || 0)">{{ formatTokenCompact(userItem.completion_tokens || 0) }}</td>
               <td class="py-3.5 px-4 text-right tabular-nums font-semibold text-gray-900" :title="formatTokenFull(effectiveAgentTokens(userItem))">{{ formatTokenCompact(effectiveAgentTokens(userItem)) }}</td>
               <td class="py-3.5 px-4">
                 <div class="flex items-center gap-3 w-48">
                   <div class="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
                     <div
-                      class="h-full bg-indigo-500 rounded-full transition-all duration-500"
+                      class="h-full bg-primary rounded-full transition-all duration-500"
                       :style="{ width: `${userItem.ratio}%` }"
                     ></div>
                   </div>
@@ -260,6 +280,16 @@
         </table>
       </div>
     </div>
+    </template>
+
+    <!-- 图片用量：独立的聚合端点，数据源是轨迹的 meta_info.image_usage -->
+    <ImageUsagePanel
+      v-else
+      :date-range="dateRange"
+      :range-label="rangeLabel"
+      :refresh-tick="refreshTick"
+      :is-admin="userInfo?.role === 'admin'"
+    />
   </div>
 </template>
 
@@ -267,6 +297,7 @@
 import { ref, onMounted, computed } from "vue";
 import axios from "../utils/axios";
 import DateRangePicker from "@/components/common/DateRangePicker.vue";
+import ImageUsagePanel from "@/components/usage/ImageUsagePanel.vue";
 import { addDays, formatDayKey } from "@/utils/dateRange";
 import { useToast } from "@/composables/useToast";
 import {
@@ -299,6 +330,21 @@ const { showToast } = useToast();
 
 const API_BASE = "";
 const userInfo = ref<any>(null);
+
+/**
+ * 页面二级 Tab。
+ *
+ * 「大模型 Token」= 原来那三块（趋势 / 智能体分布 / 用户账单），全部按 total_tokens 聚合；
+ * 「图片用量」= 生图与改图，走独立聚合端点 —— 它刻意不计入 total_tokens（那个数驱动月度
+ * 配额），所以任何按 Token 聚合的视图里都不会出现图片，必须有独立入口。
+ */
+const statsTabs = [
+  { key: "token", label: "大模型 Token" },
+  { key: "image", label: "图片用量" },
+] as const;
+const activeTab = ref<"token" | "image">("token");
+/** 页头「刷新」按钮同样要刷新图片 Tab：递增这个计数交给子组件监听 */
+const refreshTick = ref(0);
 const loading = ref(false);
 
 /** 统计区间：默认最近 7 天（含今天），由日历面板改写 */
@@ -376,6 +422,7 @@ let statsRequestVersion = 0;
 
 const refreshAll = async () => {
   const requestVersion = ++statsRequestVersion;
+  refreshTick.value += 1;
   loading.value = true;
   try {
     // 三个接口共用同一个区间：以前趋势传 days、分布传 period，两套口径天然差半天，

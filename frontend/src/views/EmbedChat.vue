@@ -52,7 +52,7 @@
 
     <!-- Persistent Global Watermark (Fixed position, now in background) -->
     <div v-if="currentUser?.watermark ? currentUser.watermark.enabled : true" class="fixed inset-0 pointer-events-none overflow-hidden z-0 opacity-[0.04] select-none grid grid-cols-2 sm:grid-cols-3 gap-x-10 gap-y-24 p-10 justify-items-center items-center h-full w-full" aria-hidden="true">
-        <div v-for="n in 60" :key="n" class="text-[10px] sm:text-xs font-black -rotate-[30deg] whitespace-nowrap uppercase tracking-tighter">
+        <div v-for="n in 60" :key="n" class="text-[10px] sm:text-xs font-bold -rotate-[30deg] whitespace-nowrap uppercase tracking-tighter">
             <template v-if="currentUser?.watermark?.style === 'custom'">
                 {{ currentUser?.watermark?.text || branding.product_name }}
             </template>
@@ -74,7 +74,7 @@
           class="flex-shrink-0 flex items-start justify-between gap-2 border-b border-amber-200 bg-amber-50/95 px-3 py-2 text-xs text-amber-900 dark:border-amber-500/30 dark:bg-amber-950/40 dark:text-amber-100"
         >
           <div class="flex items-start gap-2 min-w-0">
-            <span class="font-semibold shrink-0">⚠ 兼容模式</span>
+            <span class="font-semibold shrink-0">兼容模式</span>
             <span class="text-amber-800/90 dark:text-amber-200/80 break-words">
               检测到兼容模式接入，密钥存在泄露风险。请联系开发人员升级为 <strong>Ticket 模式</strong>。
             </span>
@@ -146,7 +146,7 @@
                          互斥条件必须显式写出来，否则生成中会同时出现徽章和状态点。 -->
                     <span
                         v-if="headerExpertLabel && !isProcessing"
-                        class="inline-flex items-center px-1.5 py-0.2 rounded-full bg-primary/10 text-primary text-[9px] font-semibold uppercase tracking-wider shrink-0"
+                        class="inline-flex items-center px-1.5 py-px rounded-full bg-primary/10 text-primary text-[9px] font-semibold uppercase tracking-wider shrink-0"
                     >
                         锁定
                     </span>
@@ -154,14 +154,14 @@
                          只在抽屉里标 TEAM 的话，用户会以为自己在跟一个普通专家聊。 -->
                     <span
                         v-if="headerExpertLabel && !isProcessing && currentExpertAgent?.is_expert_team_lead"
-                        class="inline-flex items-center gap-0.5 rounded-full border border-teal-200 bg-teal-50 px-1.5 py-px text-[9px] font-semibold text-teal-700 shrink-0 dark:border-teal-700 dark:bg-teal-950/40 dark:text-teal-300"
+                        class="inline-flex items-center gap-0.5 rounded-full border border-teal-200 bg-teal-50 px-1.5 py-px text-[9px] font-semibold text-teal-700 dark:text-teal-300 shrink-0 dark:border-primary-dark dark:bg-primary-dark/40 dark:text-teal-300"
                         :title="`专家团主专家：${currentExpertAgent.team_name || currentExpertAgent.display_name}${
                           currentExpertAgent.team_member_count
                             ? ` · ${currentExpertAgent.team_member_count} 位子专家`
                             : ''
                         }`"
                     >
-                        👥 TEAM
+                        TEAM
                     </span>
                 </div>
                 <div class="text-[11px] text-gray-400 dark:text-gray-500 flex items-center gap-1.5 min-w-0 leading-tight mt-0.5">
@@ -425,7 +425,7 @@
                       class="flex w-full items-center gap-3 px-3 py-2 text-sm text-gray-700 transition-all duration-150 hover:bg-primary/10 hover:text-primary dark:text-gray-200 dark:hover:bg-primary/20"
                       @click="runHeaderMoreShortcuts"
                     >
-                      <CommandLineIcon class="h-5 w-5 shrink-0 text-indigo-500" aria-hidden="true" />
+                      <CommandLineIcon class="h-5 w-5 shrink-0 text-primary" aria-hidden="true" />
                       <span class="flex-1 text-left font-medium">快捷指令</span>
                     </button>
 
@@ -443,7 +443,7 @@
                       class="flex w-full items-center gap-3 px-3 py-2 text-sm text-gray-700 transition-all duration-150 hover:bg-primary/10 hover:text-primary dark:text-gray-200 dark:hover:bg-primary/20"
                       @click="runHeaderMoreBrowser"
                     >
-                      <svg class="h-5 w-5 shrink-0 text-teal-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" stroke-width="1.8"/><path stroke-linecap="round" stroke-width="1.8" d="M3 8h18M7 6h.01M10 6h.01"/></svg>
+                      <svg class="h-5 w-5 shrink-0 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" stroke-width="1.8"/><path stroke-linecap="round" stroke-width="1.8" d="M3 8h18M7 6h.01M10 6h.01"/></svg>
                       <span class="flex-1 text-left font-medium">服务端浏览器</span>
                       <span v-if="browserPanelVisible" class="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
                     </button>
@@ -469,7 +469,7 @@
                       class="flex w-full items-center gap-3 border-t border-gray-100 px-3 py-2 text-sm text-gray-700 transition-all duration-150 hover:bg-primary/10 hover:text-primary dark:border-gray-700 dark:text-gray-200 dark:hover:bg-primary/20"
                       @click="runHeaderMoreAccount"
                     >
-                      <svg class="h-5 w-5 shrink-0 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
+                      <svg class="h-5 w-5 shrink-0 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
                       <span class="flex-1 text-left font-medium">我的账号</span>
                     </button>
                   </div>
@@ -644,7 +644,7 @@
                         <svg class="w-3 h-3 transform transition-transform duration-200 group-open/sys:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M9 5l7 7-7 7" />
                         </svg>
-                        <span>⚙️ 附加系统元数据说明 (点击展开)</span>
+                        <span>附加系统元数据说明 (点击展开)</span>
                       </summary>
                       <div class="mt-1.5 p-2 rounded bg-black/15 text-white/85 font-mono text-[10px] leading-relaxed whitespace-pre-wrap break-all select-text selection:bg-white/20">
                         {{ parts.contextPart }}
@@ -666,25 +666,15 @@
                           @click="(url) => handlePreviewImageUrl(url, file.filename)"
                         />
                         <!-- Skill Icon -->
-                        <div v-else-if="file.type === 'skill'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2 font-mono">
-                            ⚙️
-                        </div>
+                        <div v-else-if="file.type === 'skill'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2 font-mono"><Cog6ToothIcon class="h-4 w-4" aria-hidden="true" /></div>
                         <!-- Metadata Dataset Icon -->
-                        <div v-else-if="file.type === 'metadata_dataset'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2">
-                            📊
-                        </div>
+                        <div v-else-if="file.type === 'metadata_dataset'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2"><ChartBarIcon class="h-4 w-4" aria-hidden="true" /></div>
                         <!-- Knowledge Base Icon -->
-                        <div v-else-if="file.type === 'knowledge_base'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2">
-                            📚
-                        </div>
+                        <div v-else-if="file.type === 'knowledge_base'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2"><BookOpenIcon class="h-4 w-4" aria-hidden="true" /></div>
                         <!-- Memory Icon -->
-                        <div v-else-if="file.type === 'memory'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2">
-                            🧠
-                        </div>
+                        <div v-else-if="file.type === 'memory'" class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2"><CircleStackIcon class="h-4 w-4" aria-hidden="true" /></div>
                         <!-- File Icon -->
-                        <div v-else class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2">
-                            📄
-                        </div>
+                        <div v-else class="w-8 h-8 rounded bg-white/20 flex items-center justify-center text-white text-sm flex-shrink-0 mr-2"><DocumentIcon class="h-4 w-4" aria-hidden="true" /></div>
                         <div class="flex-1 min-w-0 flex flex-col">
                             <span v-if="file.type === 'skill' || file.type === 'knowledge_base' || file.type === 'metadata_dataset' || file.type === 'memory'" class="text-xs font-bold text-white truncate">{{ file.filename }}</span>
                             <template v-else>
@@ -800,17 +790,9 @@
              :class="{ 'space-x-2': !config.hideChatAvatar }">
           <!-- Agent Avatar (Clickable for Settings) -->
           <div v-if="!config.hideChatAvatar" class="relative group">
-            <!-- Pulse/Glow Effect -->
             <div
-              class="absolute inset-0 rounded-full animate-pulse-slow transition-opacity"
-              :class="(!msg.agentName || msg.isThinking) ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'"
-              :style="{
-                backgroundColor: 'var(--primary-color, #1677ff)',
-                filter: 'blur(4px)',
-              }"
-            ></div>
-            <div
-              class="relative w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 text-white shadow-sm overflow-hidden cursor-pointer hover:scale-110 hover:shadow-md active:scale-95 transition-all duration-200"
+              class="relative w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 text-white shadow-sm overflow-hidden cursor-pointer hover:ring-2 hover:ring-primary/30 active:scale-95 transition-all duration-150"
+              :class="msg.isThinking ? 'ring-2 ring-primary/35' : ''"
               @click.stop="showSettings = true; fetchAllowedAgents()"
               title="点击配置主题"
             >
@@ -820,14 +802,6 @@
                 alt="NanZi AI agent"
                 @error="handleAgentAvatarError"
               />
-            </div>
-            <!-- Tiny indicator dot to pulse when NOT hovered -->
-            <div
-              class="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 bg-green-400 border-2 border-white dark:border-gray-900 rounded-full group-hover:hidden"
-            >
-              <div
-                class="absolute inset-0 rounded-full animate-ping bg-green-400 opacity-75"
-              ></div>
             </div>
           </div>
           <div class="w-full min-w-0" :class="config.hideChatAvatar ? 'max-w-full' : 'max-w-[90%]'">
@@ -901,7 +875,6 @@
                 :skill-summary="getSkillFlowSummaryForMessage(msg, messages)"
                 :skill-badges="getSkillFlowBadgesForMessage(msg, messages)"
                 :suppress-permission-logs="Boolean(msg.pendingPermission)"
-                :hide-todo="activeTodoTimeline === msg.processTimeline"
                 :tool-timeout-seconds="msg.agentMaxToolcallTimeoutSeconds"
                 dark-mode
                 @stop="stopGeneration({ notifySuccess: true })"
@@ -920,10 +893,10 @@
               <!-- External Tool Execution -->
               <div
                 v-if="msg.pendingExternalExecution"
-                class="mt-3 rounded-lg border border-sky-200 dark:border-sky-900/50 bg-sky-50/80 dark:bg-sky-900/20 p-3 text-xs transition-all"
+                class="mt-3 rounded-lg border border-sky-200 dark:border-primary-dark/50 bg-sky-50/80 dark:bg-primary-dark/20 p-3 text-xs transition-all"
               >
                 <div class="flex items-start gap-2">
-                  <div class="mt-0.5 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md bg-sky-100 dark:bg-sky-900/40 text-sky-700 dark:text-sky-300">
+                  <div class="mt-0.5 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md bg-sky-100 dark:bg-primary-dark/40 text-primary-dark dark:text-sky-300">
                     <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4M14 4h6m0 0v6m0-6L10 14" />
                     </svg>
@@ -936,25 +909,25 @@
                       @click="msg.pendingExternalExecution.expanded = !(msg.pendingExternalExecution.expanded ?? (msg.pendingExternalExecution.status === 'pending'))"
                     >
                       <div class="flex min-w-0 flex-1 items-center gap-2">
-                        <div class="font-bold text-sky-900 dark:text-sky-100 shrink-0">
+                        <div class="font-bold text-primary-dark dark:text-sky-100 shrink-0">
                           {{ msg.pendingExternalExecution.title || '外部工具执行' }}
                         </div>
                         <!-- Collapsed summary preview -->
                         <span
                           v-if="!(msg.pendingExternalExecution.expanded ?? (msg.pendingExternalExecution.status === 'pending')) && (msg.pendingExternalExecution.tool_call?.name || msg.pendingExternalExecution.details)"
-                          class="min-w-0 flex-1 truncate text-[11px] text-sky-800/70 dark:text-sky-200/70 font-normal"
+                          class="min-w-0 flex-1 truncate text-[11px] text-primary-dark/70 dark:text-sky-200/70 font-normal"
                         >
                           {{ msg.pendingExternalExecution.tool_call?.name ? `${msg.pendingExternalExecution.tool_call.name}${msg.pendingExternalExecution.tool_call.args ? ': ' + JSON.stringify(msg.pendingExternalExecution.tool_call.args) : ''}` : msg.pendingExternalExecution.details }}
                         </span>
                       </div>
                       <div class="flex items-center gap-1.5 shrink-0">
-                        <span class="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
+                        <span class="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase bg-sky-100 text-primary-dark dark:bg-primary-dark/40 dark:text-sky-300">
                           {{ formatExternalExecutionStatus(msg.pendingExternalExecution.status) }}
                         </span>
                         <!-- Fold/Unfold Arrow -->
                         <button
                           type="button"
-                          class="flex h-5 w-5 items-center justify-center rounded text-sky-600 hover:text-sky-900 dark:text-sky-400 dark:hover:text-sky-200 transition-colors"
+                          class="flex h-5 w-5 items-center justify-center rounded text-primary hover:text-primary-dark dark:text-primary dark:hover:text-sky-200 transition-colors"
                           :aria-label="(msg.pendingExternalExecution.expanded ?? (msg.pendingExternalExecution.status === 'pending')) ? '收起执行' : '展开执行'"
                           @click.stop="msg.pendingExternalExecution.expanded = !(msg.pendingExternalExecution.expanded ?? (msg.pendingExternalExecution.status === 'pending'))"
                         >
@@ -973,14 +946,14 @@
 
                     <!-- Expanded Content -->
                     <div v-show="msg.pendingExternalExecution.expanded ?? (msg.pendingExternalExecution.status === 'pending')" class="mt-2">
-                      <div class="text-sky-800/80 dark:text-sky-200/80 break-words">
+                      <div class="text-primary-dark/80 dark:text-sky-200/80 break-words">
                         {{ msg.pendingExternalExecution.details }}
                       </div>
                       <div
                         v-if="msg.pendingExternalExecution.tool_call?.name"
-                        class="mt-2 rounded-md bg-white/70 dark:bg-gray-950/30 border border-sky-100 dark:border-sky-900/40 p-2 font-mono text-[10px] text-gray-600 dark:text-gray-300 overflow-x-auto max-h-56 overflow-y-auto"
+                        class="mt-2 rounded-md bg-white/70 dark:bg-gray-950/30 border border-sky-100 dark:border-primary-dark/40 p-2 font-mono text-[10px] text-gray-600 dark:text-gray-300 overflow-x-auto max-h-56 overflow-y-auto"
                       >
-                        <div class="font-semibold text-sky-900 dark:text-sky-200 mb-0.5">{{ msg.pendingExternalExecution.tool_call.name }}</div>
+                        <div class="font-semibold text-primary-dark dark:text-sky-200 mb-0.5">{{ msg.pendingExternalExecution.tool_call.name }}</div>
                         <pre v-if="msg.pendingExternalExecution.tool_call.args" class="whitespace-pre-wrap break-all font-mono">{{ JSON.stringify(msg.pendingExternalExecution.tool_call.args, null, 2) }}</pre>
                       </div>
                       <div v-if="msg.pendingExternalExecution.status === 'pending'" class="mt-3 space-y-2">
@@ -988,12 +961,12 @@
                           v-model="msg.pendingExternalExecution.outputDraft"
                           rows="4"
                           placeholder="在此粘贴客户端执行该工具后的输出结果..."
-                          class="w-full rounded-md border border-sky-200 dark:border-sky-800 bg-white/90 dark:bg-gray-950/40 px-3 py-2 text-xs text-gray-700 dark:text-gray-200"
+                          class="w-full rounded-md border border-sky-200 dark:border-primary-dark bg-white/90 dark:bg-gray-950/40 px-3 py-2 text-xs text-gray-700 dark:text-gray-200"
                         />
                         <button
                           @click="submitPendingExternalExecution(msg)"
                           :disabled="msg.pendingExternalExecution.isSubmitting"
-                          class="inline-flex items-center gap-1.5 rounded-md bg-sky-600 px-3 py-1.5 text-xs font-bold text-white shadow-sm hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-60"
+                          class="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-bold text-white shadow-sm hover:bg-primary-dark disabled:cursor-not-allowed disabled:opacity-60"
                         >
                           提交结果并继续
                         </button>
@@ -1054,8 +1027,28 @@
                                                                   </svg>
                                                                   <span>{{ msg.permissionNotice.message || '已按你的数据权限自动过滤结果' }}</span>
                                                                 </div>
+                                                                <!-- 提问轮补全正文：拆成「任务进度 / 待你确认」两个小节，默认展开、可收起 -->
+                                                                <template
+                                                                  v-if="questionBodyParts(msg) && !msg.groundingBlocked && !msg.datasetNavigation?.groups?.length"
+                                                                >
+                                                                  <UserQuestionBodyBlock
+                                                                    v-if="questionBodyParts(msg)?.progress"
+                                                                    label="任务进度"
+                                                                    tone="progress"
+                                                                    :text="questionBodyParts(msg)?.progress || ''"
+                                                                    :collapsed="msg.userQuestionProgressCollapsed === true"
+                                                                    @toggle="toggleUserQuestionBodyBlock(msg, 'progress')"
+                                                                  />
+                                                                  <UserQuestionBodyBlock
+                                                                    label="待你确认"
+                                                                    tone="pending"
+                                                                    :text="questionBodyParts(msg)?.question || ''"
+                                                                    :collapsed="msg.userQuestionPendingCollapsed === true"
+                                                                    @toggle="toggleUserQuestionBodyBlock(msg, 'pending')"
+                                                                  />
+                                                                </template>
                                                                 <MessageRenderer
-                                                                  v-if="!msg.groundingBlocked && !msg.datasetNavigation?.groups?.length"
+                                                                  v-else-if="!msg.groundingBlocked && !msg.datasetNavigation?.groups?.length"
                                                                   :content="visibleStreamBody(msg)"
                                                                   :theme="config.markdownTheme"
                                                                   :conversation-id="conversationId"
@@ -1101,6 +1094,7 @@
                 v-if="msg.userQuestion"
                 :payload="msg.userQuestion"
                 :disabled="isProcessing"
+                :summary-rendered="Boolean(questionBodyParts(msg))"
                 @submit="(payload) => submitUserQuestion(msg, payload)"
                 @option-action="handleUserQuestionOptionAction"
               />
@@ -1111,17 +1105,17 @@
                                   class="mt-2"
                                 >
                                   <span
-                                    class="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full bg-blue-200/55 dark:bg-blue-900/55 border border-blue-200/80 dark:border-blue-900/50 text-[11px] text-blue-600 dark:text-blue-300 select-none animate-fade-in align-middle backdrop-blur-sm shadow-sm"
+                                    class="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full bg-primary/20 dark:bg-primary-dark/55 border border-primary/20 dark:border-primary-dark/50 text-[11px] text-primary dark:text-primary-hover select-none animate-fade-in align-middle backdrop-blur-sm shadow-sm"
                                   >
-                                    <svg class="w-3 h-3 text-blue-500 animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24">
+                                    <svg class="w-3 h-3 text-primary animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24">
                                       <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"></circle>
                                       <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                                     </svg>
                                     <span>AI 还在思考，请稍后</span>
                                     <span class="inline-flex space-x-0.5 ml-0.5">
-                                      <span class="animate-bounce-dot text-blue-500 font-bold" style="animation-delay: 0s">.</span>
-                                      <span class="animate-bounce-dot text-blue-500 font-bold" style="animation-delay: 0.15s">.</span>
-                                      <span class="animate-bounce-dot text-blue-500 font-bold" style="animation-delay: 0.3s">.</span>
+                                      <span class="animate-bounce-dot text-primary font-bold" style="animation-delay: 0s">.</span>
+                                      <span class="animate-bounce-dot text-primary font-bold" style="animation-delay: 0.15s">.</span>
+                                      <span class="animate-bounce-dot text-primary font-bold" style="animation-delay: 0.3s">.</span>
                                     </span>
                                   </span>
                                 </div>
@@ -1413,7 +1407,7 @@
         class="absolute bottom-52 left-1/2 -translate-x-1/2 z-30"
       >        <button
           @click="scrollToBottom(true)"
-          class="flex items-center space-x-2 px-4 py-2.5 bg-primary text-white shadow-2xl shadow-primary/40 rounded-full text-xs font-black hover:-translate-y-0.5 active:scale-95 transition-all group"
+          class="flex items-center space-x-2 px-4 py-2.5 bg-primary text-white shadow-2xl shadow-primary/40 rounded-full text-xs font-bold hover:-translate-y-0.5 active:scale-95 transition-all group"
           :style="{ backgroundColor: 'var(--primary-color, #1677ff)' }"
         >
           <svg class="w-4 h-4 animate-bounce" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M19 13l-7 7-7-7" /></svg>
@@ -1603,7 +1597,7 @@
                 class="mb-2 flex items-start justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50/90 px-3 py-2 text-xs text-amber-900 dark:border-amber-500/30 dark:bg-amber-950/40 dark:text-amber-100"
               >
                 <div class="flex items-start gap-2 min-w-0">
-                  <span class="font-semibold shrink-0">⚠ 沙箱降级</span>
+                  <span class="font-semibold shrink-0">沙箱降级</span>
                   <span class="text-amber-800/90 dark:text-amber-200/80 break-words">{{ sandboxDegradedMessage }}</span>
                 </div>
                 <button
@@ -1781,13 +1775,13 @@
                       <!-- Watermark Number -->
                       <div
                           v-if="activeHistoryIndex >= 0"
-                          class="flex items-center justify-center w-5 h-5 rounded-full border flex-shrink-0 text-[9px] font-black select-none pointer-events-none -rotate-12 opacity-80"
+                          class="flex items-center justify-center w-5 h-5 rounded-full border flex-shrink-0 text-[9px] font-bold select-none pointer-events-none -rotate-12 opacity-80"
                           :style="{ color: `hsl(${(activeHistoryIndex * 137.5) % 360}, 70%, 50%)`, borderColor: `hsl(${(activeHistoryIndex * 137.5) % 360}, 70%, 40%, 0.3)` }"
                       >
                           {{ activeHistoryIndex + 1 }}
                       </div>
 
-                      <h3 class="text-sm sm:text-lg font-black text-gray-800 dark:text-gray-100 truncate">会话回溯详情</h3>
+                      <h3 class="text-sm sm:text-lg font-bold text-gray-800 dark:text-gray-100 truncate">会话回溯详情</h3>
                       <!-- 排查「两个窗口是不是同一个会话」时，界面上必须有个地方能看到会话 ID；
                            只露前 8 位（完整 UUID 会挤爆标题行），title 给全文，点击复制完整值。 -->
                       <button
@@ -1810,7 +1804,7 @@
                       <button
                           v-if="traceLogData"
                           @click.stop="continueChatFromTrace"
-                          class="flex items-center space-x-1.5 px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary hover:text-white rounded-lg transition-all text-xs font-black border border-primary/20"
+                          class="flex items-center space-x-1.5 px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary hover:text-white rounded-lg transition-all text-xs font-bold border border-primary/20"
                           title="加载此会话并继续聊天"
                       >
                           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1869,8 +1863,8 @@
                           >
                               <!-- Turn Header -->
                               <div class="flex justify-between items-center mb-4">
-                                  <span class="text-[10px] font-black text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
-                                      <span class="w-2 h-2 rounded-full bg-blue-500 shadow-sm shadow-blue-500/20"></span>
+                                  <span class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
+                                      <span class="w-2 h-2 rounded-full bg-primary shadow-sm shadow-primary/20"></span>
                                       对话回合 #{{ tIdx + 1 }}
                                   </span>
                                   <span class="text-[9px] text-gray-400 font-mono bg-gray-50 dark:bg-gray-700/50 px-2 py-0.5 rounded-full">{{ formatDate(turn.created_at) }}</span>
@@ -1879,13 +1873,13 @@
                               <!-- Q&A Content -->
                               <div class="space-y-4">
                                   <div>
-                                      <div class="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-2 opacity-70">提问 · Query</div>
+                                      <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2 opacity-70">提问 · Query</div>
                                       <div class="text-gray-800 dark:text-gray-200 text-sm font-bold leading-relaxed whitespace-pre-wrap bg-gray-50/50 dark:bg-gray-900/30 p-3 rounded-xl border border-gray-100 dark:border-gray-800">
                                           {{ turn.query || 'N/A' }}
                                       </div>
                                   </div>
                                   <div>
-                                      <div class="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-2 opacity-70">回答 · Response</div>
+                                      <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2 opacity-70">回答 · Response</div>
                                       <div class="text-gray-600 dark:text-gray-300 text-xs sm:text-sm leading-relaxed">
                                           <MessageRenderer
                                             :content="stripInternalContextBlocks(turn.summary || 'N/A')"
@@ -1904,7 +1898,7 @@
                                       @click="toggleTurnSteps(turn)"
                                       class="flex items-center justify-between w-full p-2.5 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-all group/btn"
                                   >
-                                      <div class="flex items-center space-x-2 text-[11px] font-black text-gray-500 group-hover/btn:text-primary transition-colors uppercase tracking-widest">
+                                      <div class="flex items-center space-x-2 text-[11px] font-bold text-gray-500 group-hover/btn:text-primary transition-colors uppercase tracking-widest">
                                           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
                                           <span>执行全链路 (Steps)</span>
                                           <span v-if="turn.steps?.length" class="bg-gray-100 dark:bg-gray-700 px-1.5 py-0.5 rounded text-[9px] font-mono">{{ turn.steps.length }}</span>
@@ -1926,19 +1920,19 @@
                                       <div v-if="turn.steps && turn.steps.length > 0" class="space-y-4">
                                           <div v-for="(step, sIdx) in turn.steps" :key="sIdx" class="relative group/step">
                                               <!-- Step Dot -->
-                                              <div class="absolute -left-[26px] top-1 w-5 h-5 rounded-full border border-gray-200 dark:border-gray-700 shadow-sm flex items-center justify-center text-[9px] font-black text-white z-10"
-                                                  :class="step.status === 'error' ? 'bg-amber-500' : 'bg-blue-500'">
+                                              <div class="absolute -left-[26px] top-1 w-5 h-5 rounded-full border border-gray-200 dark:border-gray-700 shadow-sm flex items-center justify-center text-[9px] font-bold text-white z-10"
+                                                  :class="step.status === 'error' ? 'bg-amber-500' : 'bg-primary'">
                                                   {{ Number(sIdx) + 1 }}
                                               </div>
                                               <!-- Step Card -->
                                               <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-3 shadow-sm">
                                                   <div class="flex justify-between items-center mb-2">
                                                       <div class="flex items-center gap-2">
-                                                          <span class="text-[9px] font-black px-1.5 py-0.5 rounded uppercase tracking-tighter"
-                                                              :class="step.event_type === 'thought' ? 'bg-blue-100 text-blue-700' : 'bg-purple-100 text-purple-700'">
+                                                          <span class="text-[9px] font-bold px-1.5 py-0.5 rounded uppercase tracking-tighter"
+                                                              :class="step.event_type === 'thought' ? 'bg-primary/5 text-primary' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300'">
                                                               {{ step.event_type }}
                                                           </span>
-                                                          <span v-if="step.tool_name" class="text-[9px] font-black text-purple-600 bg-purple-50 px-1.5 py-0.5 rounded">
+                                                          <span v-if="step.tool_name" class="text-[9px] font-bold text-primary bg-primary/5 px-1.5 py-0.5 rounded">
                                                               {{ step.tool_name }}
                                                           </span>
                                                       </div>
@@ -1946,7 +1940,7 @@
                                                   </div>
                                                   <div class="space-y-2">
                                                       <pre v-if="step.tool_input" class="bg-gray-50 dark:bg-gray-900 p-2 rounded-lg text-[9px] text-gray-500 overflow-x-auto font-mono border border-gray-100 dark:border-gray-800">{{ typeof step.tool_input === 'string' ? step.tool_input : JSON.stringify(step.tool_input, null, 2) }}</pre>
-                                                      <div v-if="step.tool_output && step.tool_output.content" class="text-[11px] text-gray-600 dark:text-gray-300 leading-relaxed bg-blue-50/20 p-2 rounded-lg border border-blue-100/10">
+                                                      <div v-if="step.tool_output && step.tool_output.content" class="text-[11px] text-gray-600 dark:text-gray-300 leading-relaxed bg-primary/5 p-2 rounded-lg border border-primary/10">
                                                           {{ step.tool_output.content }}
                                                       </div>
                                                   </div>
@@ -1961,7 +1955,7 @@
 
                               <!-- Indicator for current trace -->
                               <div v-if="turn.trace_id === traceLogData.trace_id" class="absolute top-0 right-0">
-                                  <div class="bg-primary text-white text-[8px] font-black px-2.5 py-1 rounded-bl-xl uppercase tracking-tighter shadow-sm animate-pulse">
+                                  <div class="bg-primary text-white text-[8px] font-bold px-2.5 py-1 rounded-bl-xl uppercase tracking-tighter shadow-sm animate-pulse">
                                       Current Turn
                                   </div>
                               </div>
@@ -2123,7 +2117,7 @@
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
               </div>
-              <h3 class="text-base font-black text-gray-800 dark:text-gray-100 uppercase tracking-widest">使用指南</h3>
+              <h3 class="text-base font-bold text-gray-800 dark:text-gray-100 uppercase tracking-widest">使用指南</h3>
             </div>
             <button type="button" aria-label="关闭使用指南" @click="showHelpModal = false" class="p-2 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-full transition-colors text-gray-400">
               <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12" /></svg>
@@ -2134,43 +2128,43 @@
           <div class="flex-1 overflow-y-auto p-6 space-y-8 custom-scrollbar">
             <!-- Intro -->
             <section>
-              <h4 class="text-xs font-black text-primary uppercase tracking-widest mb-3 flex items-center">
+              <h4 class="text-xs font-bold text-primary uppercase tracking-widest mb-3 flex items-center">
                  <span class="w-1.5 h-1.5 rounded-full bg-primary mr-2"></span>
                  系统简介
               </h4>
               <p class="text-sm text-gray-600 dark:text-gray-400 leading-relaxed font-medium">
-                🚀 欢迎使用<b>本智能体平台</b>。本系统是一个集成多模型能力的 🤖 AI 助手，旨在通过自然语言交互，帮助您高效完成<b>通用咨询问答</b>、📊 数据查询分析、📚 私有文档检索及 ⚙️ 复杂业务流程处理。
+                欢迎使用<b>本智能体平台</b>。本系统是一个集成多模型能力的 AI 助手，旨在通过自然语言交互，帮助您高效完成<b>通用咨询问答</b>、数据查询分析、私有文档检索及 复杂业务流程处理。
               </p>
             </section>
 
             <!-- Interaction -->
             <section>
-              <h4 class="text-xs font-black text-primary uppercase tracking-widest mb-4 flex items-center">
+              <h4 class="text-xs font-bold text-primary uppercase tracking-widest mb-4 flex items-center">
                  <span class="w-1.5 h-1.5 rounded-full bg-primary mr-2"></span>
                  如何交互
               </h4>
               <div class="grid grid-cols-1 gap-3">
                  <div class="p-3 bg-gray-50 dark:bg-gray-900/50 rounded-xl border border-gray-100 dark:border-gray-800 flex items-start space-x-3">
-                    <div class="px-2 py-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded text-xs font-mono text-blue-500 font-bold">/</div>
+                    <div class="px-2 py-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded text-xs font-mono text-primary font-bold">/</div>
                     <div>
-                      <div class="text-[11px] font-black text-gray-800 dark:text-gray-200 uppercase mb-0.5">快捷指令</div>
-                      <p class="text-[10px] text-gray-500 mb-2">Web 端支持<b>直接点击</b>快捷按钮；移动端输入斜杠 <span class="font-mono text-blue-500">/</span> 即可快速唤起。</p>
-                      <p class="text-[10px] text-gray-500 mb-2"><span class="font-mono text-blue-500">{{ DATASET_PORTAL_SLASH_COMMAND }}</span> 会基于与 ChatBI 相同的数据集目录，由 AI 生成我的数据门户与可点击追问按钮。</p>
+                      <div class="text-[11px] font-bold text-gray-800 dark:text-gray-200 uppercase mb-0.5">快捷指令</div>
+                      <p class="text-[10px] text-gray-500 mb-2">Web 端支持<b>直接点击</b>快捷按钮；移动端输入斜杠 <span class="font-mono text-primary">/</span> 即可快速唤起。</p>
+                      <p class="text-[10px] text-gray-500 mb-2"><span class="font-mono text-primary">{{ DATASET_PORTAL_SLASH_COMMAND }}</span> 会基于与 ChatBI 相同的数据集目录，由 AI 生成我的数据门户与可点击追问按钮。</p>
                       <div class="flex flex-wrap gap-1.5">
-                        <span class="px-1.5 py-0.5 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 text-[9px] rounded border border-blue-100 dark:border-blue-800 font-medium">{{ DATASET_PORTAL_SLASH_COMMAND }}</span>
-                        <span class="px-1.5 py-0.5 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 text-[9px] rounded border border-blue-100 dark:border-blue-800 font-medium">/new</span>
-                        <span class="px-1.5 py-0.5 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 text-[9px] rounded border border-blue-100 dark:border-blue-800 font-medium">/history</span>
+                        <span class="px-1.5 py-0.5 bg-primary/5 dark:bg-primary-dark/30 text-primary dark:text-primary text-[9px] rounded border border-primary/10 dark:border-primary-dark font-medium">{{ DATASET_PORTAL_SLASH_COMMAND }}</span>
+                        <span class="px-1.5 py-0.5 bg-primary/5 dark:bg-primary-dark/30 text-primary dark:text-primary text-[9px] rounded border border-primary/10 dark:border-primary-dark font-medium">/new</span>
+                        <span class="px-1.5 py-0.5 bg-primary/5 dark:bg-primary-dark/30 text-primary dark:text-primary text-[9px] rounded border border-primary/10 dark:border-primary-dark font-medium">/history</span>
                       </div>
                     </div>
                  </div>
                  <div class="p-3 bg-gray-50 dark:bg-gray-900/50 rounded-xl border border-gray-100 dark:border-gray-800 flex items-start space-x-3">
-                    <div class="px-2 py-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded text-xs font-mono text-purple-500 font-bold">@</div>
+                    <div class="px-2 py-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded text-xs font-mono text-primary font-bold">@</div>
                     <div>
-                      <div class="text-[11px] font-black text-gray-800 dark:text-gray-200 uppercase mb-0.5">提及专家</div>
-                      <p class="text-[10px] text-gray-500 mb-2">Web 端可<b>从专家列表点击</b>指定；移动端输入艾特符号 <span class="font-mono text-purple-500">@</span> 即可指定专业智能体。</p>
+                      <div class="text-[11px] font-bold text-gray-800 dark:text-gray-200 uppercase mb-0.5">提及专家</div>
+                      <p class="text-[10px] text-gray-500 mb-2">Web 端可<b>从专家列表点击</b>指定；移动端输入艾特符号 <span class="font-mono text-primary">@</span> 即可指定专业智能体。</p>
                       <div class="flex flex-wrap gap-1.5">
-                        <span class="px-1.5 py-0.5 bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 text-[9px] rounded border border-purple-100 dark:border-purple-800 font-medium">@运维专家</span>
-                        <span class="px-1.5 py-0.5 bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 text-[9px] rounded border border-purple-100 dark:border-purple-800 font-medium">@数据分析</span>
+                        <span class="px-1.5 py-0.5 bg-primary/5 dark:bg-primary-dark/30 text-primary dark:text-primary text-[9px] rounded border border-primary/10 dark:border-primary-dark font-medium">@运维专家</span>
+                        <span class="px-1.5 py-0.5 bg-primary/5 dark:bg-primary-dark/30 text-primary dark:text-primary text-[9px] rounded border border-primary/10 dark:border-primary-dark font-medium">@数据分析</span>
                       </div>
                     </div>
                  </div>
@@ -2179,14 +2173,14 @@
 
             <!-- Features -->
             <section>
-              <h4 class="text-xs font-black text-primary uppercase tracking-widest mb-4 flex items-center">
+              <h4 class="text-xs font-bold text-primary uppercase tracking-widest mb-4 flex items-center">
                  <span class="w-1.5 h-1.5 rounded-full bg-primary mr-2"></span>
                  支持功能与示例 (点击可复制)
               </h4>
               <div class="space-y-4">
                  <div class="group">
                     <div class="flex items-start space-x-3 mb-2">
-                      <div class="p-2 bg-indigo-50 dark:bg-indigo-900/20 rounded-lg text-indigo-500">
+                      <div class="p-2 bg-primary/5 dark:bg-primary-dark/20 rounded-lg text-primary">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" /></svg>
                       </div>
                       <div>
@@ -2203,7 +2197,7 @@
                           @click="handleQuickQuestion('帮我写一个关于机房节能降耗的宣传文案。'); showHelpModal = false;"
                           class="px-1.5 py-0.5 bg-primary text-white text-[9px] rounded opacity-0 group-hover/item:opacity-100 hover:scale-105 transition-all flex items-center shadow-sm"
                         >
-                          🚀 试一试
+                          试一试
                         </button>
                         <div class="transition-all duration-300">
                           <svg v-if="copiedId === 'help_chat'" class="w-3.5 h-3.5 text-emerald-500 scale-110" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
@@ -2215,7 +2209,7 @@
 
                  <div class="group">
                     <div class="flex items-start space-x-3 mb-2">
-                      <div class="p-2 bg-blue-50 dark:bg-blue-900/20 rounded-lg text-blue-500">
+                      <div class="p-2 bg-primary/5 dark:bg-primary-dark/20 rounded-lg text-primary">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
                       </div>
                       <div>
@@ -2232,7 +2226,7 @@
                           @click="handleQuickQuestion('查询上海区域所有机房的剩余机柜数'); showHelpModal = false;"
                           class="px-1.5 py-0.5 bg-primary text-white text-[9px] rounded opacity-0 group-hover/item:opacity-100 hover:scale-105 transition-all flex items-center shadow-sm"
                         >
-                          🚀 试一试
+                          试一试
                         </button>
                         <div class="transition-all duration-300">
                           <svg v-if="copiedId === 'help_bi'" class="w-3.5 h-3.5 text-emerald-500 scale-110" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
@@ -2261,7 +2255,7 @@
                           @click="handleQuickQuestion('本周的 CS 和 ops 工单有哪些？'); showHelpModal = false;"
                           class="px-1.5 py-0.5 bg-primary text-white text-[9px] rounded opacity-0 group-hover/item:opacity-100 hover:scale-105 transition-all flex items-center shadow-sm"
                         >
-                          🚀 试一试
+                          试一试
                         </button>
                         <div class="transition-all duration-300">
                           <svg v-if="copiedId === 'help_kb'" class="w-3.5 h-3.5 text-emerald-500 scale-110" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
@@ -2290,7 +2284,7 @@
                           @click="handleQuickQuestion('查询最近 1 小时的网络延迟报警，并写一封邮件告知运维团队。'); showHelpModal = false;"
                           class="px-1.5 py-0.5 bg-primary text-white text-[9px] rounded opacity-0 group-hover/item:opacity-100 hover:scale-105 transition-all flex items-center shadow-sm"
                         >
-                          🚀 试一试
+                          试一试
                         </button>
                         <div class="transition-all duration-300">
                           <svg v-if="copiedId === 'help_task'" class="w-3.5 h-3.5 text-emerald-500 scale-110" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
@@ -2304,7 +2298,7 @@
 
             <!-- Typical Scenarios -->
             <section>
-              <h4 class="text-xs font-black text-primary uppercase tracking-widest mb-4 flex items-center">
+              <h4 class="text-xs font-bold text-primary uppercase tracking-widest mb-4 flex items-center">
                  <span class="w-1.5 h-1.5 rounded-full bg-primary mr-2"></span>
                  常见场景 (点击可复制)
               </h4>
@@ -2322,7 +2316,7 @@
                         @click="handleQuickQuestion('查看 B7 机房最近的所有高压报警，并给出可能的根本原因分析。'); showHelpModal = false;"
                         class="px-1.5 py-0.5 bg-primary text-white text-[9px] rounded opacity-0 group-hover/scenario:opacity-100 hover:scale-105 transition-all shadow-sm"
                       >
-                        🚀 试一试
+                        试一试
                       </button>
                       <div class="transition-all duration-300">
                         <svg v-if="copiedId === 'help_scenario_fault'" class="w-4 h-4 text-emerald-500 scale-110" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
@@ -2343,7 +2337,7 @@
                         @click="handleQuickQuestion('统计各机房昨天的监控指标数据量，并进行分析。'); showHelpModal = false;"
                         class="px-1.5 py-0.5 bg-primary text-white text-[9px] rounded opacity-0 group-hover/scenario:opacity-100 hover:scale-105 transition-all shadow-sm"
                       >
-                        🚀 试一试
+                        试一试
                       </button>
                       <div class="transition-all duration-300">
                         <svg v-if="copiedId === 'help_scenario_inspect'" class="w-4 h-4 text-emerald-500 scale-110" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
@@ -2364,7 +2358,7 @@
                         @click="handleQuickQuestion('查找 2024 年 Q4 季度的所有变更审批记录，汇总为表格。'); showHelpModal = false;"
                         class="px-1.5 py-0.5 bg-primary text-white text-[9px] rounded opacity-0 group-hover/scenario:opacity-100 hover:scale-105 transition-all shadow-sm"
                       >
-                        🚀 试一试
+                        试一试
                       </button>
                       <div class="transition-all duration-300">
                         <svg v-if="copiedId === 'help_scenario_audit'" class="w-4 h-4 text-emerald-500 scale-110" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
@@ -2380,7 +2374,7 @@
           <div class="px-6 py-4 border-t border-gray-100 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 flex justify-end">
             <button
               @click="showHelpModal = false"
-              class="px-6 py-2 bg-primary text-white text-xs font-black uppercase tracking-widest rounded-xl hover:opacity-90 transition-all shadow-lg shadow-primary/20"
+              class="px-6 py-2 bg-primary text-white text-xs font-bold uppercase tracking-widest rounded-xl hover:opacity-90 transition-all shadow-lg shadow-primary/20"
               :style="{ backgroundColor: 'var(--primary-color, #1677ff)' }"
             >
               我明白了
@@ -2407,37 +2401,7 @@
         <div class="p-4 space-y-4">
           <div>
             <label class="block text-[10px] font-bold text-gray-400 uppercase mb-1">显示名称</label>
-            <input v-model="newCommand.label" type="text" placeholder="如：🏢 查机房" class="w-full text-sm bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 outline-none focus:ring-1 focus:ring-primary transition-all dark:text-gray-100 disabled:bg-gray-100" />
-          </div>
-          <div>
-            <label class="block text-[10px] font-bold text-gray-400 uppercase mb-1">指令内容</label>
-            <textarea v-model="newCommand.command" rows="2" placeholder="输入要发送给 AI 的文字..." class="w-full text-sm bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 outline-none focus:ring-1 focus:ring-primary transition-all dark:text-gray-100 resize-none disabled:bg-gray-100"></textarea>
-          </div>
-          <button @click="addCommand" :disabled="!newCommand.label || !newCommand.command" class="w-full py-2.5 bg-primary text-white text-sm font-bold rounded-lg hover:opacity-90 disabled:opacity-50 transition-all shadow-md shadow-primary/20" :style="{ backgroundColor: 'var(--primary-color, #1677ff)' }">
-            添加指令
-          </button>
-        </div>
-      </div>
-    </div>
-    <!-- Modal: Add Command -->
-    <div
-      v-if="showAddModal"
-      class="absolute inset-0 z-50 flex items-center justify-center bg-black/20 backdrop-blur-sm p-4"
-      @click.self="showAddModal = false"
-    >
-      <div class="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-sm overflow-hidden animate-fade-in-up border border-gray-200 dark:border-gray-700">
-        <div class="px-4 py-3 border-b border-gray-100 dark:border-gray-700 flex items-center justify-between bg-gray-50 dark:bg-gray-800/50">
-          <h3 class="text-sm font-bold text-gray-800 dark:text-gray-200">新建快捷指令</h3>
-          <button type="button" aria-label="关闭新建快捷指令" @click="showAddModal = false" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
-        <div class="p-4 space-y-4">
-          <div>
-            <label class="block text-[10px] font-bold text-gray-400 uppercase mb-1">显示名称</label>
-            <input v-model="newCommand.label" type="text" placeholder="如：🏢 查机房" class="w-full text-sm bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 outline-none focus:ring-1 focus:ring-primary transition-all dark:text-gray-100 disabled:bg-gray-100" />
+            <input v-model="newCommand.label" type="text" placeholder="如：查机房" class="w-full text-sm bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 outline-none focus:ring-1 focus:ring-primary transition-all dark:text-gray-100 disabled:bg-gray-100" />
           </div>
           <div>
             <label class="block text-[10px] font-bold text-gray-400 uppercase mb-1">指令内容</label>
@@ -2455,6 +2419,7 @@
       :loading="loadingStats"
       :stats="currentStats"
       :expanded="expandedStats"
+      :image-usage="currentImageUsage"
       @close="showStatsModal = false"
       @toggle="toggleStatExpand"
     />
@@ -2549,9 +2514,9 @@
         class="absolute inset-0 flex flex-col items-center justify-center bg-white/70 dark:bg-gray-900/80 backdrop-blur-[2px] p-6 text-center"
         data-testid="embed-awaiting-mask"
       >
-        <div class="p-4 bg-blue-50 dark:bg-blue-900/10 rounded-full mb-4">
+        <div class="p-4 bg-primary/5 dark:bg-primary-dark/10 rounded-full mb-4">
           <svg
-            class="w-12 h-12 text-blue-500 animate-spin"
+            class="w-12 h-12 text-primary animate-spin"
             fill="none"
             viewBox="0 0 24 24"
           >
@@ -2662,6 +2627,13 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted, nextTick, watch, computed } from "vue";
 import { CommandLineIcon } from "@heroicons/vue/24/outline";
+import {
+  BookOpenIcon,
+  ChartBarIcon,
+  CircleStackIcon,
+  Cog6ToothIcon,
+  DocumentIcon,
+} from "@heroicons/vue/24/outline";
 import { useRouter } from "vue-router";
 import axios from "@/utils/axios";
 import { finalizeConversation } from "@/utils/conversationFinalize";
@@ -2676,7 +2648,7 @@ import { shouldStartConversationHistoryLoad } from "@/utils/conversationHistoryR
 import { FIRST_SCREEN_SKELETON_TIMEOUT_MS, shouldStartThreadSkeleton, threadSkeletonRemainingVisibleMs } from "@/utils/embedFirstScreen";
 import { isApiSuccess } from "@/utils/apiEnvelope";
 import { isSkillForbidden } from "@/utils/skillForbidden";
-import { planHistorySync, shouldKeepRecoverySync } from "@/utils/runRecoverySync";
+import { isSuspendedHistoryStatus, planHistorySync, shouldKeepRecoverySync } from "@/utils/runRecoverySync";
 import { computePinnedDrawerLayout } from "@/utils/pinnedDrawerLayout";
 import { planRecoveryCard, type RecoveryCardState } from "@/utils/recoveryCard";
 import {
@@ -2815,6 +2787,7 @@ import ToolPermissionCard from "@/components/chat/ToolPermissionCard.vue";
 import GroundingBlockedCard from "@/components/GroundingBlockedCard.vue";
 import BusinessConfirmationCard from "@/components/BusinessConfirmationCard.vue";
 import UserQuestionCard from "@/components/UserQuestionCard.vue";
+import UserQuestionBodyBlock from "@/components/chat/UserQuestionBodyBlock.vue";
 import DatasetCapabilityMenu from "@/components/chatbi/DatasetCapabilityMenu.vue";
 import DatasetPortalDrawer from "@/components/chatbi/DatasetPortalDrawer.vue";
 import ChatBIInsightPanel from "@/components/chatbi/ChatBIInsightPanel.vue";
@@ -2843,8 +2816,10 @@ import { useKnowledgePortal } from "@/composables/useKnowledgePortal";
 import CitationPopover from "@/components/CitationPopover.vue";
 import { copyToClipboard as copyTextSecure } from "@/utils/clipboard";
 import {
+  formatImageUsageLine,
   formatTokenUsageAmount,
   formatTokenUsageTooltip,
+  type MessageImageUsage,
 } from "@/utils/tokenFormat";
 import {
   applyStreamErrorMessage,
@@ -2970,6 +2945,7 @@ import {
 } from "@/composables/chat/useChatHistoryGroups";
 import { usePinnedConversations } from "@/composables/chat/usePinnedConversations";
 import {
+  accumulateImageUsage,
   applyStreamTraceId,
   appendAssistantBodyDelta,
   createBufferedStreamEventPump,
@@ -2987,11 +2963,19 @@ import {
   type GroundingBlockedAction,
   type GroundingBlockedPayload,
 } from "@/utils/agentscopeSseHandlers";
-import { hydrateHistoryProcessTimeline, resolveBannerTodoTimeline, settlePendingTimelineSteps, timelineHasPending } from "@/utils/processTimeline";
+import {
+  createResumeSeqNormalizer,
+  hydrateHistoryProcessTimeline,
+  maxTimelineSeq,
+  resolveBannerTodoTimeline,
+  settlePendingTimelineSteps,
+  timelineHasPending,
+} from "@/utils/processTimeline";
 import { resolveImagePlaceholder } from "@/utils/imageGenerationPlaceholder";
 import { normalizeSubagentTraceMeta, type SubagentTraceMeta } from "@/utils/subagentTrace";
 import {
   buildBusinessConfirmationUserMessage,
+  businessConfirmationStatesFromTimeline,
   type BusinessConfirmationField,
   type BusinessConfirmationState,
 } from "@/utils/businessConfirmation";
@@ -3000,7 +2984,9 @@ import {
   buildUserQuestionUserMessage,
   markUserQuestionTimelineResolved,
   parseUserQuestionReceipt,
+  splitUserQuestionBody,
   userQuestionStatesFromTimeline,
+  type UserQuestionBodyParts,
   type UserQuestionReceipt,
   type UserQuestionState,
 } from "@/utils/userQuestion";
@@ -3011,7 +2997,9 @@ interface LogEntry {
   name?: string;
   title: string;
   details: string;
-  status: "pending" | "success" | "error";
+  // 与 AgentStreamLog / ProcessTimelineStatus 对齐：被用户中止的挂起行以
+  // "interrupted" 落定（settlePendingConfirmationLocally 与终态收尾都用它）。
+  status: "pending" | "success" | "error" | "interrupted";
   error_reason?: string;
   isExpanded: boolean;
   isRouter?: boolean;
@@ -3089,7 +3077,9 @@ interface ChatSendOverrides {
 interface QuickQuestionContext {
   source: "chatbi_result";
   result_id?: string;
-  requires_fresh_data: true;
+  // 与 MessageRenderer 的 quickContext 对齐：那边声明的是 boolean，
+  // 写死成 true 会让「带快捷上下文的问题」这件事在类型上对不上
+  requires_fresh_data: boolean;
 }
 
 interface QuickQuestionPayload {
@@ -3160,6 +3150,11 @@ interface Message {
   processTimeline?: import("@/utils/processTimeline").ProcessTimelineItem[];
   isProcessNarrationExpanded?: boolean;
   isCitationsExpanded?: boolean;
+  /**
+   * 本次工具调用的生效超时秒数（后端 `agent_max_toolcall_timeout_seconds` 三级解析后的值）。
+   * agentscopeSseHandlers 在收到 run_config 时写到消息上，时间线据此显示「超时 x 秒」。
+   */
+  agentMaxToolcallTimeoutSeconds?: number;
   thoughtStartTime?: number;
   thoughtDuration?: string;
   thinkingText?: string;
@@ -3178,6 +3173,8 @@ interface Message {
   completion_tokens?: number;
   total_tokens?: number;
   feedback?: "up" | "down" | null;
+  /** 历史接口或终态事件回传的轮次状态（用于区分可恢复挂起态与真正终态）。 */
+  status?: string;
   timestamp?: string;
   isTimeLabel?: boolean;
   pendingPermission?: PendingToolPermission;
@@ -3201,6 +3198,10 @@ interface Message {
   };
   businessConfirmation?: BusinessConfirmationState;
   userQuestion?: UserQuestionState;
+  /** 补全正文拆成小节时，「任务进度」小节是否被用户收起（默认展开）。 */
+  userQuestionProgressCollapsed?: boolean;
+  /** 补全正文拆成小节时，「待你确认」小节是否被用户收起（默认展开）。 */
+  userQuestionPendingCollapsed?: boolean;
   _hasSilentlyRefreshed?: boolean;
 }
 
@@ -3253,6 +3254,41 @@ function visibleStreamBody(msg: Message): string {
     : content;
   streamBodyCache.set(msg, { content, role: msg.role, result });
   return result;
+}
+
+/**
+ * 提问轮补全正文的拆分结果缓存。
+ *
+ * 模板要按它决定「渲染两个小节还是普通正文」，一次渲染会取值多次；正文可能上千字，
+ * 每帧重跑前缀/后缀比较没有必要，按「正文 + 提问卡字段」做 key 缓存一份。
+ */
+const questionBodyCache = new WeakMap<
+  object,
+  { key: string; parts: UserQuestionBodyParts | null }
+>();
+
+/**
+ * 这条消息的正文是不是「提问轮补全模板」的产物；是则给出进度与问句两段。
+ *
+ * 拆分口径见 `splitUserQuestionBody`：内容取提问卡的结构化字段，正文只用来确认身份。
+ * 认不出时返回 null，正文照常走 markdown 渲染 —— 宁可重复，不能把正常回答误拆。
+ */
+function questionBodyParts(msg: Message): UserQuestionBodyParts | null {
+  const content = visibleStreamBody(msg);
+  const key = `${content}\u0000${msg.userQuestion?.question_id || ""}\u0000${msg.userQuestion?.context || ""}`;
+  const cached = questionBodyCache.get(msg);
+  if (cached && cached.key === key) return cached.parts;
+  const parts = splitUserQuestionBody(content, msg.userQuestion);
+  questionBodyCache.set(msg, { key, parts });
+  return parts;
+}
+
+function toggleUserQuestionBodyBlock(msg: Message, which: "progress" | "pending"): void {
+  if (which === "pending") {
+    msg.userQuestionPendingCollapsed = msg.userQuestionPendingCollapsed !== true;
+  } else {
+    msg.userQuestionProgressCollapsed = msg.userQuestionProgressCollapsed !== true;
+  }
 }
 
 const skillFlowBadgeLogVersion = new WeakMap<object, number>();
@@ -3441,7 +3477,14 @@ const getMessageTokenAmount = (msg: any): string => {
 };
 
 const getMessageTokenTooltip = (msg: any): string => {
-  return formatTokenUsageTooltip(msg?.prompt_tokens, msg?.completion_tokens, msg?.total_tokens);
+  // 图片消耗由 formatTokenUsageTooltip 单独一行带出：它不计入 total_tokens
+  // （那个数驱动月度配额），但用户得知道这条消息还花了图片钱。
+  return formatTokenUsageTooltip(
+    msg?.prompt_tokens,
+    msg?.completion_tokens,
+    msg?.total_tokens,
+    formatImageUsageLine(msg?.image_usage),
+  );
 };
 // --- State ---
 const messages = ref<Message[]>([]);
@@ -3874,6 +3917,8 @@ const attachedMemoryConversationIds = computed(() => {
 const showStatsModal = ref(false);
 const loadingStats = ref(false);
 const currentStats = ref<any[]>([]);
+/** 打开明细弹窗时对应消息的图片消耗，随 currentStats 一起切换。 */
+const currentImageUsage = ref<MessageImageUsage | null>(null);
 const expandedStats = ref<Record<string, boolean>>({});
 
 const toggleStatExpand = (callIndex: number) => {
@@ -4041,6 +4086,21 @@ const openEmbedTrace = (traceId: string) => {
 // @conversation-scoped: isProcessing
 const isProcessing = ref(false);
 /**
+ * 子智能体授权交接锁：确认流拿到 `subagent_permission_handoff` 并在收尾阶段
+ * 异步把续聊指令发回父会话之前，保持输入框锁定，避免出现短暂释放/聚焦空窗。
+ */
+// @conversation-scoped: subagentHandoffPending
+const subagentHandoffPending = ref(false);
+// 子智能体交接轮询代次：主动停止或切会话时自增，正在 300ms 等待中的 dispatchResumeDirective 立即作废。
+// @conversation-scoped: handoffGeneration
+let handoffGeneration = 0;
+const hasActivePendingPermission = () =>
+  messages.value.some(
+    (item: Message) =>
+      item.pendingPermission?.status === "pending"
+      || item.pendingExternalExecution?.status === "pending",
+  );
+/**
  * 有待处理确认卡时保持锁定。
  *
  * 挂起确认意味着后端这一轮已经停在「等你点按钮」上：interrupt 之后 SSE 流结束、
@@ -4049,12 +4109,16 @@ const isProcessing = ref(false);
  * 由卡片上的「放弃本轮」显式解除。
  */
 const pendingPermissionLocking = computed(() =>
-  messages.value.some(
-    (item: Message) =>
-      item.pendingPermission?.status === "pending"
-      || item.pendingExternalExecution?.status === "pending",
-  ),
+  subagentHandoffPending.value || hasActivePendingPermission(),
 );
+// 指向 onMounted 内 `clearVisibilitySyncTimer` 的清理句柄：新流 / 恢复流启动或切会话时
+// 立即取消残留的 1.5s 历史同步轮询，防止旧轮询在重试耗尽时误清当前流的锁态。
+let cancelPendingHistorySync: () => void = () => {};
+// 待复活的「被中断恢复轮」观察者（见 restoreEmbedStreamSnapshot）：run 还在后台跑时
+// 不能立刻把卡片翻回「待确认」，得等它收敛。同一会话反复恢复快照会叠加多个观察者，
+// 它们会在收敛时对同一张卡片重复复活（用户刚点完提交又被翻回待确认），所以每次
+// 重建前先停掉上一个。
+let stopPendingReviveWatch: (() => void) | null = null;
 // 流式读取是否在途：用于区分「流仍在读」与「流已死但界面还挂着 busy」。
 // @conversation-scoped: streamInFlight
 let streamInFlight = false;
@@ -4097,7 +4161,7 @@ const usesLegacyUrlToken = ref(false);
  * 于是「清掉 URL 里的凭据 → 刷新即失效」；同时 Cookie 是整浏览器一个槽，多个嵌入实例
  * 会互相覆盖，刷新后可能变成另一个用户。
  *
- * ⚠️ 隔离粒度必须说准：sessionStorage 的边界是 **tab + origin**，不是 iframe。
+ * 隔离粒度必须说准：sessionStorage 的边界是 **tab + origin**，不是 iframe。
  * 同一 tab 里的多个**同源** iframe 共享同一个 sessionStorage。平台明确支持一页多实例
  * （`instance_id` 正是为此而生：会话 ID、消息归属都按它分桶），因此存储键也必须带
  * `instance_id`——否则同页两个实例会互相覆盖，A 刷新后读到 B 的令牌，照样串号。
@@ -4161,7 +4225,7 @@ const clearEmbedSession = (): void => {
 /** 从地址栏移除凭据（长期 Key 或一次性 Ticket），避免其残留在浏览器历史、录屏与
  * 分享链接中。
  *
- * ⚠️ **只能在确认「刷新有凭据可依」后调用**，即满足以下任一条：
+ * **只能在确认「刷新有凭据可依」后调用**，即满足以下任一条：
  *   - 本 tab 已把会话令牌写入 sessionStorage（`persistEmbedSession` 返回真）——
  *     跨站 iframe 同样成立，这是主要的判定依据；
  *   - 后端确认已下发 `embed_session` Cookie（`session_cookie_issued`）——同站场景。
@@ -5182,6 +5246,16 @@ const onModeChange = (mode: string) => {
 };
 const conversationId = ref("");
 /**
+ * 组件是否已卸载：延迟发送（如子智能体的续聊指令轮询）必须据此收手。
+ *
+ * 卸载后 `conversationId` 还在、值也没变，只比对会话 ID 检测不到「页面已经走了」，
+ * 定时器里的 `sendMessage` 会对着一个已销毁的界面发请求。
+ */
+const embedDisposed = ref(false);
+onUnmounted(() => {
+  embedDisposed.value = true;
+});
+/**
  * 临时历史条目的时间锚点：切换会话时重置。
  *
  * 不能每次都取「现在」——`pendingHistoryItem` 会因为任意依赖变化重算，时间戳跟着跳动，
@@ -5479,7 +5553,7 @@ const resourceModalOptionSelected = (type: ResourceScopeGroupKey, option: any) =
   modalDraftSelections(type).some((item) => resourceEntryMatchesOption(item, option));
 
 const resourceOptionInitial = (option: any) => String(option.name || option.id || '?').trim().charAt(0).toUpperCase();
-const resourceOptionAccent = (index: number) => ['bg-teal-500', 'bg-lime-500', 'bg-violet-500', 'bg-green-500', 'bg-sky-500'][index % 5] || 'bg-teal-500';
+const resourceOptionAccent = (index: number) => ['bg-primary', 'bg-lime-500', 'bg-violet-500', 'bg-green-500', 'bg-teal-500'][index % 5] || 'bg-primary';
 
 const filteredResourceOptions = (type: ResourceScopeGroupKey) => {
   const query = (resourceOptionSearch[type] || '').trim().toLowerCase();
@@ -6193,10 +6267,11 @@ let activeStreamDraft: {
   msg: Message;
   lastAppliedSeq?: number;
   /**
-   * 本轮正文由「不写事件日志的恢复流」（权限确认 / 外部执行恢复）写出。
+   * 本轮正文由恢复流（权限确认 / 外部执行恢复）独占写出。
    *
-   * 这类流只转发 SSE，事件日志里仍只有挂起前的事件；此时按日志首拉重建会把恢复流
-   * 刚写出的正文换回挂起前的旧内容（内容回退）。置位后本轮不再启动续显。
+   * 虽然恢复流现在也写事件日志（且保留 `:seq`），但高频增量帧（`answer_delta` /
+   * `reasoning_content`）走合并窗口、实时 SSE 帧发出时尚未带序号，前端无法精确推进
+   * `lastAppliedSeq`。因此恢复期仍暂不启用事件续显（避免重放叠字），等落库终态同步收敛。
    */
   resumeOwned?: boolean;
 } | null = null;
@@ -6213,6 +6288,8 @@ const currentStreamAgentMessage = (): Message | null => {
   if (activeStreamDraft?.msg) return activeStreamDraft.msg;
   for (let index = messages.value.length - 1; index >= 0; index -= 1) {
     const candidate = messages.value[index];
+    // index 从 length-1 递减，越界不可能；守卫只为让索引访问的类型成立
+    if (!candidate) continue;
     // 首屏历史末尾是 system 分隔符（"以上是历史会话…"），不是本轮助手消息；
     // 收尾绝不能落到它身上。
     if (candidate.role === "system") continue;
@@ -6224,7 +6301,8 @@ const currentStreamAgentMessage = (): Message | null => {
 
 const currentStreamUserMessage = (): Message | undefined => {
   for (let index = messages.value.length - 1; index >= 0; index -= 1) {
-    if (messages.value[index].role === "user") return messages.value[index];
+    const candidate = messages.value[index];
+    if (candidate?.role === "user") return candidate;
   }
   return undefined;
 };
@@ -6350,12 +6428,80 @@ const restoreEmbedStreamSnapshot = async (expectedGeneration?: number) => {
     }
 
     const traceId = String(snapshot.traceId || "").trim();
-    const terminalAlreadyVisible = traceId
-      ? messages.value.some(message => message.role === "agent" && message.trace_id === traceId)
-      : false;
-    if (terminalAlreadyVisible) {
-      // 落库终态已经在界面上，草稿没有价值。
-      clearStreamSnapshot(cid);
+    const existingAgent = traceId
+      ? messages.value.find(message => message.role === "agent" && message.trace_id === traceId)
+      : undefined;
+    if (existingAgent) {
+      const existingSuspended = isSuspendedHistoryStatus(existingAgent.status);
+      const snapshotHasResumableCard = Boolean(
+        snapshot.draft?.pendingPermission
+        || snapshot.draft?.pendingExternalExecution
+        || snapshot.resumeOwned === true,
+      );
+      if (!existingSuspended || !snapshotHasResumableCard) {
+        // 落库终态已经在界面上（或已无待恢复卡片/恢复流草稿），草稿没有价值。
+        clearStreamSnapshot(cid);
+        return;
+      }
+      // 挂起轮（awaiting_permission / awaiting_external_execution）会当场落库以防放弃后
+      // 丢历史，刷新时首屏历史会先渲染出同 trace_id 的挂起消息（不含可点审批卡）。此时
+      // 不能清掉快照，应原地把待确认卡片与恢复流增量挂回该条消息，既无重复气泡、又保留
+      // 继续审批与断线恢复能力。
+      existingAgent.isHistory = false;
+      if (snapshot.draft?.pendingPermission && !existingAgent.pendingPermission) {
+        existingAgent.pendingPermission =
+          snapshot.draft.pendingPermission as unknown as Message["pendingPermission"];
+      }
+      if (snapshot.draft?.pendingExternalExecution && !existingAgent.pendingExternalExecution) {
+        existingAgent.pendingExternalExecution =
+          snapshot.draft.pendingExternalExecution as unknown as Message["pendingExternalExecution"];
+      }
+      if (snapshot.resumeOwned === true) {
+        if (
+          snapshot.draft?.content
+          && snapshot.draft.content.length > String(existingAgent.content || "").length
+        ) {
+          existingAgent.content = snapshot.draft.content;
+        }
+        if (
+          snapshot.draft?.reasoningContent
+          && snapshot.draft.reasoningContent.length > String(existingAgent.reasoningContent || "").length
+        ) {
+          existingAgent.reasoningContent = snapshot.draft.reasoningContent;
+        }
+        if (
+          Array.isArray(snapshot.draft?.processTimeline)
+          && snapshot.draft.processTimeline.length > (existingAgent.processTimeline?.length || 0)
+        ) {
+          existingAgent.processTimeline =
+            snapshot.draft.processTimeline as Message["processTimeline"];
+        }
+        if (remoteRunActive.value) {
+          stopPendingReviveWatch?.();
+          stopPendingReviveWatch = watch(() => remoteRunActive.value, (active) => {
+            if (active) return;
+            stopPendingReviveWatch?.();
+            stopPendingReviveWatch = null;
+            reviveInterruptedResumeCards(existingAgent);
+          });
+        } else {
+          reviveInterruptedResumeCards(existingAgent);
+        }
+        activeStreamDraft = {
+          conversationId: cid,
+          msg: existingAgent,
+          lastAppliedSeq: Number(snapshot.lastSeq || 0) || 0,
+          resumeOwned: true,
+        };
+        recoveryGraceExpired.value = false;
+        refreshRecoveryCard();
+        streamReplayCursor.value = {
+          lastSeq: Number(snapshot.lastSeq || 0) || 0,
+          traceId: String(snapshot.traceId || ""),
+        };
+      }
+      await nextTick();
+      scrollToBottom(true);
       return;
     }
 
@@ -6409,7 +6555,22 @@ const restoreEmbedStreamSnapshot = async (expectedGeneration?: number) => {
       // 恢复轮被中断了，后端挂起快照还在（见 resume.py「跑完才消费」）。把被恢复流
       // 改成「已批准 / 已完成」的卡片复活，用户可以直接重试。
       if (snapshot.resumeOwned === true && traceId) {
-        reviveInterruptedResumeCards(restoredAgent);
+        const reviveTarget = restoredAgent;
+        if (remoteRunActive.value) {
+          // 后端这一轮其实**还在跑**：恢复流是有后台 producer 的（见 chat.py 的
+          // `_build_resume_background_sse_response`），客户端断线并不会让它停下。
+          // 此刻把卡片翻回「待确认」，用户点下去只会撞上恢复互斥，而真正的事件
+          // 仍在往这条消息上流。等 run 真正收敛后再复活。
+          stopPendingReviveWatch?.();
+          stopPendingReviveWatch = watch(() => remoteRunActive.value, (active) => {
+            if (active) return;
+            stopPendingReviveWatch?.();
+            stopPendingReviveWatch = null;
+            reviveInterruptedResumeCards(reviveTarget);
+          });
+        } else {
+          reviveInterruptedResumeCards(restoredAgent);
+        }
       }
       restored.push(restoredAgent);
     }
@@ -6534,7 +6695,8 @@ const pollConversationStreamEvents = async () => {
     // 草稿槽被清空后恢复器/输入锁判据要立刻跟上，避免残留的 recoveryPending 继续轮询。
     refreshRecoveryCard();
   }
-  // 本轮正文由恢复流（不写事件日志）写出：日志无法描述它，重放只会把正文重建回挂起前。
+  // 本轮正文由恢复流独占写出：高频增量帧实时下发时不带序号、无法精确推进 lastAppliedSeq，
+  // 暂不启用事件续显以避免正文重复，等落库终态同步收敛。
   if (activeStreamDraft?.resumeOwned) return;
   streamReplayInFlight = true;
   try {
@@ -6659,7 +6821,8 @@ const scheduleStreamReplay = () => {
   }
   clearStreamReplayTimer();
   if (document.visibilityState !== "visible") return;
-  // 本轮正文由恢复流（不写事件日志）写出：按日志重建只会把它换回挂起前的旧内容。
+  // 本轮正文由恢复流独占写出：高频增量帧实时下发时不带序号、无法精确推进 lastAppliedSeq，
+  // 暂不启用事件续显以避免正文重复，等落库终态同步收敛。
   if (activeStreamDraft?.resumeOwned) return;
   // 续显接管意味着 SSE 已不再推进（切页面回来 / 流已结束）。提示交给恢复卡片：
   // 它装得下后台状态、执行阶段与同步进度，并且可以被用户手动关闭。
@@ -6839,7 +7002,9 @@ const settleRecoveredTimeline = () => {
       });
     }
     msg.isThinking = false;
-    msg.processNarrationPending = false;
+    // 该字段是 string（与 agentscopeSseHandlers 里清空时的 "" 一致），
+    // 原先赋 false 会把它变成非字符串，下游按字符串处理时语义不确定
+    msg.processNarrationPending = "";
   }
   if (thoughtTimer) {
     clearInterval(thoughtTimer);
@@ -6863,8 +7028,8 @@ const finishRecoveredTurn = () => {
   streamReplayGeneration += 1;
   recoveryGraceExpired.value = false;
   recoveryUnknownCycles = 0;
-  // 本端仍在读流时不要提前解锁：可见性同步可能在流健康推进期间也跑到这里。
-  if (!streamInFlight && isProcessing.value) isProcessing.value = false;
+  // 本端仍在读流或仍有待确认卡时不要提前解锁：可见性同步可能在流健康推进或等待审批期间跑到这里。
+  if (!streamInFlight && isProcessing.value && !pendingPermissionLocking.value) isProcessing.value = false;
   recoveryCardTerminalApplied.value = true;
   clearStreamReplayTimer();
   clearStreamSnapshot(conversationId.value);
@@ -7023,7 +7188,6 @@ watch(conversationId, () => {
 const { contextUsage, refreshContextUsage } = useContextUsage();
 const {
   sandboxWorkspaceStatus,
-  sandboxWorkspaceStatusLoaded,
   sandboxWorkspaceError,
   sandboxWorkspaceInstanceId,
   sandboxWorkspaceStartedAt,
@@ -7033,22 +7197,20 @@ const {
   sandboxWarmHintSubtitle,
   dismissSandboxWarmHint,
   showSandboxWarmHint,
-  effectiveSandboxPolicy,
   sandboxBackend,
+  // 策略徽标（docker / k8s）与「是否沙箱工作区」的判定还没接到 UI 上，
+  // 但状态机与端点已由 useSandboxWorkspace 抽出，解构保留作为后续接线的入口。
+  effectiveSandboxPolicy,
   isSandboxWorkspacePolicy,
   showSandboxStopConfirm,
   showDockerTerminal,
   showK8sTerminal,
-  resetSandboxWorkspaceState,
   refreshSandboxWorkspaceStatus,
   sandboxWorkspaceRefreshing,
-  pollSandboxWorkspaceUntilRunning,
-  maybeAutoWarmSandbox,
   ensureSandboxWorkspace,
   openDockerTerminal,
   handleStopSandboxWorkspaceRequest,
   confirmStopSandboxWorkspace,
-  stopSandboxWorkspace,
   restartSandboxWorkspace,
 } = useSandboxWorkspace({
   conversationId,
@@ -7059,6 +7221,11 @@ const {
   preferToast: computed(() => windowWidth.value < 640),
   showToast,
 });
+
+// 显式消费上面两个尚未接线的值：只看不用的解构会被类型检查判成「声明未使用」，
+// 而它们确实是接线入口（见 useSandboxWorkspace 的注释放置处），不能直接删。
+void effectiveSandboxPolicy;
+void isSandboxWorkspacePolicy;
 const {
   contextCompactions,
   contextCompactionCount,
@@ -7219,10 +7386,6 @@ const checkConversationAdoption = async (
   return 'unknown';
 };
 
-/** 仅用于「能否采用」的布尔判断（不采用即返回 false）。 */
-const isConversationAdoptable = async (cid: string): Promise<boolean> =>
-  (await checkConversationAdoption(cid)) === 'adoptable';
-
 /** 宿主下发的欢迎语覆盖文案：换身份时用于恢复「宿主口径」，而不是恢复上一位用户的姓名。 */
 let welcomeMessageFromHost = "";
 
@@ -7260,6 +7423,8 @@ const resetConversationScopedState = () => {
   streamAbortReason = null;
   streamPendingConfirmation = () => false;
   isProcessing.value = false;
+  subagentHandoffPending.value = false;
+  handoffGeneration += 1;
   if (thoughtTimer) {
     clearInterval(thoughtTimer);
     thoughtTimer = null;
@@ -7272,6 +7437,7 @@ const resetConversationScopedState = () => {
   // 这里只是不留残留、也不留下一次无效的运行态核验）。
   dropPendingQuickSend();
   clearRunStatusNudge();
+  cancelPendingHistorySync();
   // 运行态轮询与锁态：目标会话若真在跑，watch(conversationId) 会重新核验并重新提供锁。
   stopRemoteRunPolling();
   resetRunStatus();
@@ -8590,7 +8756,7 @@ const handleExportChatFromSidebar = async (item: any) => {
 
     let md = `# 会话导出记录\n\n- **会话 ID**: \`${targetConvId}\`\n- **导出时间**: ${new Date().toLocaleString()}\n- **消息条数**: ${turns.length}\n\n---\n\n`;
     turns.forEach((turn) => {
-      const role = turn.role === "user" ? "👤 **用户**" : "🤖 **AI 助手**";
+      const role = turn.role === "user" ? "**用户**" : "**AI 助手**";
       const time = turn.createdAt ? ` _(${new Date(turn.createdAt).toLocaleString()})_` : "";
       md += `### ${role}${time}\n\n${turn.content}\n\n---\n\n`;
     });
@@ -8955,7 +9121,6 @@ watch(showSettings, (visible) => {
 });
 const showHelpModal = ref(false);
 
-
 // 固化报表暂存状态
 const showSaveReportModal = ref(false);
 const isEditingReport = ref(false);
@@ -9233,7 +9398,7 @@ const executeSavedReportWithOptions = async (reportArg?: SavedReportPayload | nu
   messages.value.push({
     id: Date.now(),
     role: "user",
-    content: `📌 执行固化 SQL 报表: ${report.title}`,
+    content: `执行固化 SQL 报表: ${report.title}`,
     timestamp: new Date().toISOString(),
   });
 
@@ -9334,7 +9499,7 @@ const executeSavedReportWithOptions = async (reportArg?: SavedReportPayload | nu
 
     const errorMsg = extractSavedReportExecuteErrorMessage(error);
 
-    agentMsg.value.content = `### ❌ 报表执行失败\n\n在直连执行 SQL 报表时遇到错误：\n\n\`\`\`\n${errorMsg}\n\`\`\``;
+    agentMsg.value.content = `### 报表执行失败\n\n在直连执行 SQL 报表时遇到错误：\n\n\`\`\`\n${errorMsg}\n\`\`\``;
     agentMsg.value.logs = [
       {
         id: `log_${Date.now()}`,
@@ -9486,7 +9651,6 @@ const handleMemoryCleared = (payload: { conversationIds: string[]; all?: boolean
   }
 };
 
-
 /** 聊天作用域候选（GET /api/portal/models?scope=chat，后端已按白名单收窄；未配置白名单 = 全量） */
 const chatScopedModels = ref<AIModel[]>([]);
 /** 既有 UI 使用的候选：只保留可聊天的 llm / multimodal */
@@ -9592,7 +9756,11 @@ const updateFullScreenStatus = () => {
 };
 
 // —— 移动端操作抽屉（<640px 专用）：一个抽屉、两个入口 ——
-const mobileActionsMessageId = ref<string | null>(null);
+// 存的是 Message.id（number）。原声明写成 string | null 与实际存的 number 不符：
+// 运行时赋值与比较用的是同一个值、=== 照样成立（抽屉能正常弹出），
+// 但类型层面挂着两处红（TS2322 赋值 / TS2367 比较），且一旦有人真按 string 存值
+// （例如给历史消息补一个字符串 id）就会静默失效，故让声明与事实一致。
+const mobileActionsMessageId = ref<number | null>(null);
 const mobileActionsFocus = ref<"data" | null>(null);
 
 const openMobileActions = (msg: Message, focus: "data" | null) => {
@@ -11075,6 +11243,7 @@ const fetchConversationHistory = async (
                   logs: [],
                   isThinking: false,
                   feedback: null,
+                  status: item.status ?? undefined,
                   timestamp: item.created_at
               });
           }
@@ -11083,7 +11252,10 @@ const fetchConversationHistory = async (
               // 提问卡实时渲染依赖消息对象上的 userQuestion（不落库），历史回放需从
               // process_timeline 快照重建，否则卡片只剩一行「需要用户回答」。
               const persistedQuestions = userQuestionStatesFromTimeline(hydratedTimeline);
-              newHistoryBatch.push({
+              // 业务确认卡同理：不随消息落库，只能从时间线快照重建，否则历史里
+              // 只剩一行「需要确认业务数据」，用户看不到当时要确认的数据。
+              const persistedConfirmations = businessConfirmationStatesFromTimeline(hydratedTimeline);
+              const restoredAgentMessage: Message = {
                   id: Date.now() + idx * 2 + 1 + offset,
                   trace_id: item.trace_id,
                   role: 'agent',
@@ -11093,9 +11265,18 @@ const fetchConversationHistory = async (
                   citations: item.citations ?? undefined,
                   isHistory: true,
                   userQuestion: persistedQuestions[0],
+                  // 取**最后一张**（同一轮可能确认过多组数据）；历史卡一律标 stale——
+                  // 快照的实时状态未知，而回执会触发真实写入。`!` 见上面的 length 判断。
+                  businessConfirmation: persistedConfirmations.length
+                    ? {
+                        ...persistedConfirmations[persistedConfirmations.length - 1]!,
+                        status: "stale",
+                      }
+                    : undefined,
                   logs: [],
                   isThinking: false,
                   feedback: null,
+                  status: item.status ?? undefined,
                   agentName: item.agent_name ?? undefined,
                   agentDisplayName: item.agent_display_name || (String(item.agent_name || '').startsWith('sys_') ? '系统助手' : undefined),
                   agentType: item.agent_type ?? undefined,
@@ -11111,7 +11292,16 @@ const fetchConversationHistory = async (
                       }
                     : undefined,
                   timestamp: item.created_at
-              });
+              };
+              // 图片用量：后端回填的是**原始单次记录**数组，这里用实时链路同一个累加
+              // 函数聚合。聚合规则（calls / images / requested / tokens / size）只该有
+              // 一份实现，否则「刷新前后同一条消息」会显示两个不同的数。
+              if (Array.isArray(item.image_usage)) {
+                  for (const usage of item.image_usage) {
+                      accumulateImageUsage(restoredAgentMessage, usage);
+                  }
+              }
+              newHistoryBatch.push(restoredAgentMessage);
           }
       });
       // 首屏历史必须无条件覆盖：空结果同样要清空。否则「本会话没有任何属于当前用户
@@ -11473,6 +11663,7 @@ const handleFeedback = async (msg: Message, type: "up" | "down") => {
 
 const openModelCallStats = async (msg: any) => {
   currentStats.value = [];
+  currentImageUsage.value = msg?.image_usage ?? null;
   showStatsModal.value = true;
   loadingStats.value = true;
   try {
@@ -11504,6 +11695,7 @@ const stopGeneration = (options?: StopGenerationOptions) => {
   // watch 会把刚才排队的提问发出去——用户明明按了停止，系统却反向发出一条新提问。
   dropPendingQuickSend();
   clearRunStatusNudge();
+  cancelPendingHistorySync();
   const lastMsg = messages.value.length > 0 ? messages.value[messages.value.length - 1] : null;
   if (conversationId.value) {
     void cancelConversationRun(conversationId.value, {
@@ -11527,6 +11719,8 @@ const stopGeneration = (options?: StopGenerationOptions) => {
     abortController = null;
   }
   isProcessing.value = false;
+  subagentHandoffPending.value = false;
+  handoffGeneration += 1;
   // 用户主动停止不是「后台还在跑」：置位本轮标记，否则 abort 收尾时 streamInFlight
   // 归零、草稿仍在、后端锁尚未释放，恢复卡片会把它判成恢复场景——先弹「会话仍在后台
   // 处理中」，取消轮落库后再补「内容已补齐」。真正的重算在 abort 的 finally 里，这里
@@ -11538,7 +11732,14 @@ const stopGeneration = (options?: StopGenerationOptions) => {
     thoughtTimer = null;
   }
   // Mark last thinking message as stopped
-  if (lastMsg && lastMsg.isThinking) {
+  //
+  // 条件不能只看 `isThinking`：用户常在「工具间隙」点停止——那时模型在等工具返回，
+  // isThinking 已被置 false，正文也还没开始。旧逻辑在这个窗口里什么都不做，消息
+  // 既没有正文也没有「已停止」标记，思考头会一直转圈显示「执行过程」。
+  const shouldMarkStopped =
+    Boolean(lastMsg && lastMsg.role !== "system") &&
+    (lastMsg?.isThinking === true || !lastMsg?.content);
+  if (lastMsg && shouldMarkStopped) {
     lastMsg.isThinking = false;
     if (!lastMsg.content) {
       lastMsg.content = "[已停止生成]";
@@ -11833,6 +12034,7 @@ watch([isProcessing, remoteRunBusy, sendLocked], () => {
 watch(conversationId, () => {
   dropPendingQuickSend();
   clearRunStatusNudge();
+  cancelPendingHistorySync();
 });
 
 const handleQuickQuestion = async (
@@ -12029,8 +12231,6 @@ watch(
   },
   { deep: true }
 );
-
-
 
 // 钉住面板的让位宽度与右侧偏移统一由下方 pinnedDrawerLayout 计算。
 // 这里不再保留「各面板宽度 / 16 累加成 rem」的第二套真源：那套算法既没有上限
@@ -12401,6 +12601,26 @@ const applyPermissionStreamEvent = (
 
   if (applyReusableResultStatusEvent(msg, data)) return;
 
+  if (data?.type === "subagent_permission_handoff") {
+    // 子智能体的授权已落到「父会话 + 该子代理」作用域，后端把续聊指令一并送回来。
+    // 收在这里、等流收尾再发：直接在这里发会被 isProcessing / 提交态锁挡住。
+    if (msg.pendingPermission) {
+      if (
+        data.subagent
+        && typeof data.subagent === "object"
+        && !msg.pendingPermission.subagent?.display_name
+      ) {
+        // 只在还没有展示名时补：续聊回执里的 agent_name 是标识名，
+        // 覆盖上去会让卡片徽章从「资产导出」跳成英文 ID。
+        msg.pendingPermission.subagent = data.subagent;
+      }
+      if (typeof data.directive === "string" && data.directive.trim()) {
+        msg.pendingPermission.resumeDirective = data.directive;
+      }
+    }
+    return;
+  }
+
   if (data?.type === "run_status") {
     // 恢复流（权限确认 / 外部执行）在末尾发射 run_status 作为终态，其 status 为
     // success / rejected / error 等真实执行结果。按终态映射状态，避免把“用户拒绝”
@@ -12532,10 +12752,16 @@ const submitPendingExternalExecution = async (msg: Message) => {
   const pending = msg.pendingExternalExecution;
   if (!pending || pending.status !== "pending" || pending.isSubmitting) return;
   pending.isSubmitting = true;
-  // 这段恢复流直接写这条消息，而事件日志并不记录它（恢复接口只转发 SSE）：
+  // 这段恢复流直接独占写这条消息（高频增量帧实时下发时不带序号，暂不与事件续显混写）：
   // 既要停掉可能还在跑的续显（两路同写会重复正文），也要让恢复器在它运行期间认
   // 「流在途」，不去补占位 / 拉续显。
   stopReplayForLiveStream();
+  // 取消上一轮残留的历史同步轮询与 run-status 助推，停止可能仍在跑的主流看门狗，
+  // 并同步声明后端恢复运行锁已开始。
+  stopStreamLivenessWatch();
+  cancelPendingHistorySync();
+  clearRunStatusNudge();
+  markRunStarted();
   // 主流结束时已把草稿置空（见 sendMessageInternal 的收尾），所以正常流程走到这里
   // `activeStreamDraft` 一定是 null——必须把草稿重新绑定到这条消息，否则：
   // ① 恢复流期间 pagehide / visibilitychange 触发的 maybePersistStreamSnapshot 会因
@@ -12553,23 +12779,26 @@ const submitPendingExternalExecution = async (msg: Message) => {
   }
   streamInFlight = true;
   isProcessing.value = true;
+  // 先自增写入方令牌再 abort 旧控制器：主流在被接管中止时据此识别「已交权」，
+  // 不得再把本轮刚置上的 streamInFlight / isProcessing 覆盖回 false。
+  const resumeToken = ++liveWriterToken;
   // 恢复流绑定当前会话 AbortController（支持主动停止、切会话与卸载取消），同时保留 liveWriterToken 防并发串台。
   const resumeAbort = new AbortController();
   if (abortController) {
     abortController.abort();
   }
   abortController = resumeAbort;
-  const resumeToken = ++liveWriterToken;
   msg.isThinking = true;
   startThoughtTimer(msg);
   msg.isThoughtExpanded = config.expandThoughts;
   msg.thinkingText = "正在提交外部执行结果...";
   resetStallTimer();
 
+  const normalizeResumeSeq = createResumeSeqNormalizer(maxTimelineSeq(msg.processTimeline));
   const resumeEventPump = createBufferedStreamEventPump(
     (data) => {
       if (liveWriterToken !== resumeToken || embedUnmounted) return;
-      applyPermissionStreamEvent(msg, data);
+      applyPermissionStreamEvent(msg, normalizeResumeSeq(data));
       if (data.type !== "keepalive" && data.type !== "reasoning_content" && data.type !== "answer_delta") {
         maybePersistStreamSnapshot();
       }
@@ -12604,6 +12833,9 @@ const submitPendingExternalExecution = async (msg: Message) => {
     // 先把合帧缓冲刷进消息，再追加失败提示：否则残留的正文/思考会排在提示之后，顺序错乱
     resumeEventPump.flush();
     if (error?.name === "AbortError") {
+      // 主动取消不是成功：挂起节点按 interrupted 落定，否则状态会被 finally 里的
+      // 默认 success 收尾盖成「已完成」。
+      finalizeAllPendingStreamLogs(msg, Date.now(), "interrupted");
       if (!embedUnmounted) {
         msg.content += "\n[已取消提交外部执行结果]";
       }
@@ -12629,6 +12861,9 @@ const submitPendingExternalExecution = async (msg: Message) => {
       isProcessing.value = Boolean(
         msg.pendingExternalExecution?.status === "pending" || msg.pendingPermission?.status === "pending",
       );
+      if (!embedUnmounted) {
+        nudgeRunStatusConvergence();
+      }
       msg.isThinking = false;
       clearStallTimer();
       showStalledPrompt.value = false;
@@ -12636,11 +12871,9 @@ const submitPendingExternalExecution = async (msg: Message) => {
         clearInterval(thoughtTimer);
         thoughtTimer = null;
       }
-      if (msg.logs) {
-        msg.logs.forEach((l) => {
-          if (l.status === "pending" && l.category !== "permission" && l.category !== "external") l.status = "success";
-        });
-      }
+      // 统一走主流同一收尾入口：排除 permission/external，并同步落定 processTimeline
+      // 里的旁白与推理节点（只遍历 msg.logs 会漏掉它们，呼吸灯与光标就此常亮）。
+      finalizeAllPendingStreamLogs(msg);
       scrollToBottom();
       nextTick(() => {
         if (!isMobile.value) chatInputRef.value?.focus();
@@ -12748,9 +12981,15 @@ const confirmPendingPermission = async (
   const pending = msg.pendingPermission;
   if (!pending || pending.status !== "pending" || pending.isSubmitting) return;
   pending.isSubmitting = true;
-  // 与外部执行恢复同理：这段恢复流直接写这条消息，事件日志不记录它。先让续显让位，
+  // 与外部执行恢复同理：这段恢复流独占写这条消息（暂不与事件续显混写）。先让续显让位，
   // 再把自己标记为「流在途」，恢复器在此期间不会补占位或启动续显。
   stopReplayForLiveStream();
+  // 取消上一轮残留的历史同步轮询与 run-status 助推（挂起态历史不代表终态，旧轮询可能
+  // 走到重试耗尽兜底），停止可能仍在跑的主流看门狗，并同步声明后端恢复运行锁已开始。
+  stopStreamLivenessWatch();
+  cancelPendingHistorySync();
+  clearRunStatusNudge();
+  markRunStarted();
   // 与外部执行恢复同理：主流结束时草稿已被置空，这里必须重新绑定到被确认的这条消息，
   // 否则恢复流期间刷新/切后台时快照不落盘，恢复流写出的正文会随首拉重建被换回挂起前。
   if (activeStreamDraft?.msg === msg) {
@@ -12765,13 +13004,15 @@ const confirmPendingPermission = async (
   }
   streamInFlight = true;
   isProcessing.value = true;
+  // 先自增写入方令牌再 abort 旧控制器：若主流尚未完全收尾，旧流在 catch/finally 中
+  // 通过 liveWriterToken 识别已被接管，避免把本轮的 streamInFlight / isProcessing 覆盖回 false。
+  const resumeToken = ++liveWriterToken;
   // 恢复流绑定当前会话 AbortController（支持主动停止、切会话与卸载取消），同时保留 liveWriterToken 防并发串台。
   const resumeAbort = new AbortController();
   if (abortController) {
     abortController.abort();
   }
   abortController = resumeAbort;
-  const resumeToken = ++liveWriterToken;
   if (confirmed) {
     msg.isThinking = true;
     startThoughtTimer(msg);
@@ -12780,10 +13021,11 @@ const confirmPendingPermission = async (
     resetStallTimer();
   }
 
+  const normalizeResumeSeq = createResumeSeqNormalizer(maxTimelineSeq(msg.processTimeline));
   const permissionEventPump = createBufferedStreamEventPump(
     (data) => {
       if (liveWriterToken !== resumeToken || embedUnmounted) return;
-      applyPermissionStreamEvent(msg, data);
+      applyPermissionStreamEvent(msg, normalizeResumeSeq(data));
       if (data.type !== "keepalive" && data.type !== "reasoning_content" && data.type !== "answer_delta") {
         maybePersistStreamSnapshot();
       }
@@ -12861,6 +13103,7 @@ const confirmPendingPermission = async (
     // 同外部执行恢复：先落盘缓冲，再写失败提示，避免「半段正文 + 提示 + 剩下那截正文」
     permissionEventPump.flush();
     if (error?.name === "AbortError") {
+      finalizeAllPendingStreamLogs(msg, Date.now(), "interrupted");
       if (!embedUnmounted) {
         msg.content += "\n[已终止工具确认流]";
       }
@@ -12880,6 +13123,13 @@ const confirmPendingPermission = async (
       } else {
         permissionEventPump.cancel();
       }
+      const resumeDirective = pending.resumeDirective;
+      const hasSubagentHandoff = Boolean(resumeDirective && !pending.discarded);
+      // 子智能体授权交接：在清空本流锁态前先立起交接锁，确保到 dispatchResumeDirective
+      // 真正接棒发起续聊之间输入框零空窗、绝不提前释放或弹回焦点。
+      if (hasSubagentHandoff) {
+        subagentHandoffPending.value = true;
+      }
       streamInFlight = false;
       isProcessing.value = Boolean(
         msg.pendingPermission?.status === "pending" || msg.pendingExternalExecution?.status === "pending",
@@ -12891,15 +13141,24 @@ const confirmPendingPermission = async (
         clearInterval(thoughtTimer);
         thoughtTimer = null;
       }
-      if (msg.logs) {
-        msg.logs.forEach((l) => {
-          if (l.status === "pending" && l.category !== "permission") l.status = "success";
+      // 同上：此前这里只排除了 permission，漏掉 external 会把仍在等待外部执行的
+      // 挂起行误标成 success；也没有处理 processTimeline。统一交给同一入口。
+      finalizeAllPendingStreamLogs(msg);
+      scrollToBottom();
+      // 子智能体的权限确认：授权已在后端落库，这里把续聊指令发回父会话，父专家才会
+      // 用 sub_agent_call(resume=True) 让子智能体接着跑完。指令发完即清空——不清空的话
+      // 任何一次重渲染都会再发一遍，等于无限续聊。
+      if (resumeDirective && !pending.discarded) {
+        pending.resumeDirective = undefined;
+        void dispatchResumeDirective(msg, resumeDirective);
+      } else {
+        if (!embedUnmounted) {
+          nudgeRunStatusConvergence();
+        }
+        nextTick(() => {
+          if (!isMobile.value) chatInputRef.value?.focus();
         });
       }
-      scrollToBottom();
-      nextTick(() => {
-        if (!isMobile.value) chatInputRef.value?.focus();
-      });
     }
   }
 };
@@ -12907,7 +13166,9 @@ const confirmPendingPermission = async (
 /** 撤销「本会话总是允许」：撤销后该工具在会话内重新逐次确认。 */
 const revokeSessionPermission = async (msg: Message) => {
   const pending = msg.pendingPermission;
-  const conversation = String(conversationId.value || "").trim();
+  // 子智能体的授权写在 `父会话::sub::子代理` 上，后端已在回执里带回该作用域。
+  // 沿用主会话 ID 会删一条不存在的记录，界面显示撤销成功而授权其实还在。
+  const conversation = String(pending?.sessionGrantScope || conversationId.value || "").trim();
   const toolName = String(pending?.tool_call?.name || "").trim();
   if (!pending || !toolName) return;
   if (!conversation) {
@@ -12938,6 +13199,37 @@ const revokeSessionPermission = async (msg: Message) => {
 };
 
 /**
+ * 挂起确认卡片落到终态（放弃 / 过期）后的本地收尾。
+ *
+ * 这两条路径都**不发起恢复流**，所以事后没有任何东西会把锁态复位：唯一的解锁
+ * watcher 挂在 `remoteRunActive` 上（见下方 watch），而它此刻早已是 false，
+ * 再也不会触发。漏了这一步，`isProcessing` 会永久停在 true，`sendMessage` 一进来
+ * 就被拦，用户只能刷新页面才能继续对话。
+ */
+const settlePendingConfirmationLocally = (
+  msg: Message,
+  logStatus: "interrupted" | "error",
+) => {
+  const permissionRequestId = msg.pendingPermission?.permission_request_id || "";
+  const permissionLogId = permissionRequestId ? `permission_${permissionRequestId}` : "";
+  // 时间线里的挂起行同步收敛，否则卡片左侧的呼吸灯会一直亮着。
+  for (const item of msg.processTimeline || []) {
+    if (item.kind !== "log") continue;
+    const isPermissionLog =
+      item.category === "permission" ||
+      (permissionLogId !== "" && String(item.id) === permissionLogId);
+    if (isPermissionLog && item.status === "pending") item.status = logStatus;
+  }
+  for (const log of msg.logs || []) {
+    if (log.id === permissionLogId && log.status === "pending") log.status = logStatus;
+  }
+  // 用与 sendMessage 同源的锁态重算，避免这边解了、那边还锁着。
+  if (!streamInFlight) {
+    isProcessing.value = pendingPermissionLocking.value;
+  }
+};
+
+/**
  * 「放弃本轮」：不执行这条命令，也不写任何会话授权。
  *
  * 纯粹的前端收尾——挂起快照留在服务端等 TTL 自然过期（不发请求就不会执行），
@@ -12949,6 +13241,7 @@ const expirePendingPermission = (msg: Message) => {
   // 只用本地状态收尾：服务端快照本来就已过期，不再发请求。
   pending.status = "expired";
   pending.isSubmitting = false;
+  settlePendingConfirmationLocally(msg, "error");
 };
 
 const discardPendingPermission = (msg: Message) => {
@@ -12958,6 +13251,7 @@ const discardPendingPermission = (msg: Message) => {
   pending.status = "rejected";
   pending.isSubmitting = false;
   pending.expanded = false;
+  settlePendingConfirmationLocally(msg, "interrupted");
 };
 
 const tryLocalChartOptionPatch = (userText: string): boolean => {
@@ -13031,7 +13325,7 @@ const tryLocalChartOptionPatch = (userText: string): boolean => {
             messages.value.push({
               id: Date.now() + 1,
               role: "agent",
-              content: `✨ 已为您本地秒级重绘图表，将图表形式调整为：${newType === 'line' ? '折线图' : newType === 'bar' ? '柱状图' : newType === 'pie' ? '饼图' : '标红调整'}。`,
+              content: `已为您本地秒级重绘图表，将图表形式调整为：${newType === 'line' ? '折线图' : newType === 'bar' ? '柱状图' : newType === 'pie' ? '饼图' : '标红调整'}。`,
               timestamp: new Date().toISOString(),
             });
             return true;
@@ -13101,6 +13395,52 @@ const sendSandboxHealthReport = () => {
   void sendMessage({ content: SANDBOX_HEALTH_REPORT_PROMPT });
 };
 
+/**
+ * 把子智能体的续聊指令发回父会话。
+ *
+ * 不能直接 `void sendMessage(...)`：确认流收尾时父专家那一轮可能还在输出
+ * （`isProcessing` / `remoteRunBusy` 仍为 true），`sendMessage` 会静默 return，
+ * 而指令此刻已经被清空——用户点了允许，子智能体却再也没被叫醒。
+ * 这里短暂轮询等运行态释放；始终等不到就把「再做一步」说给用户，别静默丢。
+ */
+const dispatchResumeDirective = async (msg: Message, directive: string) => {
+  const originConversationId = String(conversationId.value || "");
+  const handoffGen = ++handoffGeneration;
+  subagentHandoffPending.value = true;
+  try {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      // 用户可能在这几秒里点击停止、切走会话或关掉页面：指令属于原会话那一段，
+      // 停止后或发到别处都会反向发问。代次失配即立即作废。
+      if (embedDisposed.value || handoffGeneration !== handoffGen) return;
+      if (String(conversationId.value || "") !== originConversationId) return;
+      // 轮询自身不能被 `subagentHandoffPending` 挡住，只看外部运行态与真正的待确认卡。
+      const busy =
+        isProcessing.value
+        || remoteRunBusy.value
+        || recoveryLocking.value
+        || hasActivePendingPermission()
+        || sendLocked.value;
+      if (!busy) {
+        if (embedDisposed.value || handoffGeneration !== handoffGen) return;
+        if (String(conversationId.value || "") !== originConversationId) return;
+        // 同步释放交接锁并立即进入 sendMessage（runSendExclusive 同步立起 sendLocked），
+        // Vue 同一微任务批内无解锁空窗。
+        subagentHandoffPending.value = false;
+        await sendMessage({ content: directive });
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    if (embedDisposed.value || handoffGeneration !== handoffGen) return;
+    msg.content +=
+      "\n\n[授权已记录，但本轮仍在运行，没能自动唤回子智能体。请稍等片刻后发送「继续」，子智能体会接着跑完。]";
+  } finally {
+    if (handoffGeneration === handoffGen) {
+      subagentHandoffPending.value = false;
+    }
+  }
+};
+
 const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
   const { content, files } = snapshot;
   if ((!content && files.length === 0) || isProcessing.value || remoteRunBusy.value || recoveryLocking.value || pendingPermissionLocking.value) return;
@@ -13110,6 +13450,7 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
   // 「强制走查数」意图一起撤销，避免劫持用户的手动提问。
   dropPendingQuickSend();
   clearRunStatusNudge();
+  cancelPendingHistorySync();
 
   // 尽早消费「强制查数智能体」标记，避免中途 return 后泄漏到下一轮普通提问
   const forcedDataAgentIdForTurn = forceDataQueryAgentOnce.value ? resolvePreferredDataQueryAgentId() : "";
@@ -13200,8 +13541,10 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
       agentMsg.value.pendingPermission?.status === "pending"
       || agentMsg.value.pendingExternalExecution?.status === "pending",
   );
-  // 新一轮是新的写入方：令牌自增后，仍在收尾的旧恢复流就不能再复位本轮的锁态。
+  // 新一轮是新的写入方：令牌自增后，仍在收尾的旧恢复流就不能再复位本轮的锁态；
+  // 同时保存本轮令牌，若后续被权限确认/外部执行恢复流接管，本轮 finally 不得再踩踏新流的锁态。
   liveWriterToken += 1;
+  const streamToken = liveWriterToken;
   // 新一轮开始：续显游标整体归零。后端在 producer 启动时会清空上一轮日志并让 _seq
   // 从 1 重新计数，所以这里必须同步归零——保留 lastSeq 会让本轮事件全部落在
   // after_seq 之内而被丢弃；保留 traceId 则会把上一轮的残留事件放行进来。
@@ -13545,6 +13888,19 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
               clearInterval(thoughtTimer);
               thoughtTimer = null;
             }
+            // 需要用户操作的卡片（审批/外部执行/主动提问/业务确认）到达时必须立刻把
+            // 流快照写进 storage，不能等 1.5s 节流窗口：卡片往往紧跟在一串高密度
+            // reasoning 帧之后，而 pagehide 是同步事件、只能读已落盘的快照。晚一步
+            // 落盘，用户在这半秒内刷新/关页，回来就只剩一段没有卡片的思考过程——
+            // 那一轮既不会继续也不会结束，输入框还被锁着。
+            if (
+              data.type === "permission_required"
+              || data.type === "external_execution_required"
+              || data.type === "user_question"
+              || data.type === "business_confirmation"
+            ) {
+              maybePersistStreamSnapshot(true);
+            }
           } else if (data.type === "meta") {
             if (data.agent_name) {
               agentMsg.value.agentName = data.agent_name;
@@ -13659,6 +14015,25 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
     // 当前会话的消息上（`currentStreamAgentMessage` 的兜底是「列表最后一条」）。
     // 收到 duplicate_request 仅代表本次并发请求被拒，原有后台任务仍在运行，不可提前清草稿与续显计时器。
     if (!receivedDuplicateRequest) {
+      // 流结束了但卡片还在等人操作（审批/外部执行/提问/业务确认）：先按会话归属把
+      // 快照写进 storage，再清内存引用——落盘函数读的就是 activeStreamDraft，清完就
+      // 写不出来了。漏这一步，pagehide 时无草稿可写，刷新后卡片凭空消失，而后端那
+      // 一边其实正挂着等确认，两边状态永久错开。
+      // 只认「四类交互卡」这一个信号，不看时间线里有没有 pending 节点：收尾阶段
+      // 个别工具日志/todo 仍可能停在 pending（由 finalizeAllPendingStreamLogs 落定），
+      // 那不是「等人操作」，拿它当条件会让正常跑完的轮次也留下一份快照，恢复器随后
+      // 把它误判成断线在途——正是这段代码原本要避免的事。
+      if (
+        conversationId.value === streamConversationId
+        && (
+          agentMsg.value.pendingPermission
+          || agentMsg.value.pendingExternalExecution
+          || agentMsg.value.userQuestion
+          || agentMsg.value.businessConfirmation
+        )
+      ) {
+        maybePersistStreamSnapshot(true);
+      }
       if (conversationId.value === streamConversationId) {
         activeStreamDraft = null;
         // 本轮的输出已经完整落到界面，恢复卡片转入完成态。
@@ -13671,11 +14046,14 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
     flushReasoningBuffer();
     flushContentBuffer();
     if (e.name === "AbortError") {
+      // 中断同样要落定时间线：只写正文标记不动节点的话，思考卡片与呼吸灯会一直
+      // 停在「进行中」，直到用户刷新。
+      finalizeAllPendingStreamLogs(agentMsg.value, Date.now(), "interrupted");
       if (streamAbortReason) {
         // 看门狗中止不是用户操作：不写「[用户终止]」，交给 finally 的 run-status 核验
         // 与历史收敛把界面补齐（卡住时正文往往已在后端落库）。
         console.warn(`[Stream] aborted by liveness watchdog (${streamAbortReason})`);
-      } else if (!embedUnmounted) {
+      } else if (liveWriterToken === streamToken && !embedUnmounted) {
         agentMsg.value.content += "\n[用户终止]";
       }
     } else if (document.visibilityState === "hidden") {
@@ -13688,39 +14066,50 @@ const sendMessageInternal = async (snapshot: ChatSendSnapshot) => {
       agentMsg.value.clientTransportErrorSuffix = transportErrorSuffix;
     }
   } finally {
+    // 看门狗属于本条主流资源，必须无条件停止；否则主流被恢复流接管后看门狗会继续存活，
+    // 15s 后按冻结的 streamLastFrameAt 误杀新恢复流的 abortController。
     stopStreamLivenessWatch();
-    streamInFlight = false;
+    const ownsLiveWriter = liveWriterToken === streamToken;
+    if (ownsLiveWriter) {
+      streamInFlight = false;
+    }
     // 本轮结束：把当前会话再报一次给宿主。新建会话的 URL 早在首条消息之前就有了，
     // 宿主侧栏要靠这条消息（而不只是 URL 变化）把刚落库的任务刷进列表。
     postMessageToHost({ type: "CONVERSATION_ACTIVE", conversation_id: conversationId.value });
     // SSE 已收流结束，此时才谈得上完成态：放在 streamInFlight 归零之后刷新，
     // 否则「本端仍在收流」的判据会把完成提示压掉。
-    refreshRecoveryCard();
+    if (ownsLiveWriter) {
+      refreshRecoveryCard();
+    }
     // 组件已卸载时不再执行收尾副作用：否则 abort 后的 refreshCurrentRunStatus 会在
     // 已销毁的实例上重启会话轮询与网络请求。结果由下次挂载时的运行恢复器取回。
     if (!embedUnmounted) {
       flushReasoningBuffer();
       flushContentBuffer();
-      // 锁态是全局的：只有本轮仍是当前会话时才用本轮的权限态覆盖它。切走后若照写，
-      // 会把目标会话刚算好的锁态冲掉，或用本轮的 pending 权限把它误锁住。
+      // 锁态是全局的：只有本轮仍是当前会话且仍是当前写入方时才用本轮的权限态覆盖它。
+      // 切走或已被确认恢复流接管后若照写，会把新流的锁态直接冲掉。
       if (conversationId.value === streamConversationId) {
-        isProcessing.value = agentMsg.value.pendingPermission?.status === "pending" || agentMsg.value.pendingExternalExecution?.status === "pending";
+        if (ownsLiveWriter) {
+          isProcessing.value = agentMsg.value.pendingPermission?.status === "pending" || agentMsg.value.pendingExternalExecution?.status === "pending";
+        }
       }
       // 流刚结束：立刻核验一次后端真相，并短时重试，把「后端已收尾、前端锁尚未收敛」
       // 的窗口从最长 1.5s 压到近乎瞬时（不能直接清锁：流被中断时后端可能仍在跑）。
-      nudgeRunStatusConvergence();
-      agentMsg.value.isThinking = false;
+      if (ownsLiveWriter) {
+        nudgeRunStatusConvergence();
+        agentMsg.value.isThinking = false;
+        clearStallTimer();
+        clearStalePendingTimer();
+        showStalledPrompt.value = false;
+        finishThoughtTimer(agentMsg.value);
+        // Final cleanup: stop any remaining log spinners
+        finalizeAllPendingStreamLogs(agentMsg.value);
+      }
       void refreshQuota();
       void loadReusableResultAvailability(); // 刷新会话可复用结果入口
       void loadArtifactCounts(); // 刷新产物数量，新生成的产物即时显示角标与按钮
-      clearStallTimer();
-      clearStalePendingTimer();
-      showStalledPrompt.value = false;
       void refreshEmbedContextUsage();
       void refreshEmbedContextCompactions(true);
-      finishThoughtTimer(agentMsg.value);
-      // Final cleanup: stop any remaining log spinners
-      finalizeAllPendingStreamLogs(agentMsg.value);
       scrollToBottom();
     } else {
       if (reasoningFlushTimer !== null) {
@@ -13745,7 +14134,7 @@ const BOTTOM_THRESHOLD_PX = 80;
  * 进入视口被真正渲染，scrollHeight 才会变大。这里在随后几帧里继续贴底，只在**强制贴底**
  * （打开会话 / 发送 / 切会话）时使用。
  *
- * ⚠️ 流式增量绝不能走这条链：委派时高度每帧都在长，`height !== lastHeight` 恒真，12 帧
+ * 流式增量绝不能走这条链：委派时高度每帧都在长，`height !== lastHeight` 恒真，12 帧
  * 会全部跑满，而每帧都要读一次 `scrollHeight`——等于把每次贴底的强制布局放大成十几倍，
  * 叠加 scroll 事件里的读取就是主线程被打满的直接原因（Chrome「页面无响应」）。
  */
@@ -13843,6 +14232,9 @@ onUnmounted(() => {
     window.clearTimeout(scrollAnchorIdleTimer);
     scrollAnchorIdleTimer = null;
   }
+  // 观察者持有消息对象，组件卸载后不能再复活任何卡片。
+  stopPendingReviveWatch?.();
+  stopPendingReviveWatch = null;
 });
 
 /** 鼠标进入时暂停淡出倒计时，离开后重新计时。 */
@@ -14140,26 +14532,34 @@ onMounted(() => {
 
   // 切回前台（切回 App 或多标签页）时自动探测并拉取最新会话历史，支持退避轮询直到后台持久化完成
   let visibilitySyncTimer: any = null;
-  const clearVisibilitySyncTimer = () => {
+  let visibilitySyncGeneration = 0;
+  const clearVisibilitySyncTimer = (invalidateInFlight = false) => {
+    if (invalidateInFlight) {
+      visibilitySyncGeneration += 1;
+    }
     if (visibilitySyncTimer) {
       clearTimeout(visibilitySyncTimer);
       visibilitySyncTimer = null;
     }
   };
+  cancelPendingHistorySync = () => clearVisibilitySyncTimer(true);
 
   const syncLatestSessionHistory = async (attempt = 1, maxAttempts = 15) => {
     // 请求可能在组件卸载后才返回：不要再写已销毁实例的消息/草稿/快照。
     if (embedUnmounted) return;
     if (!conversationId.value || !hasPermission.value) return;
+    const syncGeneration = visibilitySyncGeneration;
     // 本次同步服务于哪个会话：await 期间可能已经切走，那时任何写入（尤其是 reload 分支
     // 的 clearStreamSnapshot）都会打到新会话身上。
     const startedForConversation = conversationId.value;
     const conversationChanged = () => conversationId.value !== startedForConversation;
 
     const scheduleHistoryRetry = () => {
+      if (syncGeneration !== visibilitySyncGeneration) return;
       if (attempt >= maxAttempts || document.visibilityState !== "visible") return;
       clearVisibilitySyncTimer();
       visibilitySyncTimer = setTimeout(() => {
+        if (syncGeneration !== visibilitySyncGeneration) return;
         void syncLatestSessionHistory(attempt + 1, maxAttempts);
       }, 1500);
     };
@@ -14184,6 +14584,7 @@ onMounted(() => {
         params: { conversation_id: conversationId.value, page: 1, page_size: 1 },
         headers,
       });
+      if (syncGeneration !== visibilitySyncGeneration) return;
       if (res.data?.data && Array.isArray(res.data.data.items) && res.data.data.items.length > 0) {
         const latestServerItem = res.data.data.items[0];
         if (conversationId.value !== startedForConversation) return;
@@ -14255,6 +14656,7 @@ onMounted(() => {
               );
             }
             currentMsg.citations = latestServerItem.citations ?? currentMsg.citations;
+            if (latestServerItem.status) currentMsg.status = latestServerItem.status;
             currentMsg.isThinking = false;
             // 流中断时占位消息拿不到智能体元数据，恢复同步时补齐。
             if (!currentMsg.agentName) {
@@ -14292,6 +14694,7 @@ onMounted(() => {
             logs: [],
             isThinking: false,
             feedback: null,
+            status: latestServerItem.status ?? undefined,
             agentName: latestServerItem.agent_name ?? undefined,
             agentDisplayName: latestServerItem.agent_display_name || (String(latestServerItem.agent_name || '').startsWith('sys_') ? '系统助手' : undefined),
             agentType: latestServerItem.agent_type ?? undefined,
@@ -14308,7 +14711,8 @@ onMounted(() => {
           // 补内容，绝不能顺手清掉本轮仍在途的草稿。
           const lastLocalUserIndex = (() => {
             for (let index = messages.value.length - 1; index >= 0; index -= 1) {
-              if (messages.value[index].role === "user") return index;
+              const item = messages.value[index];
+              if (item?.role === "user") return index;
             }
             return -1;
           })();
@@ -14330,7 +14734,8 @@ onMounted(() => {
         const latestTrace = String(latestServerItem?.trace_id || "");
         let lastLocalUserIndex = -1;
         for (let index = messages.value.length - 1; index >= 0; index -= 1) {
-          if (messages.value[index].role === "user") {
+          const item = messages.value[index];
+          if (item?.role === "user") {
             lastLocalUserIndex = index;
             break;
           }
@@ -14347,8 +14752,12 @@ onMounted(() => {
           latestSyncedIndex > lastLocalUserIndex &&
           Boolean(latestServerItem?.query) &&
           Boolean(lastLocalUser) &&
-          String(lastLocalUser.content || "") === String(latestServerItem.query || "");
-        if (latestSyncedIndex !== -1 && isLatestTurn) {
+          String(lastLocalUser?.content || "") === String(latestServerItem.query || "");
+        if (
+          latestSyncedIndex !== -1 &&
+          isLatestTurn &&
+          !isSuspendedHistoryStatus(latestServerItem?.status)
+        ) {
           if (activeStreamDraft) {
             finishRecoveredTurn();
           } else {
@@ -14361,6 +14770,7 @@ onMounted(() => {
     } catch (err) {
       console.warn("[LifeCycle] Failed to sync session on visibility change:", err);
     }
+    if (syncGeneration !== visibilitySyncGeneration) return;
 
     if (attempt < maxAttempts) {
       // 判据只看「有语义」的最后一条：首屏历史末尾的 system 分隔符不代表任何轮次状态，
@@ -14381,7 +14791,9 @@ onMounted(() => {
       // 只有「带重试的调用」才存在「重试耗尽」这件事。恢复器是按 (1, 1) 调用的周期
       // 轮询，它本身就靠外层定时器反复重试；若也落进这个兜底分支，就会每 3s 调一次
       // markOutputCompleted，把仍被后端锁住的输入框反复解锁，并留下「输出已完成」标记。
-      if (isProcessing.value) {
+      // 同时必须守卫 `!streamInFlight && !hasPendingConfirmation()`：客户端正在读恢复流
+      // （或仍有待确认卡）时，旧轮询重试耗尽绝不能把当前在途流的 isProcessing 清掉。
+      if (isProcessing.value && !streamInFlight && !hasPendingConfirmation()) {
         isProcessing.value = false;
       }
       // 历史同步重试已耗尽，说明前端再也拿不到更权威的进展信号。此时若界面已无待确认
@@ -14606,6 +15018,7 @@ onUnmounted(() => {
   afterStreamSnapshotRestored = null;
   recoveryPending.value = false;
   if (handlers?.clearVisibilitySyncTimer) handlers.clearVisibilitySyncTimer();
+  cancelPendingHistorySync = () => {};
   if (handlers?.clearRunRecoveryTimer) handlers.clearRunRecoveryTimer();
   if (handlers?.clearStreamReplayTimer) handlers.clearStreamReplayTimer();
   clearRunStatusNudge();
@@ -14617,19 +15030,7 @@ onUnmounted(() => {
 });
 </script>
 <style>
-@keyframes fade-in-up {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-.animate-fade-in-up {
-  animation: fade-in-up 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
-}
+
 @keyframes pulse-fast {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
@@ -14746,7 +15147,7 @@ onUnmounted(() => {
 :deep(.markdown-body pre) {
   margin-top: 1em;
   margin-bottom: 1em;
-  padding: 1.25em 1em 1em 1em;
+  padding: 0.875em 1em;
   background-color: #f8fafc;
   color: #0f172a;
   border: 1px solid #e5e7eb;
@@ -14761,18 +15162,6 @@ onUnmounted(() => {
   background-color: #0f172a;
   color: #f1f5f9;
   border-color: #1e293b;
-}
-:deep(.markdown-body pre):before {
-  content: "";
-  position: absolute;
-  top: 10px;
-  left: 12px;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background-color: #ff5f56;
-  box-shadow: 16px 0 0 #ffbd2e, 32px 0 0 #27c93f;
-  z-index: 1;
 }
 :deep(.markdown-body ul, .markdown-body ol) {
   padding-left: 1.5em;

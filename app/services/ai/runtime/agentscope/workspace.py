@@ -10,18 +10,21 @@ import inspect
 import json
 import logging
 import os
+import shlex
 import re
 import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import Mapping
-from dataclasses import replace
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
+from app.services.ai.runtime.agentscope.build_progress import BuildStageTimer
 from app.services.ai.runtime.agentscope.tool_timeout import (
     apply_sandbox_gateway_timeout,
 )
+from app.services.ai.runtime.sandbox_errors import SandboxUnavailableError
 from app.services.ai.tools.registry import AGENTSCOPE_BUILTIN_TOOL_ALIASES
 
 logger = logging.getLogger(__name__)
@@ -52,9 +55,101 @@ _k8s_workspace_locks: dict[str, asyncio.Lock] = {}
 _k8s_workspace_last_used: dict[str, float] = {}
 _k8s_workspace_reaper_task: asyncio.Task[None] | None = None
 _workspace_sandbox_refs: dict[str, str] = {}
+#: 未命中的工作区准备按 cache_key 单飞（见 :func:`_await_workspace_build`）：preflight
+#: 预热与构建段会打到同一个键上，同一份工作只该干一次。
+_workspace_inflight: dict[str, asyncio.Task[Any]] = {}
+#: 最近一次构建的分段测量（cache_key → :class:`WorkspacePrepareTrace`）。
+#: 只用于展示与日志，不参与任何判断。
+_workspace_prepare_traces: dict[str, "WorkspacePrepareTrace"] = {}
 _docker_workspace_reaper_task: asyncio.Task[None] | None = None
 #: 用户级（``<root>/<user_key>``）宿主机准备锁：见 :func:`_sandbox_host_prepare_lock`。
 _sandbox_host_prepare_locks: dict[str, asyncio.Lock] = {}
+
+
+#: 工作区准备分段测量的子阶段名 → 摘要里的展示名（顺序即摘要顺序）。
+_WORKSPACE_TRACE_STAGE_LABELS: dict[str, str] = {
+    "config": "配置与会话目录",
+    # 权限禁用集合与技能扫描都会改变 skill_paths，但开销来源完全不同：前者是一次
+    # 权限查询（Redis 命中后还可能补一次明细聚合，未命中直接走 DB），后者是逐个目录
+    # 读 SKILL.md 的纯磁盘 IO。合成一格时「15s」无法判断该优化谁，故拆开测。
+    "forbidden": "权限禁用集合",
+    "skills": "技能发现",
+    "sandbox": "沙箱获取",
+    "preseed": "技能快照播种",
+    "session": "会话工作区初始化",
+}
+#: 摘要里 notes 的展示名。
+_WORKSPACE_TRACE_NOTE_LABELS: dict[str, str] = {
+    "policy": "策略",
+    "skills": "技能",
+    "sandbox": "沙箱",
+    "copied": "新播种",
+    "refreshed": "换版",
+    "pruned": "清理",
+}
+#: 沙箱获取结果 → 摘要文案。
+_WORKSPACE_TRACE_SANDBOX_TEXT: dict[str, str] = {
+    "lazy": "待按需拉起",
+    "reused": "复用存活沙箱",
+    "created": "本轮新建",
+    "none": "无（宿主工作区）",
+}
+#: 超过这个时长就以 WARNING 打一条带分解的日志（首 token 前的静默期要能追）。
+_WORKSPACE_PREPARE_SLOW_WARN_MS = 3000.0
+
+
+@dataclass
+class WorkspacePrepareTrace:
+    """工作区准备的「花在哪、遇到了什么」的测量结果。
+
+    单独一个对象而不是直接往构建计时器里写，是因为这段准备可能**不是本轮发起的**：
+    preflight 预热先跑，本轮构建只是接续同一次工作（见
+    :func:`_await_workspace_build`）。子阶段耗时属于那次构建，本轮等待时间可能只有
+    几百毫秒，所以两者分开记录，由调用方决定怎么展示——绝不把父阶段墙钟改写成子阶段
+    之和，那是在编数据。
+
+    ``Workflow``：由 :func:`get_local_workspace` 内部创建并测量，调用方传入一个空对象
+    接收（:meth:`absorb`），随后自行决定怎么用（时间线明细 / 日志 / 卡片 details）。
+    """
+
+    #: ``(子阶段名, 毫秒)``，按真实执行顺序。
+    stages: list[tuple[str, float]] = field(default_factory=list)
+    #: 关键事实：沙箱策略、技能数量、沙箱是本轮新建还是复用。
+    notes: dict[str, Any] = field(default_factory=dict)
+    #: 那次构建的真实总耗时（毫秒）。
+    total_ms: float = 0.0
+    #: 本轮是否只是接续了一次已经在跑的构建（预热先发起）。
+    joined_inflight: bool = False
+
+    def absorb(self, other: "WorkspacePrepareTrace", *, joined: bool) -> None:
+        """拷贝另一次构建的测量结果（``joined`` 标记本轮是否只是接续它）。"""
+        self.stages = list(other.stages)
+        self.notes = dict(other.notes)
+        self.total_ms = other.total_ms
+        self.joined_inflight = joined
+
+    def summary(self) -> str:
+        """一行中文摘要，给日志与 ``workspace:prepare`` 卡片的 details 用。"""
+        parts: list[str] = []
+        if self.joined_inflight:
+            parts.append(f"接续预热中的构建（该次构建共 {self.total_ms:.0f}ms）")
+        for key, value in self.notes.items():
+            if value is None or value == "":
+                continue
+            if key == "sandbox":
+                parts.append(
+                    f"{_WORKSPACE_TRACE_NOTE_LABELS.get(key, key)}="
+                    f"{_WORKSPACE_TRACE_SANDBOX_TEXT.get(str(value), value)}"
+                )
+                continue
+            parts.append(f"{_WORKSPACE_TRACE_NOTE_LABELS.get(key, key)}={value}")
+        slowest = max(self.stages, key=lambda item: item[1], default=None)
+        if slowest is not None and self.total_ms >= 1000.0:
+            parts.append(
+                f"最慢：{_WORKSPACE_TRACE_STAGE_LABELS.get(slowest[0], slowest[0])} "
+                f"{slowest[1]:.0f}ms"
+            )
+        return "；".join(parts)
 
 
 def _sandbox_host_prepare_lock(host_workdir: str) -> asyncio.Lock:
@@ -137,20 +232,23 @@ async def resolve_effective_sandbox_idle_seconds(*, default_seconds: float) -> f
 _effective_sandbox_idle_seconds = resolve_effective_sandbox_idle_seconds
 
 
-class DockerSandboxUnavailableError(RuntimeError):
+class DockerSandboxUnavailableError(SandboxUnavailableError):
     """Docker 沙箱未能初始化，调用方不得回退到宿主 Bash。"""
 
     def __init__(
         self,
         message: str,
         *,
+        policy: str = "docker",
         reason_code: str = "docker_workspace_start_failed",
         user_message: str | None = None,
     ) -> None:
-        super().__init__(message)
-        self.reason_code = reason_code
-        self.user_message = user_message or (
-            "Docker 沙箱不可用，Bash 未执行。请检查 Docker daemon、镜像和权限。"
+        super().__init__(
+            message,
+            policy=policy,
+            reason_code=reason_code,
+            user_message=user_message
+            or "Docker 沙箱不可用，Bash 未执行。请检查 Docker daemon、镜像和权限。",
         )
 
 
@@ -296,18 +394,33 @@ def discover_platform_skill_paths(
     paths: list[str] = []
     from app.utils.skill_metadata import is_skill_enabled, parse_skill_frontmatter
 
-    for entry in sorted(os.listdir(skills_root)):
-        skill_dir = os.path.join(skills_root, entry)
-        if os.path.isdir(skill_dir) and os.path.isfile(os.path.join(skill_dir, "SKILL.md")):
-            if allowlist is not None and entry not in allowlist:
-                continue
-            if entry in forbidden:
-                continue
-            # 过滤禁用的技能
-            meta = parse_skill_frontmatter(entry, os.path.join(skill_dir, "SKILL.md"))
-            if not is_skill_enabled(meta):
-                continue
-            paths.append(os.path.abspath(skill_dir))
+    # 用 scandir 而不是 listdir + isdir：目录项类型由 readdir 的 d_type 直接给出，
+    # 省掉「每个条目一次 stat」。技能库上千条时这一项就是秒级差距（网络盘/同步盘上
+    # 单次 stat 可达毫秒量级）。白名单/禁用过滤放在读 SKILL.md 之前——只有真正入选的
+    # 技能才需要 open + 解析 frontmatter。
+    try:
+        with os.scandir(skills_root) as scan:
+            entries = sorted(scan, key=lambda item: item.name)
+    except OSError as exc:
+        logger.warning("[workspace] Failed to scan skills root %s: %s", skills_root, exc)
+        return []
+
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        name = entry.name
+        if allowlist is not None and name not in allowlist:
+            continue
+        if name in forbidden:
+            continue
+        skill_md = os.path.join(entry.path, "SKILL.md")
+        if not os.path.isfile(skill_md):
+            continue
+        # 过滤禁用的技能
+        meta = parse_skill_frontmatter(name, skill_md)
+        if not is_skill_enabled(meta):
+            continue
+        paths.append(os.path.abspath(entry.path))
 
     # 追加用户个人技能路径
     if user_info:
@@ -337,11 +450,143 @@ def discover_platform_skill_paths(
     return paths
 
 
+#: 后台配置的 ``agentscope_workspace_root`` 绝不能**恰好等于**的系统目录。
+#:
+#: 拦的不是"越权读写"（那由 ``fs_access`` 负责），而是"工作区根本身就选在系统目录"：
+#: 一旦踩中，技能播种与会话目录会直接写进 ``/`` 或 ``/etc``，空闲回收还会对着系统
+#: 目录做 rmtree。``/app`` 只在这里拦——它的子孙（容器内默认的
+#: ``/app/data/agent_workspaces``）是合法值。
+_PROTECTED_WORKSPACE_ROOT_EXACT = frozenset(
+    {
+        "/",
+        "/Applications",
+        "/Library",
+        "/System",
+        "/Users",
+        "/app",
+        "/bin",
+        "/boot",
+        "/data",
+        "/dev",
+        "/etc",
+        "/home",
+        "/lib",
+        "/lib64",
+        "/media",
+        "/mnt",
+        "/opt",
+        "/private",
+        "/proc",
+        "/root",
+        "/run",
+        "/sbin",
+        "/srv",
+        "/sys",
+        "/tmp",
+        "/usr",
+        "/var",
+        "/workspace",
+    }
+)
+
+#: 绝不允许工作区根落在其**内部**的系统目录（比上面更严：子孙也不许）。
+#:
+#: ``/var`` 与 ``/private`` 刻意只出现在上面的 exact 名单里：macOS 的 ``/tmp``、
+#: ``/var/folders`` 经 realpath 解析后都在 ``/private`` 下，若列为前缀会把测试临时
+#: 目录、正常部署路径一并误杀。
+_PROTECTED_WORKSPACE_ROOT_PREFIXES = (
+    "/Applications",
+    "/Library",
+    "/System",
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/proc",
+    "/root",
+    "/sbin",
+    "/sys",
+    "/usr",
+)
+
+
+def _repository_root_dir() -> str:
+    """平台代码根目录（``workspace.py`` 往上 5 层到仓库根）。"""
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), *[os.pardir] * 5))
+
+
+#: 已经就"配置值非法"告警过的原始值。
+#:
+#: ``resolve_workspace_root()`` 在每次构建会话工作区时都会被调用，若配置一直非法，
+#: 逐次打 error 日志会把日志刷满。这里只对**第一次**见到的非法值告警；集合本身有
+#: 上限，避免长期运行下无限增长。
+_WARNED_BAD_WORKSPACE_ROOTS: set[str] = set()
+_WARNED_BAD_WORKSPACE_ROOTS_LIMIT = 16
+
+
+def workspace_root_config_error(raw: Any) -> str | None:
+    """校验后台配置的工作区根，返回错误原因；合法时返回 ``None``。
+
+    历史实现是 ``os.path.abspath(str(raw))`` 照单全收，于是：
+
+    * 配成相对路径 ``20`` 得到 ``<cwd>/20``——单测把 ``ConfigService.get`` 一刀切
+      成返回 ``"20"`` 时，技能快照就被 copytree 进了仓库根（仓库根 ``./20/admin__1/``
+      就是这么来的）；
+    * 配成 ``/`` 得到根目录，后续 ``makedirs`` / 写入直接落到宿主根。
+
+    这类值必须忽略并回退 ``default_workspace_root()``，绝不能"照配执行"。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return "空值"
+    if any(char in text for char in ("\n", "\r", "\t", "\0")):
+        return "包含控制字符或换行"
+    if not os.path.isabs(text):
+        return "不是绝对路径"
+    # 同时看"字面规范路径"与"解引用软链接后的路径"：前者给出可读的拒绝理由
+    # （`/etc` 不会被 macOS 解析成 `/private/etc` 而误导管理员），后者防软链接绕过。
+    literal = os.path.normpath(os.path.abspath(text))
+    resolved = os.path.normpath(os.path.realpath(text))
+    for candidate in (literal, resolved):
+        if candidate in _PROTECTED_WORKSPACE_ROOT_EXACT:
+            return "指向系统敏感目录"
+        for prefix in _PROTECTED_WORKSPACE_ROOT_PREFIXES:
+            if candidate == prefix or candidate.startswith(prefix + os.sep):
+                return f"位于系统目录 {prefix} 下"
+    repository_root = os.path.normpath(os.path.realpath(_repository_root_dir()))
+    for candidate in {literal, resolved}:
+        if candidate == repository_root:
+            return "指向平台代码根目录"
+        if repository_root.startswith(candidate + os.sep):
+            return "是平台代码根目录的上级目录"
+    if len([part for part in literal.split(os.sep) if part]) < 2:
+        return "层级过浅"
+    return None
+
+
 async def resolve_workspace_root(*, ensure_exists: bool = True) -> str:
     try:
         from app.services.config_service import ConfigService
 
         raw = await ConfigService.get("agentscope_workspace_root")
+        if raw:
+            # 先校验再 abspath：非法值（相对路径、系统根、代码根）一律回退默认根。
+            config_error = workspace_root_config_error(raw)
+            if config_error:
+                if str(raw) not in _WARNED_BAD_WORKSPACE_ROOTS:
+                    if len(_WARNED_BAD_WORKSPACE_ROOTS) >= _WARNED_BAD_WORKSPACE_ROOTS_LIMIT:
+                        _WARNED_BAD_WORKSPACE_ROOTS.clear()
+                    _WARNED_BAD_WORKSPACE_ROOTS.add(str(raw))
+                    logger.error(
+                        "[workspace] 忽略非法的 agentscope_workspace_root=%r（%s），"
+                        "回退默认工作区根 %s。请在系统配置中填写部署时真实存在的绝对路径。",
+                        raw,
+                        config_error,
+                        default_workspace_root(),
+                    )
+                raw = None
         if raw:
             configured = os.path.abspath(str(raw))
             # 个人技能源由 default_workspace_root() 拼接（不读该配置），二者不一致时
@@ -896,8 +1141,15 @@ async def _prune_forbidden_session_skills(workdir: str, user_info: dict | None) 
     if not os.path.isfile(index_path) and not os.path.isfile(legacy_index_path):
         return
     prune_index_path = index_path if os.path.isfile(index_path) else legacy_index_path
-    # ③ 与权限无关，先做：即便权限查询失败也不影响"源已删除"这条硬事实
-    _prune_removed_session_skills_from_ledger(workdir, prune_index_path, user_info)
+    # ③ 与权限无关，先做：即便权限查询失败也不影响"源已删除"这条硬事实。
+    # 这里到函数末尾全是同步磁盘 IO（读账本、删副本、走目录），放在协程里会卡住
+    # 整个 worker 的事件循环——缓存命中路径每轮都会走到，所以一律放线程里。
+    await asyncio.to_thread(
+        _prune_removed_session_skills_from_ledger,
+        workdir,
+        prune_index_path,
+        user_info,
+    )
     try:
         from app.services.ai.skills.policy import get_forbidden_skill_ids
 
@@ -906,24 +1158,32 @@ async def _prune_forbidden_session_skills(workdir: str, user_info: dict | None) 
         logger.warning("[workspace] Failed to resolve forbidden skills for pruning: %s", exc)
         forbidden_skill_ids = set()
     # ② 管理端禁用只解析账本里出现过的 id，不做全库扫描
-    ledger_ids = _read_session_skills_ledger(workdir)
+    ledger_ids = await asyncio.to_thread(_read_session_skills_ledger, workdir)
     unavailable_ids = {
         str(item).strip() for item in (forbidden_skill_ids or ()) if str(item).strip()
     }
-    unavailable_ids |= _disabled_platform_skill_ids(
-        str((entry or {}).get("skill_id") or "").strip()
-        for entry in ledger_ids.values()
+    unavailable_ids |= await asyncio.to_thread(
+        _disabled_platform_skill_ids,
+        [
+            str((entry or {}).get("skill_id") or "").strip()
+            for entry in ledger_ids.values()
+        ],
     )
     if not unavailable_ids:
         return
-    _prune_stale_session_skills(
-        skill_root,
-        prune_index_path,
-        _forbidden_skill_hashes(unavailable_ids),
-        unavailable_ids,
-        personal_hashes=_personal_skill_hash_index(user_info),
-    )
-    _prune_session_skill_partitions(workdir)
+
+    def _prune_sync() -> int:
+        """同步清理：哈希索引进线程里现算，别在主线程读一遍目录。"""
+        return _prune_stale_session_skills(
+            skill_root,
+            prune_index_path,
+            _forbidden_skill_hashes(unavailable_ids),
+            unavailable_ids,
+            personal_hashes=_personal_skill_hash_index(user_info),
+        )
+
+    await asyncio.to_thread(_prune_sync)
+    await asyncio.to_thread(_prune_session_skill_partitions, workdir)
 
 
 def _session_skill_seed_dir(workdir: str) -> str:
@@ -1056,8 +1316,13 @@ def _preseed_session_skills(
     skill_paths: list[str],
     forbidden_skill_ids: Iterable[str] | None = None,
     user_info: dict | None = None,
-) -> None:
+) -> dict[str, int]:
     """把平台技能快照铺进 ``<workdir>/skills/.seed``（AgentScope 的 seed 模板）。
+
+    返回本次的统计（``total`` / ``copied`` / ``refreshed`` / ``pruned`` / ``removed``）：
+    这段是**每会话一份真实副本**的同步磁盘 IO，是「工作区准备」忽快忽慢的主要变量之一，
+    没有这些数字就只能靠猜。调用方（:func:`get_local_workspace`）把它放线程里跑并把
+    统计带进 :class:`WorkspacePrepareTrace`。
 
     AgentScope 的 ``LocalWorkspace.initialize`` 会把 ``skill_paths`` 逐个 ``copytree`` 进会话
     目录（每会话一份完整物理副本），并在这一过程中把平铺技能迁移进 ``.seed``、顺手丢掉平台
@@ -1087,6 +1352,15 @@ def _preseed_session_skills(
     ledger_moved = os.path.isfile(legacy_index_path) and not os.path.isfile(index_path)
     migrated = _migrate_flat_session_skills(workdir)
     os.makedirs(seed_dir, exist_ok=True)
+    #: 本次播种的统计（调用方带进分段测量，见 WorkspacePrepareTrace）。
+    stats: dict[str, int] = {
+        "total": 0,
+        "copied": 0,
+        "refreshed": 0,
+        "pruned": 0,
+        "removed": 0,
+        "migrated": int(migrated),
+    }
 
     # 先清掉"禁用之前"铺进来的技能（直接读文件即可绕过禁用），再走下面的 hash 差集——不能
     # 早退。早退会让新增/改版技能只能等 AgentScope 自己复制，而它按 frontmatter name 命名，
@@ -1211,6 +1485,7 @@ def _preseed_session_skills(
             entry["hash"] = skill_hash
             entry["skill_id"] = skill_id
             updated = True
+            stats["refreshed"] += 1
             continue
 
         # Resolve agent-facing name conflict (mirror AgentScope loop)
@@ -1251,6 +1526,7 @@ def _preseed_session_skills(
             "skill_name": agent_name,
             "skill_id": skill_id,
         }
+        stats["copied"] += 1
         existing_hashes.add(skill_hash)
         existing_agent_names.add(agent_name)
         existing_dir_names.add(dir_name)
@@ -1313,6 +1589,12 @@ def _preseed_session_skills(
         # pruned 也要算：只清 .seed 不清分区，被禁技能的副本会继续留在会话目录里可读。
         if updated or migrated or pruned:
             _prune_session_skill_partitions(workdir)
+
+    stats["total"] = len(existing)
+    stats["pruned"] = int(pruned)
+    # ``_prune_removed_session_skills`` 返回被删掉的**目录名列表**（不是条数）。
+    stats["removed"] = len(removed or ())
+    return stats
 
 
 SANDBOX_POLICY_LOCAL = "local"
@@ -2951,9 +3233,32 @@ def _drop_docker_workspace_entry_locked(cache_key: str) -> tuple[Any, list[Any]]
             continue
         cached = _workspace_cache.pop(workspace_cache_key, None)
         _workspace_sandbox_refs.pop(workspace_cache_key, None)
+        # 分段测量只服务展示：条目摘掉时一并清，避免下一轮读到上一次构建的读数。
+        _workspace_prepare_traces.pop(workspace_cache_key, None)
         if cached is not None:
             pairs.append(cached)
     return sandbox, pairs
+
+
+def _docker_sandbox_confirmed_alive(cache_key: str) -> bool:
+    """缓存里的 docker 沙箱是否**刚被确认还活着**（存活探测窗口之内）。
+
+    ``is_alive`` 只是普通布尔属性，容器被回收 / ``docker rm`` / 别的实例
+    ``create_or_replace`` 之后它仍是 ``True``。所以「缓存里有条目」不等于「容器还在」：
+    真正确认只有两种来源——刚刚建好，或最近 :data:`DOCKER_WORKSPACE_ALIVE_PROBE_TTL_SECONDS`
+    内做过一次 ``container.show()``（两者都会写 ``_docker_workspace_verified_at``）。
+
+    **为什么这点很关键**：构建路径（``lazy_sandbox=True``）只有在沙箱「确认活着」时才
+    直接复用缓存条目。否则一旦进程里残留着一条旧条目（``is_alive`` 还是 True、容器其实
+    早被空闲回收），就会走 eager 路径去探测，探测判死后**当场重建一台容器**——十几秒
+    全记在首 token 之前，而多数轮次根本不会调用 Bash。给惰性代理则把这笔钱推到真正
+    需要 Bash 的那一刻（代理的 ``ensure_ready`` 会走同一个 ``_acquire_docker_workspace``，
+    探测、重建、引用计数一样不少）。
+    """
+    verified_at = _docker_workspace_verified_at.get(cache_key, 0.0)
+    if not verified_at:
+        return False
+    return (time.monotonic() - verified_at) < DOCKER_WORKSPACE_ALIVE_PROBE_TTL_SECONDS
 
 
 async def _acquire_docker_workspace(
@@ -3145,6 +3450,7 @@ def _drop_k8s_workspace_entry_locked(cache_key: str) -> tuple[Any, list[Any]]:
             continue
         cached = _workspace_cache.pop(workspace_cache_key, None)
         _workspace_sandbox_refs.pop(workspace_cache_key, None)
+        _workspace_prepare_traces.pop(workspace_cache_key, None)
         if cached is not None:
             pairs.append(cached)
     return sandbox, pairs
@@ -4529,6 +4835,65 @@ class LazySandboxWorkspaceProxy:
         return None
 
 
+async def _build_outcome(builder: Callable[[], Awaitable[Any]]) -> Any:
+    """把构建结果包成 ``(pair, error)``，让多个等待者共享同一次失败。
+
+    这里刻意不往上抛：等待者可能不止一个，同一个异常实例被反复 ``raise`` 会让
+    traceback 相互串联；包成元组后由各等待者自行抛出，类型与
+    ``reason_code`` 等属性一个都不丢。
+    """
+    try:
+        return await builder(), None
+    except asyncio.CancelledError:
+        # 取消不是「构建失败」，必须原样传播，否则等待者会把取消当成成功。
+        raise
+    except BaseException as exc:  # noqa: BLE001 - 由等待者决定怎么处理
+        return None, exc
+
+
+def _discard_inflight_build(task: "asyncio.Task[Any]", key: str) -> None:
+    """构建任务结束后从单飞表里摘掉自己（只摘自己，别误删并发方新建的那条）。"""
+    if _workspace_inflight.get(key) is task:
+        _workspace_inflight.pop(key, None)
+
+
+async def _await_workspace_build(
+    cache_key: str,
+    builder: Callable[[], Awaitable[Any]],
+    prepare_trace: WorkspacePrepareTrace | None,
+) -> Any:
+    """按 ``cache_key`` 单飞执行「缓存未命中」的工作区准备。
+
+    **为什么必须单飞**：preflight 预热用 ``asyncio.wait_for``（docker/local 10s、
+    e2b/ssh 60s）包着同一个 ``get_local_workspace``。超时只应该结束「这一方不再等」，
+    但此前那次构建会连同已经铺好的技能快照一起被取消、作废，随后构建段从头再干一遍
+    ——用户白等两轮（预热 10s + 构建 60s）。现在构建跑在独立 task 里、等待者用
+    ``shield`` 等：超时只是这一方退出，活儿照旧只干一遍，构建段接续同一次工作。
+
+    同理，同一会话被并发触发（重新生成、多个子代理共用会话）时也只会建一份。
+    """
+    task = _workspace_inflight.get(cache_key)
+    joined = task is not None
+    if task is None:
+        # 并发方可能刚好在「判未命中」之后把结果填好了：再查一次，别重复建。
+        done = _workspace_cache.get(cache_key)
+        if done is not None:
+            return done
+        task = asyncio.ensure_future(_build_outcome(builder))
+        _workspace_inflight[cache_key] = task
+        task.add_done_callback(
+            lambda finished, key=cache_key: _discard_inflight_build(finished, key)
+        )
+        joined = False
+    pair, error = await asyncio.shield(task)
+    if error is not None:
+        raise error
+    recorded = _workspace_prepare_traces.get(cache_key)
+    if prepare_trace is not None and recorded is not None:
+        prepare_trace.absorb(recorded, joined=joined)
+    return pair
+
+
 async def get_local_workspace(
     *,
     user_id: str | int | None,
@@ -4538,6 +4903,7 @@ async def get_local_workspace(
     skills_custom: bool = False,
     allowed_global_skills: list[str] | None = None,
     lazy_sandbox: bool = False,
+    prepare_trace: WorkspacePrepareTrace | None = None,
 ) -> tuple[Any, Any] | None:
     """Return ``(sandbox_ws, local_ws)`` for the conversation.
 
@@ -4551,8 +4917,14 @@ async def get_local_workspace(
     ``conversation_id`` is available; either element may be ``None``:
       - local policy            -> ``(None, LocalWorkspace)``
       - docker/e2b/ssh policy   -> ``(sandbox_ws, LocalWorkspace)``
-      - no id                   -> ``None``
-      - Docker init failure     -> ``DockerSandboxUnavailableError`` (fail-closed)
+      - no id + local           -> ``None``（local 本就没有沙箱）
+      - no id + 远端沙箱策略    -> ``SandboxUnavailableError``（fail-closed，调用方降级）
+      - Docker/K8s init failure -> ``DockerSandboxUnavailableError`` / ``K8sSandboxUnavailableError``
+      - e2b/ssh init failure    -> ``SandboxUnavailableError``
+      - local init failure      -> ``None``（保持历史容错，bind 侧只拦文件工具）
+
+    ``prepare_trace``：传入一个空 :class:`WorkspacePrepareTrace` 即可拿到分段耗时与
+    关键事实（谁慢、沙箱是新建还是复用）；不传则完全不记录，行为与改造前一致。
     """
     if not conversation_id:
         from app.services.config_service import (
@@ -4577,6 +4949,23 @@ async def get_local_workspace(
                 reason_code="k8s_workspace_start_failed",
                 user_message="缺少会话 ID，K8S 沙箱未启动，代码未执行。",
             )
+        if sandbox_policy_is_sandbox(policy_without_conversation) and (
+            policy_without_conversation
+            not in (SANDBOX_POLICY_DOCKER, SANDBOX_POLICY_K8S)
+        ):
+            # e2b / ssh：此前与 local 一起落到下面的 ``return None``。但 local 返回
+            # None 是"本来就没有沙箱"，而远端沙箱返回 None 会被调用方当成"工作区
+            # 已就绪"，最后只能由 bind 抛出一句语焉不详的"沙箱未就绪"。这里与
+            # docker/k8s 对齐：明确说清是缺会话 ID，让调用方走统一降级分支。
+            raise SandboxUnavailableError(
+                f"{policy_without_conversation} sandbox requires a conversation_id",
+                policy=policy_without_conversation,
+                reason_code=f"{policy_without_conversation}_workspace_start_failed",
+                user_message=(
+                    f"缺少会话 ID，{str(policy_without_conversation).upper()} 沙箱未启动，"
+                    "Bash 未执行（已降级为仅文件工具）。"
+                ),
+            )
         return None
 
     from app.services.config_service import (
@@ -4584,6 +4973,9 @@ async def get_local_workspace(
         resolve_effective_sandbox_policy,
     )
 
+    # 分段计时从这里开始：配置/目录、技能发现、沙箱获取、技能播种、会话初始化。
+    # 只在真正构建时才有内容（缓存命中走上方的早退，通常几十毫秒）。
+    prepare = BuildStageTimer()
     root = await resolve_workspace_root()
     workdir = resolve_session_workdir(
         root=root,
@@ -4605,6 +4997,7 @@ async def get_local_workspace(
     if policy not in KNOWN_SANDBOX_POLICIES:
         logger.warning("[workspace] Unknown sandbox_policy=%r, falling back to local", policy)
         policy = SANDBOX_POLICY_LOCAL
+    prepare.mark("config")
     # Ensure each (workdir, skills, policy) caches independently so an in-flight
     # policy switch never hands back a workspace built under another strategy.
     #
@@ -4615,12 +5008,17 @@ async def get_local_workspace(
     from app.services.ai.skills.policy import get_forbidden_skill_ids
 
     forbidden_skill_ids = await get_forbidden_skill_ids(_resolve_identity_user_id(user_info))
-    skill_paths = discover_platform_skill_paths(
+    prepare.mark("forbidden")
+    # 技能发现要逐个目录读 SKILL.md 解析 frontmatter（同步 IO，随技能库线性增长），
+    # 同样放线程里，别在首 token 前的关键路径上占着事件循环。
+    skill_paths = await asyncio.to_thread(
+        discover_platform_skill_paths,
         user_info=user_info,
         skills_custom=skills_custom,
         allowed_global_skills=allowed_global_skills,
         forbidden_skill_ids=forbidden_skill_ids,
     )
+    prepare.mark("skills")
 
     cache_key = f"{workdir}::{skills_fp}::{policy}"
 
@@ -4695,135 +5093,211 @@ async def get_local_workspace(
         SANDBOX_POLICY_SSH,
     )
 
-    sandbox_ws = None
-    sandbox_cache_key: str | None = None
-    sandbox_user_key: str | None = None
-    try:
-        if is_sandbox:
-            if policy in (SANDBOX_POLICY_DOCKER, SANDBOX_POLICY_K8S):
-                sandbox_user_key = _resolve_sandbox_user_key(
-                    user_id=user_id,
-                    user_name=user_name,
-                    user_info=user_info,
-                )
-                if not sandbox_user_key:
-                    raise RuntimeError(
-                        f"{policy.upper()} sandbox requires an authenticated user identity"
+    async def _build_pair() -> Any:
+        """构建并缓存 ``(sandbox_ws, local_ws)``；异常语义与改造前完全一致。"""
+        sandbox_ws = None
+        sandbox_cache_key: str | None = None
+        sandbox_user_key: str | None = None
+        skills_stats: dict[str, Any] = {}
+        #: 沙箱这一格的结果（摘要用）：none / lazy / reused / created。
+        sandbox_outcome = "none"
+        try:
+            if is_sandbox:
+                if policy in (SANDBOX_POLICY_DOCKER, SANDBOX_POLICY_K8S):
+                    sandbox_user_key = _resolve_sandbox_user_key(
+                        user_id=user_id,
+                        user_name=user_name,
+                        user_info=user_info,
                     )
+                    if not sandbox_user_key:
+                        raise RuntimeError(
+                            f"{policy.upper()} sandbox requires an authenticated user identity"
+                        )
 
-                # 用与 _acquire_* 完全相同的算键函数判定「沙箱已经活着」：手写键格式
-                # （此前少了技能集合令牌）会恒不命中，结果是一律走 lazy 代理，连
-                # 「建会话即持有引用」的语义都丢了——没用过 Bash 的会话 refcount 为 0，
-                # 别的会话释放/回收就能把它关掉。
-                is_already_alive = False
-                if policy == SANDBOX_POLICY_DOCKER:
-                    d_key = _docker_workspace_cache_key(root, sandbox_user_key, skill_paths)
-                    existing_dk = _docker_workspace_cache.get(d_key)
-                    if existing_dk is not None and getattr(existing_dk, "is_alive", True) is not False:
-                        is_already_alive = True
-                elif policy == SANDBOX_POLICY_K8S:
-                    k_key = _k8s_workspace_cache_key(root, sandbox_user_key, skill_paths)
-                    existing_k8s = _k8s_workspace_cache.get(k_key)
-                    if existing_k8s is not None and getattr(existing_k8s, "is_alive", True) is not False:
-                        is_already_alive = True
-
-                if lazy_sandbox and not is_already_alive:
-                    sandbox_ws = LazySandboxWorkspaceProxy(
-                        policy=policy,
-                        root=root,
-                        user_key=sandbox_user_key,
-                        skill_paths=skill_paths,
-                        cache_key=cache_key,
-                    )
-                else:
+                    # 用与 _acquire_* 完全相同的算键函数判定「沙箱已经活着」：手写键格式
+                    # （此前少了技能集合令牌）会恒不命中，结果是一律走 lazy 代理，连
+                    # 「建会话即持有引用」的语义都丢了——没用过 Bash 的会话 refcount 为 0，
+                    # 别的会话释放/回收就能把它关掉。
+                    is_already_alive = False
                     if policy == SANDBOX_POLICY_DOCKER:
-                        sandbox_ws, sandbox_cache_key = await _acquire_docker_workspace(
+                        d_key = _docker_workspace_cache_key(root, sandbox_user_key, skill_paths)
+                        existing_dk = _docker_workspace_cache.get(d_key)
+                        # 必须「刚确认活着」才复用：只剩一个 is_alive 属性为 True 的旧条目，
+                        # 容器很可能早被回收，走 eager 就会在首 token 前当场重建一台。
+                        if (
+                            existing_dk is not None
+                            and getattr(existing_dk, "is_alive", True) is not False
+                            and _docker_sandbox_confirmed_alive(d_key)
+                        ):
+                            is_already_alive = True
+                    elif policy == SANDBOX_POLICY_K8S:
+                        k_key = _k8s_workspace_cache_key(root, sandbox_user_key, skill_paths)
+                        existing_k8s = _k8s_workspace_cache.get(k_key)
+                        if existing_k8s is not None and getattr(existing_k8s, "is_alive", True) is not False:
+                            is_already_alive = True
+
+                    if lazy_sandbox and not is_already_alive:
+                        sandbox_ws = LazySandboxWorkspaceProxy(
+                            policy=policy,
                             root=root,
                             user_key=sandbox_user_key,
                             skill_paths=skill_paths,
+                            cache_key=cache_key,
                         )
+                        sandbox_outcome = "lazy"
                     else:
-                        sandbox_ws, sandbox_cache_key = await _acquire_k8s_workspace(
-                            root=root,
-                            user_key=sandbox_user_key,
-                            skill_paths=skill_paths,
-                        )
-            elif policy == SANDBOX_POLICY_E2B:
-                sandbox_ws = await _policy_e2b_workspace(skill_paths)
-            else:
-                sandbox_ws = await _policy_ssh_workspace(skill_paths)
-        else:
-            sandbox_ws = None
-
-        # Host local workspace serving file tools (Read/Write/Edit/Glob/Grep).
-        # For the local policy this is the sole workspace; for sandbox policies
-        # it backs the file tools against the user's host session workdir.
-        from agentscope.workspace import LocalWorkspace
-
-        # Pre-seed session skills/ with real copies + matching .skills index so
-        # AgentScope's initialize() hash-skips all copies instead of duplicating
-        # every skill into each session directory.
-        _preseed_session_skills(workdir, skill_paths, forbidden_skill_ids, user_info)
-        local_ws = LocalWorkspace(
-            workdir=workdir,
-            skill_paths=skill_paths,
-        )
-        if policy in (SANDBOX_POLICY_DOCKER, SANDBOX_POLICY_K8S) and sandbox_user_key:
-            local_ws.workspace_user_root = os.path.join(root, sandbox_user_key)
-            if sandbox_ws is not None and not isinstance(sandbox_ws, LazySandboxWorkspaceProxy):
-                sandbox_ws._platform_sandbox_file_tool_mount_mappings = (
-                    _build_sandbox_file_tool_mount_mappings(
-                        local_ws.workspace_user_root,
-                        public_docs_mounted=bool(
-                            getattr(
-                                sandbox_ws,
-                                "_platform_sandbox_public_docs_mounted",
-                                False,
+                        # 走到这里不是「复用」就是「本轮现场重建」，两者代价差两个数量级，
+                        # 摘要里必须分开写清楚（重建通常意味着容器被回收/镜像要重新构建）。
+                        sandbox_outcome = "reused" if is_already_alive else "created"
+                        if policy == SANDBOX_POLICY_DOCKER:
+                            sandbox_ws, sandbox_cache_key = await _acquire_docker_workspace(
+                                root=root,
+                                user_key=sandbox_user_key,
+                                skill_paths=skill_paths,
                             )
-                        ),
-                    )
-                )
-        await local_ws.initialize()
-        if sandbox_ws is not None:
-            if isinstance(sandbox_ws, LazySandboxWorkspaceProxy):
-                sandbox_ws.local_ws = local_ws
+                        else:
+                            sandbox_ws, sandbox_cache_key = await _acquire_k8s_workspace(
+                                root=root,
+                                user_key=sandbox_user_key,
+                                skill_paths=skill_paths,
+                            )
+                elif policy == SANDBOX_POLICY_E2B:
+                    sandbox_ws = await _policy_e2b_workspace(skill_paths)
+                    sandbox_outcome = "created"
+                else:
+                    sandbox_ws = await _policy_ssh_workspace(skill_paths)
+                    sandbox_outcome = "created"
             else:
-                sandbox_ws._platform_sandbox_policy = policy
-                sandbox_ws._platform_execution_backend = policy
-    except Exception as exc:
-        if sandbox_cache_key is not None:
-            await _release_sandbox_workspace(
-                sandbox_cache_key,
-                reason="host LocalWorkspace initialization failure",
-            )
-        elif sandbox_ws is not None:
-            await _close_workspace_safely(
-                sandbox_ws,
-                reason="host LocalWorkspace initialization failure",
-            )
-        logger.warning("[workspace] Failed to initialize %s workspace workdir=%s: %s", policy, workdir, exc)
-        if policy == SANDBOX_POLICY_DOCKER:
-            if isinstance(exc, DockerSandboxUnavailableError):
-                raise
-            raise DockerSandboxUnavailableError(
-                str(exc),
-                reason_code=_docker_init_reason_code(exc),
-            ) from exc
-        if policy == SANDBOX_POLICY_K8S:
-            from app.services.ai.runtime.agentscope.k8s_workspace import K8sSandboxUnavailableError
-            if isinstance(exc, K8sSandboxUnavailableError):
-                raise
-            raise K8sSandboxUnavailableError(
-                str(exc),
-                reason_code="k8s_workspace_start_failed",
-            ) from exc
-        return None
+                sandbox_ws = None
+            prepare.mark("sandbox")
 
-    pair = (sandbox_ws, local_ws)
-    _workspace_cache[cache_key] = pair
-    if sandbox_cache_key is not None:
-        _workspace_sandbox_refs[cache_key] = sandbox_cache_key
-    return pair
+            # Host local workspace serving file tools (Read/Write/Edit/Glob/Grep).
+            # For the local policy this is the sole workspace; for sandbox policies
+            # it backs the file tools against the user's host session workdir.
+            from agentscope.workspace import LocalWorkspace
+
+            # Pre-seed session skills/ with real copies + matching .skills index so
+            # AgentScope's initialize() hash-skips all copies instead of duplicating
+            # every skill into each session directory.
+            #
+            # 这段是**同步磁盘 IO**（每会话一份真实副本）：直接在协程里跑会把整个
+            # worker 的事件循环卡住，别的会话的 SSE 一起停摆，所以放线程里。
+            skills_stats = await asyncio.to_thread(
+                _preseed_session_skills,
+                workdir,
+                skill_paths,
+                forbidden_skill_ids,
+                user_info,
+            )
+            prepare.mark("preseed")
+            local_ws = LocalWorkspace(
+                workdir=workdir,
+                skill_paths=skill_paths,
+            )
+            # 上游 LocalWorkspace 没有 conversation_id 属性：必须显式挂上，否则
+            # 脚本凭据通道（_ScriptCredentialBashNativeTool）与脚本工具（_bind_script_tool_spec）
+            # 都会拿到 None，导致脚本凭据每次都因 no-conversation-id 静默跳过注入。
+            local_ws.conversation_id = str(conversation_id or "").strip()
+            if policy in (SANDBOX_POLICY_DOCKER, SANDBOX_POLICY_K8S) and sandbox_user_key:
+                local_ws.workspace_user_root = os.path.join(root, sandbox_user_key)
+                if sandbox_ws is not None and not isinstance(sandbox_ws, LazySandboxWorkspaceProxy):
+                    sandbox_ws._platform_sandbox_file_tool_mount_mappings = (
+                        _build_sandbox_file_tool_mount_mappings(
+                            local_ws.workspace_user_root,
+                            public_docs_mounted=bool(
+                                getattr(
+                                    sandbox_ws,
+                                    "_platform_sandbox_public_docs_mounted",
+                                    False,
+                                )
+                            ),
+                        )
+                    )
+            await local_ws.initialize()
+            prepare.mark("session")
+            if sandbox_ws is not None:
+                if isinstance(sandbox_ws, LazySandboxWorkspaceProxy):
+                    sandbox_ws.local_ws = local_ws
+                else:
+                    sandbox_ws._platform_sandbox_policy = policy
+                    sandbox_ws._platform_execution_backend = policy
+        except Exception as exc:
+            if sandbox_cache_key is not None:
+                await _release_sandbox_workspace(
+                    sandbox_cache_key,
+                    reason="host LocalWorkspace initialization failure",
+                )
+            elif sandbox_ws is not None:
+                await _close_workspace_safely(
+                    sandbox_ws,
+                    reason="host LocalWorkspace initialization failure",
+                )
+            logger.warning("[workspace] Failed to initialize %s workspace workdir=%s: %s", policy, workdir, exc)
+            if policy == SANDBOX_POLICY_DOCKER:
+                if isinstance(exc, DockerSandboxUnavailableError):
+                    raise
+                raise DockerSandboxUnavailableError(
+                    str(exc),
+                    reason_code=_docker_init_reason_code(exc),
+                ) from exc
+            if policy == SANDBOX_POLICY_K8S:
+                from app.services.ai.runtime.agentscope.k8s_workspace import K8sSandboxUnavailableError
+                if isinstance(exc, K8sSandboxUnavailableError):
+                    raise
+                raise K8sSandboxUnavailableError(
+                    str(exc),
+                    reason_code="k8s_workspace_start_failed",
+                ) from exc
+            if policy == SANDBOX_POLICY_LOCAL:
+                # local 策略没有沙箱可兜底：宿主的 LocalWorkspace 起不来时保持历史
+                # 行为（返回 None），交由 bind 按 local 语义只拦文件工具，Bash 仍可用。
+                # 这里若改成抛异常，local 模式的容错反而变差。
+                return None
+            # e2b / ssh：此前同样静默 ``return None``，而调用方把 ``None`` 当成
+            # "工作区已就绪"（照常清空降级标记）。若智能体只挂了 Bash、没有文件工具
+            # 去触发 PermissionError，用户命令就会以平台后端的 cwd 直接执行——
+            # 与"沙箱不可用绝不退回宿主执行"的承诺相反。这里必须 fail-closed，
+            # 交给调用方的统一降级分支处理（见 SandboxUnavailableError）。
+            raise SandboxUnavailableError(
+                str(exc),
+                policy=policy,
+                reason_code=f"{policy}_workspace_start_failed",
+                user_message=(
+                    f"{str(policy).upper()} 沙箱不可用，命令未执行。"
+                    "请检查沙箱配置或联系管理员。"
+                ),
+            ) from exc
+
+        pair = (sandbox_ws, local_ws)
+        _workspace_cache[cache_key] = pair
+        if sandbox_cache_key is not None:
+            _workspace_sandbox_refs[cache_key] = sandbox_cache_key
+        recorded = WorkspacePrepareTrace(
+            stages=list(prepare.stages().items()),
+            notes={
+                "policy": policy,
+                "skills": len(skill_paths),
+                "sandbox": sandbox_outcome,
+            }
+            | {
+                key: skills_stats[key]
+                for key in ("copied", "refreshed", "pruned")
+                if skills_stats.get(key)
+            },
+            total_ms=prepare.elapsed_ms(),
+        )
+        _workspace_prepare_traces[cache_key] = recorded
+        if recorded.total_ms >= _WORKSPACE_PREPARE_SLOW_WARN_MS:
+            # 这一段是「首 token 前的静默期」最主要的变量：慢的时候必须能一眼看出
+            # 慢在沙箱、技能播种还是会话初始化，否则只能靠猜（排查见 FAQ 7.3.5 Q7）。
+            logger.warning(
+                "[workspace] 工作区准备耗时 %.0fms（%s）",
+                recorded.total_ms,
+                recorded.summary(),
+            )
+        return pair
+
+    return await _await_workspace_build(cache_key, _build_pair, prepare_trace)
 
 
 async def ensure_docker_workspace(
@@ -4832,12 +5306,21 @@ async def ensure_docker_workspace(
     conversation_id: str | None,
     user_name: str | None = None,
     user_info: dict[str, Any] | None = None,
+    skills_custom: bool = False,
+    allowed_global_skills: list[str] | None = None,
 ) -> Any:
     """Ensure the current user's Docker workspace container is running.
 
     This is a lifecycle-only operation: it initializes or reuses the same
     process-local workspace used by the chat runner and never executes a tool
     command inside the container.
+
+    ``skills_custom`` / ``allowed_global_skills`` **必须与之后的对话构建同源**：
+    沙箱身份（缓存键、容器名、技能目录）都由技能集合令牌决定（见
+    :func:`_sandbox_workspace_id`）。预热时按默认的全量技能建一台、构建时按智能体的
+    白名单再建一台，用户看到的就是「沙箱已经 warm 起来了，可这轮工作区准备还是花了
+    十几秒」——预热的那台压根不是这台，白建还会占资源。调用方（``/sandbox/.../ensure``
+    端点）按会话当前使用的智能体解析这两个值再传进来。
     """
     if not str(conversation_id or "").strip():
         raise DockerSandboxUnavailableError(
@@ -4879,6 +5362,9 @@ async def ensure_docker_workspace(
         conversation_id=str(conversation_id).strip(),
         user_name=user_name,
         user_info=user_info,
+        # 与对话构建同源的技能范围：少了它，预热会按全量技能另建一台用不上的容器。
+        skills_custom=bool(skills_custom),
+        allowed_global_skills=list(allowed_global_skills or []),
         lazy_sandbox=False,
     )
     sandbox_ws, _local_ws = _normalize_workspace_pair(workspace_pair)
@@ -5832,11 +6318,15 @@ async def ensure_k8s_workspace(
     conversation_id: str | None,
     user_name: str | None = None,
     user_info: dict[str, Any] | None = None,
+    skills_custom: bool = False,
+    allowed_global_skills: list[str] | None = None,
 ) -> dict[str, Any]:
     """Start (warm up) or reuse the current user's K8s sandbox workspace.
 
     Mirrors ``ensure_docker_workspace``: goes through ``get_local_workspace``
-    so the Pod shares the exact cache key with the next chat turn.
+    so the Pod shares the exact cache key with the next chat turn — including
+    the skill-set token in ``skills_custom`` / ``allowed_global_skills``, or
+    the warm-up spins up a Pod the coming turn cannot use.
     """
     user_key = await _k8s_runtime_guard(
         user_id=user_id,
@@ -5851,6 +6341,9 @@ async def ensure_k8s_workspace(
         conversation_id=str(conversation_id).strip(),
         user_name=user_name,
         user_info=user_info,
+        # 同 docker 侧：技能集合令牌参与 Pod 身份，预热必须与构建同源。
+        skills_custom=bool(skills_custom),
+        allowed_global_skills=list(allowed_global_skills or []),
         lazy_sandbox=False,
     )
     sandbox_ws, _local_ws = _normalize_workspace_pair(workspace_pair)
@@ -6043,14 +6536,24 @@ async def build_host_only_workspace(
     from app.services.ai.skills.policy import get_forbidden_skill_ids
 
     forbidden_skill_ids = await get_forbidden_skill_ids(_resolve_identity_user_id(user_info))
-    skill_paths = discover_platform_skill_paths(
+    # 降级路径同样在首 token 之前，且沙箱刚失败时用户已经在等，别再拿同步 IO 卡住
+    # 事件循环（与 get_local_workspace 保持同一口径）。
+    skill_paths = await asyncio.to_thread(
+        discover_platform_skill_paths,
         user_info=user_info,
         skills_custom=skills_custom,
         allowed_global_skills=allowed_global_skills,
         forbidden_skill_ids=forbidden_skill_ids,
     )
-    _preseed_session_skills(workdir, skill_paths, forbidden_skill_ids, user_info)
+    await asyncio.to_thread(
+        _preseed_session_skills,
+        workdir,
+        skill_paths,
+        forbidden_skill_ids,
+        user_info,
+    )
     local_ws = LocalWorkspace(workdir=workdir, skill_paths=skill_paths)
+    local_ws.conversation_id = str(conversation_id or "").strip()
     await local_ws.initialize()
     return local_ws
 
@@ -6088,6 +6591,8 @@ async def delete_workspace_for_session(
     for key in list(_workspace_cache.keys()):
         if key == workdir or (isinstance(key, str) and key.startswith(prefix)):
             cached = _workspace_cache.pop(key, None)
+            # 分段测量只用于展示：会话被删除时一并摘掉，别让它按会话数永续累积。
+            _workspace_prepare_traces.pop(key, None)
             if cached is not None:
                 cached_workspaces.append(
                     (cached, _workspace_sandbox_refs.pop(key, None))
@@ -6119,6 +6624,10 @@ async def delete_workspace_for_session(
 def clear_workspace_cache() -> None:
     _workspace_cache.clear()
     _workspace_sandbox_refs.clear()
+    # 单飞表与分段测量只服务于「正在进行/刚完成」的那次构建：缓存都清了，它们留下的
+    # 记录只会让下一次调用误判「有人正在建」。任务本身不在这里取消——取消由持有者负责。
+    _workspace_inflight.clear()
+    _workspace_prepare_traces.clear()
     _docker_workspace_cache.clear()
     _docker_workspace_refcounts.clear()
     _docker_workspace_locks.clear()
@@ -6737,6 +7246,10 @@ class _SandboxLogicalWorkspaceNativeTool:
         self.name = getattr(native_tool, "name", "")
 
     def __getattr__(self, attribute: str) -> Any:
+        # 少这个判断，任何在 `_native_tool` 赋值前发生的属性访问（深拷贝、pickle
+        # 还原、调试器打印）都会在这里无限递归到 RecursionError。
+        if attribute in ("_native_tool", "__setstate__", "__deepcopy__"):
+            raise AttributeError(attribute)
         return getattr(self._native_tool, attribute)
 
     def _map(self, tool_input: Mapping[str, Any]) -> dict[str, Any]:
@@ -7186,6 +7699,10 @@ class _WorkspaceFileAccessNativeTool:
         self.name = getattr(native_tool, "name", "")
 
     def __getattr__(self, attribute: str) -> Any:
+        # 少这个判断，任何在 `_native_tool` 赋值前发生的属性访问（深拷贝、pickle
+        # 还原、调试器打印）都会在这里无限递归到 RecursionError。
+        if attribute in ("_native_tool", "__setstate__", "__deepcopy__"):
+            raise AttributeError(attribute)
         return getattr(self._native_tool, attribute)
 
     def _map(self, tool_input: Mapping[str, Any]) -> dict[str, Any]:
@@ -7326,6 +7843,10 @@ class _SandboxSessionBashNativeTool:
         self.name = getattr(native_tool, "name", "")
 
     def __getattr__(self, attribute: str) -> Any:
+        # 少这个判断，任何在 `_native_tool` 赋值前发生的属性访问（深拷贝、pickle
+        # 还原、调试器打印）都会在这里无限递归到 RecursionError。
+        if attribute in ("_native_tool", "__setstate__", "__deepcopy__"):
+            raise AttributeError(attribute)
         return getattr(self._native_tool, attribute)
 
     def _default_cwd(self) -> str:
@@ -7350,6 +7871,519 @@ class _SandboxSessionBashNativeTool:
         return result
 
 
+#: 票据文件名前缀。带上 jti 才能让同一会话的并行 Bash 互不覆盖。
+TICKET_FILE_PREFIX = "ticket."
+
+#: helper 目录名，与 sandbox_helper.DIR_NAME 保持一致（这里避免循环导入而写字面量）。
+DIR_NAME_FOR_HELPER = ".nanzi"
+
+#: 注入没成功时导出的诊断变量。没有它，取不到凭据的唯一表现就是
+#: `nanzi-credential: command not found`——用户会去查 PATH、查安装，全都不对。
+#: 跑一句 `echo $NANZI_CREDENTIAL_STATUS` 就能看到真正的原因。
+CREDENTIAL_STATUS_VAR = "NANZI_CREDENTIAL_STATUS"
+
+
+class _ScriptCredentialBashContext:
+    """一次带凭据的 Bash 执行的全部状态。"""
+
+    __slots__ = (
+        "jti",
+        "platform_url",
+        "ticket_path",
+        "workdir",
+        "registered",
+        "peek_broken",
+    )
+
+    def __init__(
+        self, *, jti: str, platform_url: str, ticket_path: str, workdir: str
+    ) -> None:
+        self.jti = jti
+        self.platform_url = platform_url
+        self.ticket_path = ticket_path
+        self.workdir = workdir
+        #: 已解密登记过的 key，避免每个 chunk 重复查一遍。
+        self.registered: set[str] = set()
+        #: Redis 读失败过一次就不再逐 chunk 重试：输出有多少块就会刷多少条告警，
+        #: 而脱敏本来也拿不到值了，重复尝试没有收益。
+        self.peek_broken = False
+
+
+class _ScriptCredentialBashNativeTool:
+    """在 Bash 命令前后接上「按需取凭据」的 helper。
+
+    为什么是一层包装而不是改各自的实现：Bash 有两条路径——沙箱（MCP bash）与本机
+    （宿主子进程），两者命令都在 ``kwargs["command"]``，装配时统一包一次，口径不会漂移。
+
+    **四条踩过的坑，改这里之前先读完**：
+
+    1. **返回值是异步生成器，不是 await 出来的结果**。``await tool(command=...)``
+       拿到的仍是一个**尚未开始执行的** async generator（``LocalWorkspace`` 的 Bash
+       与沙箱 MCP Bash 都是这个形态）。所以清理票据必须放进生成器内部的
+       ``finally``——放在 ``__call__`` 里会在命令真正跑起来之前就删票，脚本一取
+       凭据就是「票据不存在」。
+    2. **chunk 的正文是 ``list[TextBlock]``**，不是 ``str``。只认 ``str`` 会让脱敏
+       在真实结构上永远命中不了，明文静默进模型上下文。
+    3. **路径要在「命令的视角」里**。沙箱命令看到的是 ``/workspace/<会话目录>``，
+       宿主绝对路径在容器里不存在。
+    4. **票据文件按 jti 命名**。同一会话可能并行跑两条 Bash，共用一个固定文件名会
+       互删——慢的那条中途丢票，并且消费记录会挂到另一条上导致漏脱敏。
+    """
+
+    def __init__(
+        self,
+        native_tool: Any,
+        *,
+        workdir: str | None,
+        host_root: str | None,
+        sandboxed: bool,
+        user_info: Any,
+        conversation_id: str | None,
+    ) -> None:
+        self._native_tool = native_tool
+        self._workdir = workdir
+        self._host_root = host_root
+        self._sandboxed = sandboxed
+        self._user_info = user_info
+        self._conversation_id = conversation_id
+        self.name = getattr(native_tool, "name", "")
+
+    def __getattr__(self, attribute: str) -> Any:
+        # 少这个判断，任何在 `_native_tool` 赋值前发生的属性访问（深拷贝、pickle
+        # 还原、调试器打印）都会在这里无限递归到 RecursionError。
+        if attribute in ("_native_tool", "__setstate__", "__deepcopy__"):
+            raise AttributeError(attribute)
+        return getattr(self._native_tool, attribute)
+
+    # ── 身份与路径 ────────────────────────────────────────────────
+
+    def _resolved_conversation_id(self) -> str:
+        """取当前会话 id：优先用绑定时传入的，缺省时从运行时 AgentContext 兜底。"""
+        cid = str(self._conversation_id or "").strip()
+        if cid:
+            return cid
+        try:
+            from app.core.context import get_current_agent_context
+
+            agent_ctx = get_current_agent_context()
+            if agent_ctx is not None:
+                return str(getattr(agent_ctx, "conversation_id", "") or "").strip()
+        except Exception:  # noqa: BLE001 - 上下文不可读时按缺失处理
+            pass
+        return ""
+
+    def _identity(self) -> tuple[str, str, str] | None:
+        """(user_id, conversation_id, dept_code)。缺前两个就签不出票，跳过注入。
+
+        ``dept_code`` 必须一起带上：部门授权的系统级凭据只在它非空时才匹配得上，
+        丢了它这类凭据在脚本里「列不出来也取不到」。
+        """
+        info = self._user_info
+        if not isinstance(info, dict):
+            return None
+        user_id = str(info.get("user_id") or info.get("id") or "")
+        conversation_id = self._resolved_conversation_id()
+        if not user_id or not conversation_id or not self._workdir:
+            return None
+        return user_id, conversation_id, str(info.get("dept_code") or "")
+
+    def _helper_dir_in_command_view(self) -> str | None:
+        """helper 目录在**命令执行时**的路径。
+
+        沙箱：``/workspace`` 下与会话目录的相对位置相同（Docker 与 K8s 的沙箱内根
+        都是 ``/workspace``，宿主根只用于换算）。本机：直接用宿主绝对路径。
+        """
+        from app.services.secrets.sandbox_helper import DIR_NAME
+
+        workdir = self._workdir
+        if not workdir:
+            return None
+        if not self._sandboxed:
+            return os.path.join(workdir, DIR_NAME)
+        if not self._host_root:
+            # 换算不出容器内位置时宁可不注入：猜一个错路径会让每条命令多一行
+            # "command not found"。
+            return None
+        try:
+            relative = os.path.relpath(
+                os.path.abspath(workdir), os.path.abspath(self._host_root)
+            )
+        except ValueError:
+            return None
+        if relative == ".":
+            return f"{DOCKER_WORKSPACE_LOGICAL_ROOT}/{DIR_NAME}"
+        if relative.startswith(".."):
+            return None
+        return f"{DOCKER_WORKSPACE_LOGICAL_ROOT}/{relative}/{DIR_NAME}"
+
+    def _skip_reason(self) -> str | None:
+        """不能注入的原因；``None`` 表示可以注入。"""
+        info = self._user_info
+        if not isinstance(info, dict):
+            return "no-user-info"
+        if not str(info.get("user_id") or info.get("id") or ""):
+            return "no-user-id"
+        if not self._resolved_conversation_id():
+            return "no-conversation-id"
+        if not self._workdir:
+            return "no-workdir"
+        return None
+
+    def _record_status(self, reason: str) -> None:
+        """把注入失败的原因落到工作区 ``.nanzi/last-error.txt``。
+
+        为什么落文件而不只写日志：这个功能失效时用户看到的唯一现象就是
+        ``command not found``，会误以为是「没装这个命令」；而平台日志在服务端，
+        用户未必看得到。落盘之后 ``cat .nanzi/last-error.txt`` 就能看到原因，
+        不用去猜，也不用依赖模型照指令执行。
+        """
+        if not self._workdir:
+            return
+        try:
+            directory = os.path.join(self._workdir, DIR_NAME_FOR_HELPER)
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            with open(
+                os.path.join(directory, "last-error.txt"), "w", encoding="utf-8"
+            ) as handle:
+                handle.write(f"{self._timestamp()} {reason}\n")
+        except OSError as exc:  # noqa: BLE001 - 落盘失败只能记日志
+            logger.warning("[ScriptCredential] 写诊断文件失败: %s", exc)
+
+    @staticmethod
+    def _timestamp() -> str:
+        from datetime import datetime
+
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── 准备 / 清理 ───────────────────────────────────────────────
+
+    async def _prepare(
+        self, identity: tuple[str, str, str], helper_dir: str
+    ) -> tuple[_ScriptCredentialBashContext | None, str]:
+        """签票 + 写 helper。任何一步失败都返回 None（命令按原样执行）。"""
+        from app.services.secrets.sandbox_helper import (
+            resolve_platform_url,
+            write_credential_helper,
+        )
+        from app.services.secrets.sandbox_ticket import issue_ticket, verify_ticket
+
+        user_id, conversation_id, dept_code = identity
+        try:
+            platform_url = await resolve_platform_url(sandboxed=self._sandboxed)
+            ticket = issue_ticket(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                dept_code=dept_code,
+                sandbox_id=(
+                    ""
+                    if not self._sandboxed
+                    else str(getattr(self._native_tool, "sandbox_id", "") or "")
+                ),
+            )
+            claims = verify_ticket(ticket)
+            if claims is None:
+                logger.warning("[ScriptCredential] 刚签发的票据验签失败，跳过注入")
+                return None, "ticket-verify-failed"
+            written = write_credential_helper(
+                self._workdir or "",
+                ticket=ticket,
+                platform_url=platform_url,
+                ticket_name=f"{TICKET_FILE_PREFIX}{claims.jti}",
+            )
+        except Exception as exc:  # noqa: BLE001 - 不能因为取凭据拦住无关命令
+            logger.warning(
+                "[ScriptCredential] 准备取凭据的 helper 失败，本次命令按原样执行: %s", exc
+            )
+            # 原因串要短且能一眼认出类型；详细栈在服务端日志里。
+            return None, f"{type(exc).__name__}:{str(exc)[:120]}"
+
+        return _ScriptCredentialBashContext(
+            jti=claims.jti,
+            platform_url=platform_url,
+            ticket_path=str(written.ticket_path),
+            workdir=self._workdir or "",
+        ), ""
+
+    def _decorate(
+        self, command: str, helper_dir: str, ctx: _ScriptCredentialBashContext
+    ) -> str:
+        # **票据路径必须是「命令视角」的**，不能用 ctx.ticket_path（宿主绝对路径）：
+        # 沙箱里只挂载了 /workspace，宿主路径在容器中不存在，helper 会报「票据
+        # 不存在」——而且这个错看起来像权限问题，排查方向会被带偏。
+        # ctx.ticket_path 留给宿主侧的 _cleanup 删文件用。
+        # **helper 目录用 `$(pwd)` 现算，并兼容子目录 `cwd` 与跨目录 `cwd`。**
+        # 1. 常规（无 cwd）：初始 cwd 就是会话目录，`$(pwd)/.nanzi` 直接命中；
+        # 2. 子目录 cwd（如 skills/xxx）：沿父目录向上回溯找到 `.nanzi`；
+        # 3. 沙箱跨目录 cwd（如 /tmp）：若可换算出容器内 `/workspace/.../.nanzi`，作为最后兜底。
+        fallback_view = ""
+        if self._sandboxed:
+            view_dir = self._helper_dir_in_command_view()
+            if view_dir and view_dir.startswith(f"{DOCKER_WORKSPACE_LOGICAL_ROOT}/"):
+                fallback_view = (
+                    f'if [ ! -d "$NANZI_H" ] && [ -d {shlex.quote(view_dir)} ]; then '
+                    f"NANZI_H={shlex.quote(view_dir)}; fi; "
+                )
+        # 全部用 if/then/fi，不用 `[ -d x ] || { ...; }`：后者在候选都不存在时
+        # 返回非零，用户脚本若带 `set -e` 会被这行前缀直接打断。取凭据找不到
+        # helper 只该让 helper 报错，不该让本来无关的命令失败。
+        prelude = (
+            'NANZI_H="$(pwd)/.nanzi"; '
+            'if [ ! -d "$NANZI_H" ]; then NANZI_D="$(pwd)"; '
+            'while [ "$NANZI_D" != "/" ] && [ -n "$NANZI_D" ]; do '
+            'if [ -d "$NANZI_D/.nanzi" ]; then NANZI_H="$NANZI_D/.nanzi"; break; fi; '
+            'NANZI_D="$(dirname "$NANZI_D")"; done; fi; '
+            f"{fallback_view}"
+            f"export NANZI_PLATFORM_URL={shlex.quote(ctx.platform_url)}; "
+            f'export NANZI_TICKET_FILE="$NANZI_H/{TICKET_FILE_PREFIX}{ctx.jti}"; '
+            'export PATH="$NANZI_H:$PATH";'
+        )
+        return f"{prelude}\n{command}"
+
+    async def _cleanup(self, ctx: _ScriptCredentialBashContext) -> None:
+        """删票 + 清掉这次执行在 Redis 里留下的取用记录。
+
+        异常只记日志：命令结果比清理更要紧。记录里只有 key 名、没有值，即便删失败
+        也只是留 900 秒的 TTL，不构成泄漏；但不清会让「本次执行取过什么」在 Redis
+        里滞留，排查时容易把两次执行看串。
+        """
+        from app.services.secrets.sandbox_helper import remove_ticket_file
+        from app.services.secrets.sandbox_ticket import take_consumed_keys
+
+        try:
+            remove_ticket_file(ctx.ticket_path)
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("[ScriptCredential] 删除票据失败: %s", exc)
+        try:
+            await take_consumed_keys(ctx.jti)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[ScriptCredential] 清理取用记录失败: %s", exc)
+
+    # ── 执行 ─────────────────────────────────────────────────────
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        command = kwargs.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return await self._invoke_plain(kwargs)
+
+        reason = self._skip_reason()
+        if reason is not None:
+            self._record_status(reason)
+            return await self._invoke_plain(_with_credential_status(kwargs, reason))
+
+        identity = self._identity()
+        if identity is None:  # pragma: no cover - 与 _skip_reason 同源
+            return await self._invoke_plain(
+                _with_credential_status(kwargs, "no-identity")
+            )
+        helper_dir = os.path.join(self._workdir or "", DIR_NAME_FOR_HELPER)
+
+        ctx, prepare_error = await self._prepare(identity, helper_dir)
+        if ctx is None:
+            reason = f"prepare-failed:{prepare_error}"
+            self._record_status(reason)
+            return await self._invoke_plain(_with_credential_status(kwargs, reason))
+
+        decorated = dict(kwargs)
+        decorated["command"] = self._decorate(command, helper_dir, ctx)
+
+        try:
+            result = self._native_tool(**decorated)
+            if inspect.isawaitable(result):
+                result = await result
+        except BaseException:
+            await self._cleanup(ctx)
+            raise
+
+        # 流式：清理与脱敏都必须在生成器内部——此刻命令还没开始跑。
+        if inspect.isasyncgen(result):
+            return self._stream_with_redaction(result, ctx)
+
+        try:
+            return await _redact_result(result, ctx)
+        finally:
+            await self._cleanup(ctx)
+
+    async def _invoke_plain(self, kwargs: dict[str, Any]) -> Any:
+        result = self._native_tool(**kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    def _stream_with_redaction(
+        self, agen: Any, ctx: _ScriptCredentialBashContext
+    ) -> Any:
+        cleanup = self._cleanup  # bound 方法，供生成器内部 await
+
+        async def _stream() -> Any:
+            from app.services.secrets.redact import (
+                injected_values,
+                merge_injected,
+                redact_text,
+                reset_injected,
+            )
+
+            # 快照 + 恢复：这里清的是整条执行流共用的 ContextVar，直接 reset 会把
+            # 同一执行流里先前登记的其它凭据值一并抹掉。
+            before = injected_values()
+            try:
+                async with contextlib.aclosing(agen):
+                    async for chunk in agen:
+                        await _register_consumed_values(ctx)
+                        if isinstance(chunk, str):
+                            # 裸字符串没法就地改，只能换一个 yield 出去。
+                            chunk = redact_text(chunk, where="Bash")
+                        else:
+                            _redact_chunk_inplace(chunk)
+                        yield chunk
+            finally:
+                reset_injected()
+                merge_injected(before)
+                await cleanup(ctx)
+
+        return _stream()
+
+
+def _with_credential_status(kwargs: dict[str, Any], reason: str) -> dict[str, Any]:
+    """给没法注入 helper 的命令加一个诊断变量。
+
+    命令仍然照常执行（不能因为取凭据失败就拦住无关命令），但会把原因挂在
+    ``$NANZI_CREDENTIAL_STATUS`` 上：否则用户能看到的唯一线索就是
+    ``nanzi-credential: command not found``，而那个提示会把人引向「是不是没装」。
+    """
+    command = kwargs.get("command")
+    if not isinstance(command, str):
+        return kwargs
+    decorated = dict(kwargs)
+    decorated["command"] = (
+        f"export {CREDENTIAL_STATUS_VAR}={shlex.quote(reason)};\n{command}"
+    )
+    return decorated
+
+
+async def _register_consumed_values(ctx: _ScriptCredentialBashContext) -> None:
+    """把这张票**到目前为止**取过的凭据值登记进掩码集合（幂等）。
+
+    为什么每个 chunk 前都要刷一次：消费记录是脚本调用 helper 时才写进去的，而输出
+    是边跑边流出来的。只在整个流结束后才登记，值早就 yield 给上层了。
+
+    为什么不用「取走即删」：流还没结束，后面可能还有值要登记。真正的删除在
+    ``take_consumed_keys``（由清理阶段调用，这里不碰）。
+    """
+    from app.services.secrets.redact import register_injected
+    from app.services.secrets.sandbox_ticket import peek_consumed_keys
+
+    if ctx.peek_broken:
+        return
+    try:
+        entries = await peek_consumed_keys(ctx.jti)
+    except Exception as exc:  # noqa: BLE001 - 脱敏是补强，不能阻断输出
+        ctx.peek_broken = True
+        logger.warning(
+            "[ScriptCredential] 读取取用记录失败，本次执行不再尝试脱敏: %s", exc
+        )
+        return
+
+    fresh = [
+        entry
+        for entry in entries
+        if entry.get("key") and entry["key"] not in ctx.registered
+    ]
+    if not fresh:
+        return
+
+    from app.services.secrets.policy import SCENE_SANDBOX_SCRIPT
+    from app.services.secrets.resolver import secret_resolver
+
+    for entry in fresh:
+        # 先标记再取值：单条失败不该让后面每个 chunk 都重试一遍它。
+        ctx.registered.add(entry["key"])
+        try:
+            resolved = await secret_resolver.resolve_by_key(
+                user_id=entry.get("user_id") or "",
+                secret_key=entry["key"],
+                scene=SCENE_SANDBOX_SCRIPT,
+                conversation_id=entry.get("conversation_id") or None,
+                dept_code=entry.get("dept_code") or None,
+                record_usage=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[ScriptCredential] 复现凭据值失败 key=%s: %s", entry["key"], exc
+            )
+            continue
+        if resolved.ok and resolved.value is not None:
+            register_injected(resolved.value.reveal())
+
+
+def _chunk_text_targets(chunk: Any) -> list[Any]:
+    """列出 chunk 里所有「带 text 属性的对象」，用来就地改写。
+
+    AgentScope 2.x 的工具输出是 ``ToolChunk(content=[TextBlock, ...])``，正文在
+    ``TextBlock.text`` 里。同时兼容裸 ``str``（测试替身与部分后端）。
+    """
+    if isinstance(chunk, str):
+        return [chunk]
+    content = getattr(chunk, "content", None)
+    if isinstance(content, list):
+        return [
+            block
+            for block in content
+            if isinstance(getattr(block, "text", None), str)
+        ]
+    if isinstance(content, str):
+        return [content]  # 由 _redact_chunk_inplace 回写 chunk.content
+    if isinstance(getattr(chunk, "text", None), str):
+        return [chunk]
+    return []
+
+
+def _redact_chunk_inplace(chunk: Any) -> None:
+    """就地掩码一个 chunk（改写 ``TextBlock.text``）。
+
+    **已知边界**：值若被切在两个 chunk 之间，任何单块都不完整，扫不到。实际输出里
+    TextBlock 基本是完整段落，跨块切断属于极端情况；这里拦的是「整段 print 出来」。
+    """
+    from app.services.secrets.redact import redact_text
+
+    for target in _chunk_text_targets(chunk):
+        if isinstance(target, str):
+            # chunk.content 本身是字符串（不是 TextBlock）：只能回写到对象上。
+            masked = redact_text(target, where="Bash")
+            if masked != target and getattr(chunk, "content", None) is target:
+                try:
+                    chunk.content = masked
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            continue
+        masked = redact_text(target.text, where="Bash")
+        if masked != target.text:
+            try:
+                target.text = masked
+            except (AttributeError, TypeError, ValueError):
+                pass
+
+
+async def _redact_result(result: Any, ctx: _ScriptCredentialBashContext) -> Any:
+    """非流式结果的一次性脱敏。就地改对象，尽量不改变调用方拿到的类型。"""
+    from app.services.secrets.redact import (
+        injected_values,
+        merge_injected,
+        redact_text,
+        reset_injected,
+    )
+
+    before = injected_values()
+    try:
+        await _register_consumed_values(ctx)
+        if isinstance(result, str):
+            return redact_text(result, where="Bash")
+        _redact_chunk_inplace(result)
+        return result
+    finally:
+        reset_injected()
+        merge_injected(before)
+
+
 class _CanonicalWorkspaceNativeTool:
     """Expose an MCP-backed workspace tool under the platform tool name."""
 
@@ -7358,6 +8392,10 @@ class _CanonicalWorkspaceNativeTool:
         self.name = name
 
     def __getattr__(self, attribute: str) -> Any:
+        # 少这个判断，任何在 `_native_tool` 赋值前发生的属性访问（深拷贝、pickle
+        # 还原、调试器打印）都会在这里无限递归到 RecursionError。
+        if attribute in ("_native_tool", "__setstate__", "__deepcopy__"):
+            raise AttributeError(attribute)
         return getattr(self._native_tool, attribute)
 
     def __call__(self, **kwargs: Any) -> Any:
@@ -7670,6 +8708,34 @@ def _bind_script_tool_spec(
     return replace(spec, callable=_invoke_script_tool)
 
 
+async def _effective_policy_for_tool_binding() -> str:
+    """当前生效的沙箱策略，仅供 ``bind_configured_tools_to_workspace`` 分流用。
+
+    读取失败一律按 ``local`` 处理：这条路径只在"工作区拿不到"的异常场景上用到，
+    此时把 local 当作默认是保守选择（local 分支本身不做任何宿主回退，只是保持
+    历史行为）；真正的安全兜底在 ``get_local_workspace`` 里——非 local 策略的
+    失败会抛 ``SandboxUnavailableError``，根本走不到这里。
+    """
+    try:
+        from app.services.config_service import (
+            ConfigService,
+            resolve_effective_sandbox_policy,
+        )
+
+        raw = await ConfigService.get("sandbox_policy", SANDBOX_POLICY_LOCAL)
+        policy = resolve_effective_sandbox_policy(raw, SANDBOX_POLICY_LOCAL)
+        # 未识别的取值不能当成沙箱：`sandbox_policy` 是自由文本配置，误配（历史测试里
+        # 就出现过把 ConfigService.get 一律 mock 成数字的情况）会让会话走到
+        # 「非 local 却没有工作区」的 fail-closed 分支，整站不可用。只有真正的沙箱
+        # 策略才允许进入非 local 分支。
+        return policy if sandbox_policy_is_sandbox(policy) else SANDBOX_POLICY_LOCAL
+    except Exception as exc:  # noqa: BLE001 - 配置不可用按 local 处理
+        logger.warning(
+            "[workspace] 读取 sandbox_policy 失败，工具绑定按 local 处理: %s", exc
+        )
+        return SANDBOX_POLICY_LOCAL
+
+
 async def bind_configured_tools_to_workspace(
     workspace: Any,
     tool_specs: list[Any] | None,
@@ -7690,13 +8756,41 @@ async def bind_configured_tools_to_workspace(
     """
     specs = list(tool_specs or [])
     if workspace is None:
-        if any(
-            _workspace_native_name_for_spec(spec)
-            in DOCKER_WORKSPACE_FILE_TOOL_NAMES
+        # ``workspace is None`` 有两种完全不同的含义，必须按当前沙箱策略区分：
+        #
+        # 1) **local 策略**：本来就没有沙箱工作区，"宿主本地执行"正是它的语义。
+        #    历史行为是只拦文件工具（它们需要 LocalWorkspace 才能安全落盘），
+        #    Bash 照旧可用。这里保持原样——否则 local 模式下没有 conversation_id
+        #    的会话（``get_local_workspace`` 对 local 直接 return None）里，
+        #    凡挂了 Bash 的智能体都会整轮报错。
+        #
+        # 2) **非 local 策略**：用户明确要求了沙箱，此时拿到 None 说明沙箱没建立
+        #    起来（e2b/ssh 初始化失败等）。绝不能把 Bash 交回平台后端执行，否则
+        #    用户命令会以 /app 为 cwd 跑在宿主 root 下，还能读到后端全部环境变量。
+        file_tool_blocked = any(
+            _workspace_native_name_for_spec(spec) in DOCKER_WORKSPACE_FILE_TOOL_NAMES
             for spec in specs
-        ):
+        )
+        policy = await _effective_policy_for_tool_binding()
+        if policy == SANDBOX_POLICY_LOCAL:
+            if file_tool_blocked:
+                raise PermissionError(
+                    "文件访问被拒绝：宿主工作区不可用，文件工具未执行"
+                )
+            return specs
+        blocked = sorted(
+            {
+                native_name
+                for native_name in (
+                    _workspace_native_name_for_spec(spec) for spec in specs
+                )
+                if native_name in WORKSPACE_BUILTIN_TOOL_NAMES
+            }
+        )
+        if blocked:
             raise PermissionError(
-                "文件访问被拒绝：宿主工作区不可用，文件工具未执行"
+                f"工作区访问被拒绝：{policy} 沙箱未就绪，以下工具未执行："
+                + "、".join(blocked)
             )
         return specs
     if not specs:
@@ -7860,6 +8954,25 @@ async def bind_configured_tools_to_workspace(
                 workspace_tool,
                 sandbox_host_root,
                 local_ws.workdir,
+            )
+        if native_name == "Bash" and workspace_tool is not None:
+            # 脚本通道：给每条 Bash 命令接上「按需取凭据」的 helper。放在 canonical
+            # 包装之前，是为了让 name / description / schema 的补全照旧只做一次。
+            # 沙箱与本机两条路径共用这一层，口径不会漂移。
+            workspace_tool = _ScriptCredentialBashNativeTool(
+                workspace_tool,
+                # 沙箱策略下 local_ws 可能是 None，但沙箱必然挂了某个宿主目录
+                # （sandbox_host_root → /workspace）。没有 workdir 兜底，整个脚本
+                # 取凭据能力在沙箱里会**静默失效**——而沙箱正是主要使用场景。
+                workdir=getattr(local_ws, "workdir", None) or sandbox_host_root,
+                # 沙箱：session 目录相对宿主工作区根的位置，用来换算容器内路径。
+                host_root=sandbox_host_root,
+                sandboxed=sandbox_ws is not None,
+                user_info=user_info,
+                conversation_id=(
+                    getattr(local_ws, "conversation_id", None)
+                    or getattr(workspace, "conversation_id", None)
+                ),
             )
         if (
             native_name == "Bash"

@@ -30,6 +30,10 @@ class PendingAgentScopeSnapshot:
     stream_state: dict[str, Any]
     runner_context: dict[str, Any]
     evidence_receipts: list[dict[str, Any]] = field(default_factory=list)
+    # 委派来源：子智能体自己发起的权限确认要记住「哪个父会话的哪个子智能体」，
+    # 确认后才可能把授权结果交回父会话继续，而不是在内部子会话里自生自灭。
+    # 主会话自身的确认没有这一层，一律为空 dict（旧快照读回同样落到空 dict）。
+    delegation: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
 
     def is_expired(self, now: float | None = None) -> bool:
@@ -132,6 +136,13 @@ class PendingAgentScopeStore:
         if snapshot and snapshot.is_expired():
             self._memory_fallback.pop(request_id, None)
             return None
+        # 内存兜底分支同样要校验归属：Redis 分支的 key 里带 user_id 天然隔离，
+        # 这里只按 request_id 取值。缺了这一步，Redis 异常期间用户 B 拿到用户 A 的
+        # request_id 就能 peek 出 A 的会话（确认接口随后还会据此释放 A 的会话锁）。
+        # 只在**显式传了** user_id 时校验：调用方不传是既有的「按 request_id 直取」
+        # 语义，保持原行为，免得改成无条件校验后把不带用户维度的调用点全部判空。
+        if snapshot and user_id is not None and not self._user_matches(snapshot, user_id):
+            return None
         return snapshot
 
     async def prune(self) -> None:
@@ -210,6 +221,7 @@ class PendingAgentScopeStore:
                 stream_state=dict(data.get("stream_state") or {}),
                 runner_context=dict(data.get("runner_context") or {}),
                 evidence_receipts=list(data.get("evidence_receipts") or []),
+                delegation=dict(data.get("delegation") or {}),
                 created_at=float(data.get("created_at", time.time())),
             )
         except Exception as exc:

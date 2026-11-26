@@ -27,6 +27,8 @@ export interface UseWorkspaceCanvasOptions {
   normalizeDirectPayloadTitle?: boolean;
   /** 窄屏：画布全屏置顶遮罩，不自动钉住侧栏（工作区可保持打开） */
   isMobile?: () => boolean;
+  /** `handleOpenCanvas` 默认是否钉住侧栏：聊天页默认 true，独立工作空间页传 false 以浮层打开 */
+  defaultPinned?: boolean;
 }
 
 export function useWorkspaceCanvas(options: UseWorkspaceCanvasOptions) {
@@ -63,7 +65,8 @@ export function useWorkspaceCanvas(options: UseWorkspaceCanvasOptions) {
    */
   const showCanvas = (pinByDefault = true) => {
     const mobile = options.isMobile?.() ?? false;
-    canvasPinned.value = pinByDefault && !mobile;
+    const allowDefaultPin = options.defaultPinned ?? true;
+    canvasPinned.value = pinByDefault && !mobile && allowDefaultPin;
     canvasVisible.value = true;
   };
 
@@ -209,10 +212,20 @@ export function useWorkspaceCanvas(options: UseWorkspaceCanvasOptions) {
             type: canvasType,
             title: filename,
             content,
-            sourcePath: shouldAttachWorkspaceSourcePath(filePath, filename) ? filePath : undefined,
             langName: scriptLanguage || undefined,
             runnable: !!scriptLanguage,
           };
+        }
+        // 统一兜底注入工作区路径，不要每条分支各写一遍。
+        // 此前只有上面这条文本分支带了 sourcePath，Office / PDF / 图片 / CSV
+        // 四条分支全部缺失——于是它们在画布里显示「需先保存，无法分享」，
+        // 可文件明明就在用户自己的工作区里。分享入口与「已保存」徽标都依赖它。
+        if (
+          canvasData.value &&
+          !canvasData.value.sourcePath &&
+          shouldAttachWorkspaceSourcePath(filePath, filename)
+        ) {
+          canvasData.value = { ...canvasData.value, sourcePath: filePath };
         }
         showCanvas();
       } catch (error: any) {
